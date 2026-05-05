@@ -15,7 +15,7 @@ source "${REPO_ROOT}/core/utils.sh"
 log_section "Step 01 — Ubuntu System Update"
 
 log_info "Running apt-get update…"
-apt-get update -y
+apt_update_safe
 
 log_info "Running full system upgrade…"
 DEBIAN_FRONTEND=noninteractive apt-get upgrade -y

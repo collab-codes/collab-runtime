@@ -33,6 +33,31 @@ require_root() {
 }
 
 # ---------------------------------------------------------------------------
+# apt_update_safe
+# Runs apt-get update but treats individual repo failures as warnings, not
+# fatal errors. Third-party repos (Redis, TimescaleDB) may not support the
+# current Ubuntu version — that must not block packages from working repos.
+# ---------------------------------------------------------------------------
+apt_update_safe() {
+  if apt-get update -y 2>&1; then
+    return 0
+  fi
+  echo "[WARN]  apt-get update had errors — some repos may not support Ubuntu $(lsb_release -cs)" >&2
+  echo "[WARN]  Continuing with available package cache from working repositories" >&2
+  return 0  # intentionally succeed so the caller can still attempt installs
+}
+
+# ---------------------------------------------------------------------------
+# codename_supported <codename> <space-separated-list>
+# Returns 0 if codename is in the list, 1 otherwise.
+# ---------------------------------------------------------------------------
+codename_supported() {
+  local codename="$1"
+  local list="$2"
+  [[ " ${list} " == *" ${codename} "* ]]
+}
+
+# ---------------------------------------------------------------------------
 # apt_retry <max_attempts> <apt-get arguments...>
 # Runs apt-get with retries on transient network/lock failures.
 # Example: apt_retry 3 install -y timescaledb-2-postgresql-17
@@ -50,7 +75,7 @@ apt_retry() {
     if (( attempt < max_attempts )); then
       echo "[WARN]  apt-get $* failed (attempt ${attempt}/${max_attempts}). Retrying in ${wait_secs}s…" >&2
       sleep "$wait_secs"
-      apt-get update -y 2>/dev/null || true
+      apt_update_safe
       (( wait_secs *= 2 )) || true
     fi
     (( attempt++ )) || true

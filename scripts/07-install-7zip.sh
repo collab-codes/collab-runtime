@@ -16,7 +16,7 @@ if command_exists 7z; then
   log_info "7-Zip already installed: $(7z i 2>&1 | head -2 | tail -1)"
 else
   log_info "Installing p7zip-full and p7zip-rar…"
-  apt-get update -y
+  apt_update_safe
   apt-get install -y p7zip-full p7zip-rar
 fi
 

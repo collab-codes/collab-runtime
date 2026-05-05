@@ -19,7 +19,7 @@ log_section "Step 03 — Install PostgreSQL ${PG_VERSION}"
 
 # ── Prerequisites ─────────────────────────────────────────────────────────────
 log_info "Installing prerequisites (curl, ca-certificates)…"
-apt-get update -y
+apt_update_safe
 apt_retry 3 install -y curl ca-certificates
 
 # ── PGDG repository ───────────────────────────────────────────────────────────
@@ -48,7 +48,7 @@ if command_exists psql && psql --version 2>/dev/null | grep -q "${PG_VERSION}"; 
   log_info "PostgreSQL ${PG_VERSION} is already installed: $(psql --version)"
 else
   log_info "Installing postgresql-${PG_VERSION}…"
-  apt-get update -y
+  apt_update_safe
   apt_retry 3 install -y "postgresql-${PG_VERSION}" postgresql-contrib
 fi
 

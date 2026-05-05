@@ -104,6 +104,28 @@ echo "  Started at: $(date '+%Y-%m-%d %H:%M:%S')"
 echo ""
 log_summary "Profile: ${PROFILE} | PG: ${PG_VERSION} | Node: ${NODE_VERSION}"
 
+# ── Step 6.5: Remove stale apt repos from any previous failed run ─────────────
+# Third-party repos added in a previous run may reference a wrong Ubuntu
+# codename (e.g. "questing") that is unsupported. If left in place, every
+# subsequent apt-get update fails, cascading to all other steps.
+# Each install script re-adds its own repo after this cleanup.
+log_section "Pre-flight: cleaning stale apt repos"
+
+_STALE_REPOS=(
+  /etc/apt/sources.list.d/timescale_timescaledb.list
+  /etc/apt/sources.list.d/redis.list
+  /etc/apt/sources.list.d/nodesource.list
+)
+for _repo in "${_STALE_REPOS[@]}"; do
+  if [[ -f "$_repo" ]]; then
+    rm -f "$_repo"
+    log_info "Removed stale repo: ${_repo}"
+  fi
+done
+# Remove orphaned keyring if redis.list was removed
+rm -f /usr/share/keyrings/redis-archive-keyring.gpg 2>/dev/null || true
+log_ok "Stale repo cleanup done"
+
 # ── Step 7: Run install scripts ────────────────────────────────────────────────
 # Each script is run in a subshell. On failure, we log the error and continue
 # so that all steps are attempted and the summary accurately reflects what
