@@ -22,7 +22,7 @@ source "${REPO_ROOT}/core/utils.sh"
 
 PG_VERSION="${PG_VERSION:-17}"
 TSDB_PKG="timescaledb-2-postgresql-${PG_VERSION}"
-TSDB_SUPPORTED_CODENAMES="focal jammy noble"
+# TSDB_SUPPORTED_CODENAMES is defined in core/utils.sh (single source of truth).
 
 # Persistent test database used to verify TimescaleDB is operational.
 # Kept identical to the literal hardcoded in the `collab status` command.

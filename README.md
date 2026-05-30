@@ -14,8 +14,10 @@ Prepares a fresh Ubuntu server with everything needed to run the collab.codes pl
 ## Usage
 
 ```bash
+cd /data
 git clone https://github.com/collab-codes/collab-runtime
 cd collab-runtime
+[git pull] # optional, update
 sudo ./install.sh
 ```
 

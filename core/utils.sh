@@ -6,6 +6,16 @@
 # Usage: source "$(dirname "${BASH_SOURCE[0]}")/utils.sh"
 
 # ---------------------------------------------------------------------------
+# TSDB_SUPPORTED_CODENAMES
+# Ubuntu codenames for which TimescaleDB publishes apt packages (packagecloud.io):
+#   focal (20.04), jammy (22.04), noble (24.04).
+# Single source of truth — consumed by install.sh (early pre-flight warning) and
+# scripts/04-install-timescaledb.sh. Verified 2026-05: no package for 26.04 yet.
+# Add a codename here once TimescaleDB ships packages for it.
+# ---------------------------------------------------------------------------
+TSDB_SUPPORTED_CODENAMES="${TSDB_SUPPORTED_CODENAMES:-focal jammy noble}"
+
+# ---------------------------------------------------------------------------
 # command_exists <cmd>
 # Returns 0 if the command is on PATH, 1 otherwise.
 # ---------------------------------------------------------------------------
