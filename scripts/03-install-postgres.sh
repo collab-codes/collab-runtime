@@ -15,6 +15,12 @@ source "${REPO_ROOT}/core/utils.sh"
 
 PG_VERSION="${PG_VERSION:-17}"
 
+# Default application role used by the collab apps (e.g. collab-auth, whose
+# appconfig.json default is postgres://collab:collab@localhost:5432/...).
+# Override via env if you want different defaults at install time.
+DB_APP_USER="${DB_APP_USER:-collab}"
+DB_APP_PASSWORD="${DB_APP_PASSWORD:-collab}"
+
 log_section "Step 03 — Install PostgreSQL ${PG_VERSION}"
 
 # ── Prerequisites ─────────────────────────────────────────────────────────────
@@ -57,7 +63,29 @@ log_info "Enabling and starting postgresql service…"
 systemctl enable postgresql
 systemctl start postgresql
 
+# ── Create default application role (first install only) ───────────────────────
+# The collab apps connect as this role. We create it only when it does not yet
+# exist — on a re-run we leave an existing role untouched so a password the
+# operator may have changed is never reset.
+DB_APP_CREATED=0
+if sudo -u postgres psql -Atq -c \
+     "SELECT 1 FROM pg_roles WHERE rolname = '${DB_APP_USER}';" | grep -q 1; then
+  log_info "Database role '${DB_APP_USER}' already exists — leaving it untouched"
+else
+  log_info "Creating default application role '${DB_APP_USER}'…"
+  sudo -u postgres psql -v ON_ERROR_STOP=1 -c \
+    "CREATE ROLE \"${DB_APP_USER}\" WITH LOGIN PASSWORD '${DB_APP_PASSWORD}' CREATEDB;"
+  DB_APP_CREATED=1
+fi
+
 PG_VER_STR="$(psql --version)"
 PG_STATUS="$(systemctl is-active postgresql)"
 log_ok "PostgreSQL installed: ${PG_VER_STR} | status: ${PG_STATUS}"
 log_info "Tip: connect with 'sudo -u postgres psql'"
+
+if [[ "$DB_APP_CREATED" == "1" ]]; then
+  log_ok "Default database user '${DB_APP_USER}' was created (password: '${DB_APP_PASSWORD}', CREATEDB)"
+  log_warn "Insecure default password — change it in production with:"
+  log_warn "  sudo -u postgres psql -c \"ALTER ROLE \\\"${DB_APP_USER}\\\" WITH PASSWORD '<strong-password>';\""
+  log_warn "  then update each app's appconfig.json databaseUrl to match"
+fi
