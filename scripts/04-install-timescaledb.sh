@@ -24,6 +24,10 @@ PG_VERSION="${PG_VERSION:-17}"
 TSDB_PKG="timescaledb-2-postgresql-${PG_VERSION}"
 TSDB_SUPPORTED_CODENAMES="focal jammy noble"
 
+# Persistent test database used to verify TimescaleDB is operational.
+# Kept identical to the literal hardcoded in the `collab status` command.
+TEST_DB="collab_test"
+
 # Resolve current Ubuntu codename
 . /etc/os-release
 CODENAME="${VERSION_CODENAME:-unknown}"
@@ -106,22 +110,30 @@ fi
 systemctl is-active --quiet postgresql
 log_ok "PostgreSQL running with timescaledb in shared_preload_libraries"
 
-# ── Enable extension and smoke-test ───────────────────────────────────────────
-sudo -u postgres psql -v ON_ERROR_STOP=1 -d postgres \
-  -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"
+# ── Create persistent test database ───────────────────────────────────────────
+# Postgres has no "CREATE DATABASE IF NOT EXISTS", so guard on pg_database.
+if sudo -u postgres psql -Atqc \
+     "SELECT 1 FROM pg_database WHERE datname = '${TEST_DB}';" | grep -q 1; then
+  log_info "Test database '${TEST_DB}' already exists"
+else
+  log_info "Creating test database '${TEST_DB}'…"
+  sudo -u postgres createdb "$TEST_DB"
+fi
 
-sudo -u postgres psql -v ON_ERROR_STOP=1 -d postgres <<'SQL'
-CREATE TABLE IF NOT EXISTS _collab_tsdb_smoke (
+# ── Enable extension and verify with a hypertable inside the test DB ───────────
+# Extensions are per-database, so timescaledb must be enabled in collab_test.
+sudo -u postgres psql -v ON_ERROR_STOP=1 -d "$TEST_DB" <<'SQL'
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+CREATE TABLE IF NOT EXISTS collab_healthcheck (
   time TIMESTAMPTZ NOT NULL,
   val  DOUBLE PRECISION NOT NULL
 );
-SELECT create_hypertable('_collab_tsdb_smoke', 'time', if_not_exists => TRUE);
-INSERT INTO _collab_tsdb_smoke VALUES (NOW(), 1.0);
-SELECT 'timescaledb smoke test ok' AS result FROM _collab_tsdb_smoke LIMIT 1;
-DROP TABLE _collab_tsdb_smoke;
+SELECT create_hypertable('collab_healthcheck', 'time', if_not_exists => TRUE);
+INSERT INTO collab_healthcheck VALUES (NOW(), 1.0);
+SELECT 'timescaledb test ok' AS result FROM collab_healthcheck LIMIT 1;
 SQL
 
-TSDB_VER="$(sudo -u postgres psql -Atqc \
+TSDB_VER="$(sudo -u postgres psql -Atqc -d "$TEST_DB" \
   "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb';" 2>/dev/null || true)"
 
-log_ok "TimescaleDB Community ${TSDB_VER} verified on PostgreSQL ${PG_VERSION}"
+log_ok "TimescaleDB Community ${TSDB_VER} verified in database '${TEST_DB}' on PostgreSQL ${PG_VERSION}"

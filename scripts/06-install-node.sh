@@ -18,6 +18,17 @@ NODE_VERSION="${NODE_VERSION:-24}"
 
 log_section "Step 06 — Install Node.js ${NODE_VERSION}.x"
 
+# Installs pnpm globally via npm. Idempotent: skips if already present.
+ensure_pnpm() {
+  if command_exists pnpm; then
+    log_info "pnpm $(pnpm --version) already installed"
+    return 0
+  fi
+  log_info "Installing pnpm globally via npm…"
+  npm install -g pnpm
+  log_ok "pnpm: $(pnpm --version)"
+}
+
 if command_exists node; then
   CURRENT_MAJOR="$(node --version | sed 's/v//' | cut -d. -f1)"
   if (( CURRENT_MAJOR >= NODE_VERSION )); then
@@ -29,6 +40,7 @@ if command_exists node; then
       apt-get install -y npm
     fi
     log_info "npm: $(npm --version)"
+    ensure_pnpm
     exit 0
   else
     log_info "Found Node.js v${CURRENT_MAJOR} — replacing with v${NODE_VERSION}…"
@@ -61,4 +73,6 @@ if ! command_exists npm; then
   NPM_VER="$(npm --version)"
 fi
 
-log_ok "Node.js installed: ${NODE_VER} | npm: ${NPM_VER}"
+ensure_pnpm
+
+log_ok "Node.js installed: ${NODE_VER} | npm: ${NPM_VER} | pnpm: $(pnpm --version)"

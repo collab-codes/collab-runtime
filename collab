@@ -15,6 +15,10 @@ COLLAB_LOG_DIR="/var/log/collab"
 SUMMARY_LOG="${COLLAB_LOG_DIR}/install-summary.log"
 DETAIL_LOG="${COLLAB_LOG_DIR}/install-detail.log"
 
+# Persistent test database created by scripts/04-install-timescaledb.sh.
+# Keep this literal identical to TEST_DB in that script.
+TEST_DB="collab_test"
+
 # ── Colour helpers ─────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
   C_RESET='\033[0m'
@@ -91,14 +95,35 @@ cmd_status() {
   command -v pm2       &>/dev/null && info "pm2        $(pm2 --version 2>/dev/null)"
   command -v 7z        &>/dev/null && info "7zip       $(7z i 2>&1 | grep '7-Zip' | head -1 | awk '{print $1, $2}')"
 
+  # Test database (TimescaleDB health-check DB)
+  echo -e "\n${C_BOLD}Database${C_RESET}"
+  divider
+  if command -v psql &>/dev/null && systemctl is-active --quiet postgresql 2>/dev/null; then
+    if sudo -u postgres psql -Atqc \
+         "SELECT 1 FROM pg_database WHERE datname = '${TEST_DB}';" 2>/dev/null | grep -q 1; then
+      tsdb_ver="$(sudo -u postgres psql -Atqc -d "$TEST_DB" \
+        "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb';" 2>/dev/null || true)"
+      rows="$(sudo -u postgres psql -Atqc -d "$TEST_DB" \
+        "SELECT count(*) FROM collab_healthcheck;" 2>/dev/null || true)"
+      if [[ -n "$tsdb_ver" ]]; then
+        pass "${TEST_DB} (timescaledb ${tsdb_ver}, healthcheck rows: ${rows:-?})"
+      else
+        warn "${TEST_DB} exists but timescaledb extension not enabled"
+      fi
+    else
+      warn "${TEST_DB} not found (run install.sh / step 04 to create it)"
+    fi
+  else
+    warn "postgresql not running — skipping database check"
+  fi
+
   # Disk usage
   echo -e "\n${C_BOLD}Disk usage${C_RESET}"
   divider
-  df -h --output=target,size,used,avail,pcent \
-    / /var /var/lib 2>/dev/null | \
-    grep -v "^Filesystem" | \
-    awk '{printf "  %-20s  size:%-8s  used:%-8s  avail:%-8s  %s\n", $1, $2, $3, $4, $5}' || \
-    df -h / | tail -1 | awk '{printf "  /  size:%s  used:%s  avail:%s  %s\n", $2, $3, $4, $5}'
+
+  printf "  %-12s %8s %8s %8s %6s\n" "Mounted" "Size" "Used" "Avail" "Use%"
+  df -h / /data 2>/dev/null | tail -n +2 | \
+    awk '{printf "  %-12s %8s %8s %8s %6s\n", $1, $2, $3, $4, $5}'
 
   echo ""
 }
@@ -169,13 +194,13 @@ cmd_doctor() {
   divider
 
   if command -v psql &>/dev/null && systemctl is-active --quiet postgresql 2>/dev/null; then
-    TSDB_VER="$(sudo -u postgres psql -Atqc \
+    TSDB_VER="$(sudo -u postgres psql -Atqc -d "$TEST_DB" \
       "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb';" \
       2>/dev/null || true)"
     if [[ -n "$TSDB_VER" ]]; then
-      pass "TimescaleDB extension installed (version ${TSDB_VER})"
+      pass "TimescaleDB extension installed in ${TEST_DB} (version ${TSDB_VER})"
     else
-      fail "TimescaleDB extension NOT found in pg_extension (connect as postgres and run: CREATE EXTENSION IF NOT EXISTS timescaledb;)"
+      fail "TimescaleDB extension NOT found in ${TEST_DB} (run install.sh step 04, or: sudo -u postgres psql -d ${TEST_DB} -c 'CREATE EXTENSION IF NOT EXISTS timescaledb;')"
       (( failures++ )) || true
     fi
 
