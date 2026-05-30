@@ -101,9 +101,9 @@ cmd_status() {
   if command -v psql &>/dev/null && systemctl is-active --quiet postgresql 2>/dev/null; then
     if sudo -u postgres psql -Atqc \
          "SELECT 1 FROM pg_database WHERE datname = '${TEST_DB}';" 2>/dev/null | grep -q 1; then
-      tsdb_ver="$(sudo -u postgres psql -Atqc -d "$TEST_DB" \
+      tsdb_ver="$(sudo -u postgres psql -Atq -d "$TEST_DB" -c \
         "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb';" 2>/dev/null || true)"
-      rows="$(sudo -u postgres psql -Atqc -d "$TEST_DB" \
+      rows="$(sudo -u postgres psql -Atq -d "$TEST_DB" -c \
         "SELECT count(*) FROM collab_healthcheck;" 2>/dev/null || true)"
       if [[ -n "$tsdb_ver" ]]; then
         pass "${TEST_DB} (timescaledb ${tsdb_ver}, healthcheck rows: ${rows:-?})"
@@ -194,7 +194,7 @@ cmd_doctor() {
   divider
 
   if command -v psql &>/dev/null && systemctl is-active --quiet postgresql 2>/dev/null; then
-    TSDB_VER="$(sudo -u postgres psql -Atqc -d "$TEST_DB" \
+    TSDB_VER="$(sudo -u postgres psql -Atq -d "$TEST_DB" -c \
       "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb';" \
       2>/dev/null || true)"
     if [[ -n "$TSDB_VER" ]]; then

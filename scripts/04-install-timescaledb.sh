@@ -133,7 +133,7 @@ INSERT INTO collab_healthcheck VALUES (NOW(), 1.0);
 SELECT 'timescaledb test ok' AS result FROM collab_healthcheck LIMIT 1;
 SQL
 
-TSDB_VER="$(sudo -u postgres psql -Atqc -d "$TEST_DB" \
+TSDB_VER="$(sudo -u postgres psql -Atq -d "$TEST_DB" -c \
   "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb';" 2>/dev/null || true)"
 
 log_ok "TimescaleDB Community ${TSDB_VER} verified in database '${TEST_DB}' on PostgreSQL ${PG_VERSION}"
