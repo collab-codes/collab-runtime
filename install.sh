@@ -150,6 +150,7 @@ run_step() {
   fi
 }
 
+run_step 00 "Setup Data Disk"         "00-setup-data-disk.sh"
 run_step 01 "Ubuntu System Update"    "01-ubuntu-update.sh"
 run_step 02 "Install NGINX"           "02-install-nginx.sh"
 run_step 03 "Install PostgreSQL"      "03-install-postgres.sh"
