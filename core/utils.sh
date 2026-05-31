@@ -125,5 +125,6 @@ print_versions_table() {
   command_exists npm        && printf "  %-20s %s\n" "npm"        "$(npm --version)"
   command_exists pm2        && printf "  %-20s %s\n" "pm2"        "$(pm2 --version 2>/dev/null)"
   command_exists 7z         && printf "  %-20s %s\n" "7zip"       "$(7z i 2>&1 | awk '/7-Zip/{print $2; exit}')"
+  command_exists certbot    && printf "  %-20s %s\n" "certbot"    "$(certbot --version 2>&1 | awk '{print $2}')"
   echo ""
 }

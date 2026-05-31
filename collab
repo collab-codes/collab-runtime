@@ -5,6 +5,7 @@
 # Usage:
 #   collab logs [--detail]
 #   collab status
+#   collab statusdb
 #   collab doctor
 #   collab update --check
 #   collab update --apply
@@ -94,6 +95,7 @@ cmd_status() {
   command -v npm       &>/dev/null && info "npm        $(npm --version)"
   command -v pm2       &>/dev/null && info "pm2        $(pm2 --version 2>/dev/null)"
   command -v 7z        &>/dev/null && info "7zip       $(7z i 2>&1 | grep '7-Zip' | head -1 | awk '{print $1, $2}')"
+  command -v certbot   &>/dev/null && info "certbot    $(certbot --version 2>&1 | awk '{print $2}')"
 
   # Test database (TimescaleDB health-check DB)
   echo -e "\n${C_BOLD}Database${C_RESET}"
@@ -125,6 +127,93 @@ cmd_status() {
   df -h / /data 2>/dev/null | tail -n +2 | \
     awk '{printf "  %-12s %8s %8s %8s %6s\n", $1, $2, $3, $4, $5}'
 
+  echo ""
+}
+
+# ── Subcommand: statusdb ─────────────────────────────────────────────────────
+# Lists every database owned by the 'collab' role and the tables inside each.
+# Connects as the 'collab' PostgreSQL user over TCP. The password is NEVER stored
+# in this script: it is read interactively at runtime (or taken from $PGPASSWORD
+# if it is already exported in the environment).
+cmd_statusdb() {
+  local db_user="collab"
+  local db_host="${PGHOST:-localhost}"
+  local db_port="${PGPORT:-5432}"
+
+  header "collab — databases (user: ${db_user}@${db_host}:${db_port})"
+
+  if ! command -v psql &>/dev/null; then
+    fail "psql not found"
+    exit 1
+  fi
+  if ! systemctl is-active --quiet postgresql 2>/dev/null; then
+    warn "postgresql service is not active — trying to connect anyway"
+  fi
+
+  # Password: taken from the environment if present, otherwise prompted (never
+  # hard-coded in source). Read silently so it is not echoed to the terminal.
+  local pw="${PGPASSWORD:-}"
+  if [[ -z "$pw" ]]; then
+    read -rsp "  Password for PostgreSQL role '${db_user}': " pw
+    echo ""
+  fi
+  export PGPASSWORD="$pw"
+
+  # psql helper bound to this connection (-X: ignore ~/.psqlrc, -A -t -q: script-friendly).
+  psql_collab() { psql -h "$db_host" -p "$db_port" -U "$db_user" -X -Atq "$@"; }
+
+  # Connection / auth test before doing anything else.
+  if ! psql_collab -d postgres -c "SELECT 1" &>/dev/null; then
+    unset PGPASSWORD
+    fail "could not connect as '${db_user}' (wrong password, or role/permission issue)"
+    exit 1
+  fi
+
+  # Databases owned by the collab role.
+  local dbs
+  dbs="$(psql_collab -d postgres -c \
+    "SELECT d.datname FROM pg_database d JOIN pg_roles r ON d.datdba = r.oid \
+     WHERE r.rolname = '${db_user}' AND NOT d.datistemplate ORDER BY d.datname")"
+
+  if [[ -z "$dbs" ]]; then
+    unset PGPASSWORD
+    warn "no databases owned by role '${db_user}'"
+    echo ""
+    return 0
+  fi
+
+  # User tables with on-disk size and estimated row count.
+  # TimescaleDB internal chunk/catalog schemas are hidden for readability.
+  local tbl_query="\
+    SELECT n.nspname || '.' || c.relname, \
+           pg_size_pretty(pg_total_relation_size(c.oid)), \
+           COALESCE(s.n_live_tup, 0) \
+    FROM pg_class c \
+    JOIN pg_namespace n ON n.oid = c.relnamespace \
+    LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid \
+    WHERE c.relkind IN ('r','p') \
+      AND n.nspname NOT IN ('pg_catalog','information_schema','timescaledb_information') \
+      AND n.nspname NOT LIKE 'pg_toast%' \
+      AND n.nspname NOT LIKE '_timescaledb%' \
+    ORDER BY 1"
+
+  local db dbsize tbl size rows count
+  while IFS= read -r db; do
+    [[ -z "$db" ]] && continue
+    dbsize="$(psql_collab -d "$db" -c "SELECT pg_size_pretty(pg_database_size('${db}'))" 2>/dev/null || echo '?')"
+    echo -e "\n${C_BOLD}${db}${C_RESET} ${C_DIM}(${dbsize})${C_RESET}"
+    divider
+    printf "  %-44s %10s %12s\n" "Table" "Size" "Est.rows"
+    count=0
+    while IFS='|' read -r tbl size rows; do
+      [[ -z "$tbl" ]] && continue
+      printf "  %-44s %10s %12s\n" "$tbl" "$size" "$rows"
+      count=$((count + 1))
+    done < <(psql_collab -d "$db" -c "$tbl_query" 2>/dev/null || true)
+    [[ "$count" -eq 0 ]] && echo -e "  ${C_DIM}(no user tables)${C_RESET}"
+  done <<< "$dbs"
+
+  unset PGPASSWORD
   echo ""
 }
 
@@ -289,6 +378,7 @@ cmd_help() {
   echo "Commands:"
   echo "  logs [--detail]     Show install log (summary or full detail)"
   echo "  status              Show service health, versions, and disk usage"
+  echo "  statusdb            List all databases and tables owned by the 'collab' user"
   echo "  doctor              Run PASS/FAIL diagnostics for all components"
   echo "  update --check      List available apt upgrades (dry-run)"
   echo "  update --apply      Apply all apt upgrades (requires sudo)"
@@ -296,6 +386,7 @@ cmd_help() {
   echo ""
   echo "Examples:"
   echo "  collab status"
+  echo "  collab statusdb"
   echo "  collab doctor"
   echo "  collab logs --detail"
   echo "  collab update --check"
@@ -308,9 +399,10 @@ COMMAND="${1:-help}"
 shift || true
 
 case "$COMMAND" in
-  logs)    cmd_logs   "$@" ;;
-  status)  cmd_status "$@" ;;
-  doctor)  cmd_doctor "$@" ;;
+  logs)     cmd_logs     "$@" ;;
+  status)   cmd_status   "$@" ;;
+  statusdb) cmd_statusdb "$@" ;;
+  doctor)   cmd_doctor   "$@" ;;
   update)  cmd_update "$@" ;;
   help|--help|-h) cmd_help ;;
   *)

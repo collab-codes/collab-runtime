@@ -82,6 +82,7 @@ After installation, the `collab` CLI is available at `/usr/local/bin/collab`.
 
 ```
 collab status              # show service health + versions
+collab statusdb            # databases + tables owned by the 'collab' user (prompts for password)
 collab logs                # last 50 lines of install-summary.log
 collab logs --detail       # last 50 lines of install-detail.log
 collab doctor              # PASS/FAIL check for all components

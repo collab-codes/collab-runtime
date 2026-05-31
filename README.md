@@ -35,6 +35,7 @@ A `collab` command is available for ongoing server maintenance:
 
 ```bash
 collab status          # service health and versions
+collab statusdb        # databases + tables owned by the 'collab' user (prompts for password)
 collab doctor          # full PASS/FAIL diagnostic
 collab logs            # installation summary log
 collab update --check  # list available system updates
