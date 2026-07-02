@@ -60,3 +60,51 @@ else
 fi
 chown -R "${DEPLOY_USER}:" "$MLS_BASE_DIR"
 log_ok "${MLS_BASE_DIR} ready (owner: ${DEPLOY_USER})"
+
+# ── runtime .env ─────────────────────────────────────────────────────────────────
+# Stable at the mls-base root; addNewVersion.mjs copies it into every release (the
+# server and migrate resolve .env from their cwd). Without it the app falls back to
+# APP_ENV=development + RUNTIME_MODE=memory and never touches Postgres.
+# Credentials match the role created by 03-install-postgres.sh (collab/collab).
+ENV_FILE="${MLS_BASE_DIR}/.env"
+DB_APP_USER="${DB_APP_USER:-collab}"
+DB_APP_PASSWORD="${DB_APP_PASSWORD:-collab}"
+DB_APP_DATABASE="${DB_APP_DATABASE:-mdm}"
+if [[ -f "$ENV_FILE" ]]; then
+  log_info ".env already present at ${ENV_FILE} — leaving it untouched"
+else
+  log_info "Creating ${ENV_FILE} (production runtime, postgres as '${DB_APP_USER}')…"
+  cat > "$ENV_FILE" <<EOF
+APP_ENV=production
+RUNTIME_MODE=postgres
+PORT=3000
+PGHOST=127.0.0.1
+PGPORT=5432
+PGDATABASE=${DB_APP_DATABASE}
+PGUSER=${DB_APP_USER}
+PGPASSWORD=${DB_APP_PASSWORD}
+# Local VM has no AWS/DynamoDB: keep the write-behind worker off.
+WRITE_BEHIND_ENABLED=false
+EOF
+  chown "${DEPLOY_USER}:" "$ENV_FILE"
+  log_ok "${ENV_FILE} created"
+fi
+
+# ── application database ─────────────────────────────────────────────────────────
+# migrate.js creates tables but not the database itself; ensure it exists here.
+if command_exists psql; then
+  if sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname = '${DB_APP_DATABASE}';" | grep -q 1; then
+    log_info "Database '${DB_APP_DATABASE}' already exists"
+  else
+    log_info "Creating database '${DB_APP_DATABASE}' owned by '${DB_APP_USER}'…"
+    sudo -u postgres psql -c "CREATE DATABASE \"${DB_APP_DATABASE}\" OWNER \"${DB_APP_USER}\";"
+    log_ok "Database '${DB_APP_DATABASE}' created"
+  fi
+  # Per-database and superuser-only (step 04 installs the packages; the app cannot
+  # enable the extension at runtime — hypertables need it).
+  log_info "Ensuring timescaledb extension on '${DB_APP_DATABASE}'…"
+  sudo -u postgres psql -d "${DB_APP_DATABASE}" -c 'CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;' \
+    || log_warn "timescaledb extension not enabled (step 04 ran?) — hypertables fall back to regular tables"
+else
+  log_warn "psql not found — skipping database creation (run step 03 first)"
+fi
