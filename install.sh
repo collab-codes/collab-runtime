@@ -209,14 +209,26 @@ AGENT_DEST="/usr/local/bin/collab-sites-agent"
 AGENT_SERVICE="/etc/systemd/system/collab-sites-agent.service"
 
 install_agent_binary=false
+installed_cargo_for_agent=false
 if [[ -x "$AGENT_SRC_PREBUILT" ]]; then
   install_agent_binary=true
-elif command -v cargo >/dev/null 2>&1 && [[ -f "$AGENT_MANIFEST" ]]; then
-  log_info "Building collab-sites-agent with cargo"
-  if cargo build --release --manifest-path "$AGENT_MANIFEST"; then
-    install_agent_binary=true
-  else
-    log_error "collab-sites-agent cargo build failed"
+elif [[ -f "$AGENT_MANIFEST" ]]; then
+  if ! command -v cargo >/dev/null 2>&1; then
+    log_info "cargo not found; installing cargo to build collab-sites-agent"
+    if apt-get update -y && apt-get install -y cargo; then
+      installed_cargo_for_agent=true
+    else
+      log_error "Could not install cargo for collab-sites-agent"
+    fi
+  fi
+
+  if command -v cargo >/dev/null 2>&1; then
+    log_info "Building collab-sites-agent with cargo"
+    if cargo build --release --manifest-path "$AGENT_MANIFEST"; then
+      install_agent_binary=true
+    else
+      log_error "collab-sites-agent cargo build failed"
+    fi
   fi
 fi
 
@@ -255,6 +267,12 @@ EOF
 else
   record_step_result "collab-sites agent" "SKIP" "prebuilt binary missing and cargo unavailable"
   log_warn "collab-sites-agent not installed; provide a prebuilt agent/target/release/collab-sites-agent or install cargo before running install.sh"
+fi
+
+if [[ "$installed_cargo_for_agent" == true ]]; then
+  log_info "Removing cargo build toolchain installed for collab-sites-agent"
+  apt-get purge -y cargo rustc || true
+  apt-get autoremove -y || true
 fi
 
 # ── Step 9: Finalize and print summary ─────────────────────────────────────────
