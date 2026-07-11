@@ -122,19 +122,24 @@ collab_sites_event() {
   local details="${5:-{}}"
 
   if ! collab_sites_can_report || ! command -v curl >/dev/null 2>&1; then
+    if collab_sites_can_report; then
+      log_warn "Cannot report collab-sites event '${code}': curl is not installed yet"
+    fi
     return 0
   fi
 
   local payload
   payload="{\"projectId\":\"$(json_escape "$PROJECT_ID")\",\"token\":\"$(json_escape "$AGENT_TOKEN")\",\"level\":\"$(json_escape "$level")\",\"code\":\"$(json_escape "$code")\",\"message\":\"$(json_escape "$message")\",\"status\":\"$(json_escape "$status")\",\"details\":${details}}"
 
-  curl -fsS \
+  if ! curl -fsS \
     --max-time 10 \
     -H "Content-Type: application/json" \
     -H "X-Collab-Origin: collab-runtime-install" \
     -X POST \
     --data-binary "$payload" \
-    "${SITES_URL%/}/api/v1/servers/${SERVER_ID}/events" >/dev/null 2>&1 || true
+    "${SITES_URL%/}/api/v1/servers/${SERVER_ID}/events" >/dev/null; then
+    log_warn "Failed to report collab-sites event '${code}'"
+  fi
 }
 
 # ── Step 3: Load profile ───────────────────────────────────────────────────────
@@ -172,7 +177,6 @@ echo "  Log (detail)  : ${DETAIL_LOG}"
 echo "  Started at: $(date '+%Y-%m-%d %H:%M:%S')"
 echo ""
 log_summary "Profile: ${PROFILE} | PG: ${PG_VERSION} | Node: ${NODE_VERSION}"
-collab_sites_event "info" "runtime.bootstrap_started" "collab-runtime bootstrap started" "" "{\"profile\":\"$(json_escape "$PROFILE")\",\"runtimeDir\":\"$(json_escape "$INSTALL_DIR")\"}"
 
 # ── Step 6.5: Remove stale apt repos from any previous failed run ─────────────
 # Third-party repos added in a previous run may reference a wrong Ubuntu
@@ -195,6 +199,17 @@ done
 # Remove orphaned keyring if redis.list was removed
 rm -f /usr/share/keyrings/redis-archive-keyring.gpg 2>/dev/null || true
 log_ok "Stale repo cleanup done"
+
+if collab_sites_can_report && ! command -v curl >/dev/null 2>&1; then
+  log_section "Pre-flight: installing curl for collab-sites progress events"
+  if apt-get update -y && apt-get install -y curl; then
+    log_ok "curl installed for collab-sites progress events"
+  else
+    log_warn "Could not install curl; collab-sites progress events may be unavailable"
+  fi
+fi
+
+collab_sites_event "info" "runtime.bootstrap_started" "collab-runtime bootstrap started" "" "{\"profile\":\"$(json_escape "$PROFILE")\",\"runtimeDir\":\"$(json_escape "$INSTALL_DIR")\"}"
 
 # ── Step 7: Run install scripts ────────────────────────────────────────────────
 # Each script is run in a subshell. On failure, we log the error and continue
