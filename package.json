@@ -1,0 +1,9 @@
+{
+  "name": "collab-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "cargo build --release --manifest-path agent/Cargo.toml",
+    "publish": "sh scripts/publish.sh"
+  }
+}

@@ -4,7 +4,7 @@
 # Bootstrap and install the full collab server stack on Ubuntu 24.04 LTS.
 #
 # Usage:
-#   sudo ./install.sh [--profile=small|medium|enterprise]
+#   sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--agent-env=/etc/collab/sites-agent.env]
 #
 # Requirements:
 #   - Ubuntu 24.04 LTS (exits immediately on any other OS)
@@ -43,26 +43,48 @@ require_root
 
 # ── Step 2: Parse arguments ────────────────────────────────────────────────────
 PROFILE="medium"  # default
+SERVER_ID=""
+PROJECT_ID=""
+SITES_URL=""
+AGENT_ENV="/etc/collab/sites-agent.env"
 
 for arg in "$@"; do
   case "$arg" in
     --profile=*)
       PROFILE="${arg#--profile=}"
       ;;
+    --server-id=*)
+      SERVER_ID="${arg#--server-id=}"
+      ;;
+    --project-id=*)
+      PROJECT_ID="${arg#--project-id=}"
+      ;;
+    --sites-url=*)
+      SITES_URL="${arg#--sites-url=}"
+      ;;
+    --agent-env=*)
+      AGENT_ENV="${arg#--agent-env=}"
+      ;;
     --help|-h)
       echo ""
-      echo "Usage: sudo ./install.sh [--profile=small|medium|enterprise]"
+      echo "Usage: sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--agent-env=/etc/collab/sites-agent.env]"
       echo ""
       echo "Profiles:"
       echo "  small      1-2 vCPU / 1-2 GB RAM"
       echo "  medium     2-4 vCPU / 4-8 GB RAM  (default)"
       echo "  enterprise 8+ vCPU / 32+ GB RAM"
       echo ""
+      echo "collab-sites agent:"
+      echo "  --server-id   Server id registered in collab-sites"
+      echo "  --project-id  Project id hosted by this runtime"
+      echo "  --sites-url   collab-sites base URL"
+      echo "  --agent-env   Root-only env file with heartbeat token"
+      echo ""
       exit 0
       ;;
     *)
       echo "[ERR]  Unknown argument: ${arg}" >&2
-      echo "Usage: sudo ./install.sh [--profile=small|medium|enterprise]" >&2
+      echo "Usage: sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--agent-env=/etc/collab/sites-agent.env]" >&2
       exit 1
       ;;
   esac
@@ -176,6 +198,63 @@ if [[ -f "$CLI_SRC" ]]; then
 else
   record_step_result "collab CLI" "FAIL" "source file not found: ${CLI_SRC}"
   log_error "collab CLI source not found at ${CLI_SRC}"
+fi
+
+# ── Step 8.5: Install collab-sites heartbeat agent ────────────────────────────
+log_section "Installing collab-sites agent"
+
+AGENT_SRC_PREBUILT="${INSTALL_DIR}/agent/target/release/collab-sites-agent"
+AGENT_MANIFEST="${INSTALL_DIR}/agent/Cargo.toml"
+AGENT_DEST="/usr/local/bin/collab-sites-agent"
+AGENT_SERVICE="/etc/systemd/system/collab-sites-agent.service"
+
+install_agent_binary=false
+if [[ -x "$AGENT_SRC_PREBUILT" ]]; then
+  install_agent_binary=true
+elif command -v cargo >/dev/null 2>&1 && [[ -f "$AGENT_MANIFEST" ]]; then
+  log_info "Building collab-sites-agent with cargo"
+  if cargo build --release --manifest-path "$AGENT_MANIFEST"; then
+    install_agent_binary=true
+  else
+    log_error "collab-sites-agent cargo build failed"
+  fi
+fi
+
+if [[ "$install_agent_binary" == true && -x "$AGENT_SRC_PREBUILT" ]]; then
+  cp "$AGENT_SRC_PREBUILT" "$AGENT_DEST"
+  chmod +x "$AGENT_DEST"
+  record_step_result "collab-sites agent binary" "PASS" "installed to ${AGENT_DEST}"
+
+  if [[ -f "$AGENT_ENV" ]]; then
+    chmod 600 "$AGENT_ENV"
+    cat > "$AGENT_SERVICE" <<EOF
+[Unit]
+Description=collab-sites runtime heartbeat agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=${AGENT_ENV}
+ExecStart=${AGENT_DEST} --env ${AGENT_ENV}
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now collab-sites-agent
+    record_step_result "collab-sites agent service" "PASS" "enabled systemd service"
+    log_ok "collab-sites agent service enabled"
+  else
+    record_step_result "collab-sites agent service" "SKIP" "agent env not found: ${AGENT_ENV}"
+    log_warn "Agent env file not found: ${AGENT_ENV}; service not enabled"
+  fi
+else
+  record_step_result "collab-sites agent" "SKIP" "prebuilt binary missing and cargo unavailable"
+  log_warn "collab-sites-agent not installed; provide a prebuilt agent/target/release/collab-sites-agent or install cargo before running install.sh"
 fi
 
 # ── Step 9: Finalize and print summary ─────────────────────────────────────────

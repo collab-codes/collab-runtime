@@ -77,7 +77,7 @@ cmd_status() {
   # Service status
   echo -e "\n${C_BOLD}Services${C_RESET}"
   divider
-  for svc in nginx postgresql redis-server; do
+  for svc in nginx postgresql redis-server collab-sites-agent; do
     if systemctl is-active --quiet "$svc" 2>/dev/null; then
       pass "${svc}"
     else
