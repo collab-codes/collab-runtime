@@ -100,6 +100,43 @@ for arg in "$@"; do
   esac
 done
 
+json_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  printf '%s' "$value"
+}
+
+collab_sites_can_report() {
+  [[ -n "$SERVER_ID" && -n "$PROJECT_ID" && -n "$SITES_URL" && -n "$AGENT_TOKEN" ]]
+}
+
+collab_sites_event() {
+  local level="$1"
+  local code="$2"
+  local message="$3"
+  local status="${4:-}"
+  local details="${5:-{}}"
+
+  if ! collab_sites_can_report || ! command -v curl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local payload
+  payload="{\"projectId\":\"$(json_escape "$PROJECT_ID")\",\"token\":\"$(json_escape "$AGENT_TOKEN")\",\"level\":\"$(json_escape "$level")\",\"code\":\"$(json_escape "$code")\",\"message\":\"$(json_escape "$message")\",\"status\":\"$(json_escape "$status")\",\"details\":${details}}"
+
+  curl -fsS \
+    --max-time 10 \
+    -H "Content-Type: application/json" \
+    -H "X-Collab-Origin: collab-runtime-install" \
+    -X POST \
+    --data-binary "$payload" \
+    "${SITES_URL%/}/api/v1/servers/${SERVER_ID}/events" >/dev/null 2>&1 || true
+}
+
 # ── Step 3: Load profile ───────────────────────────────────────────────────────
 PROFILE_CONF="${INSTALL_DIR}/profiles/${PROFILE}/profile.conf"
 if [[ ! -f "$PROFILE_CONF" ]]; then
@@ -135,6 +172,7 @@ echo "  Log (detail)  : ${DETAIL_LOG}"
 echo "  Started at: $(date '+%Y-%m-%d %H:%M:%S')"
 echo ""
 log_summary "Profile: ${PROFILE} | PG: ${PG_VERSION} | Node: ${NODE_VERSION}"
+collab_sites_event "info" "runtime.bootstrap_started" "collab-runtime bootstrap started" "" "{\"profile\":\"$(json_escape "$PROFILE")\",\"runtimeDir\":\"$(json_escape "$INSTALL_DIR")\"}"
 
 # ── Step 6.5: Remove stale apt repos from any previous failed run ─────────────
 # Third-party repos added in a previous run may reference a wrong Ubuntu
@@ -169,15 +207,18 @@ run_step() {
   local script="$3"
 
   log_section "Running ${step_name}"
+  collab_sites_event "info" "runtime.step_started" "Starting ${step_name}" "" "{\"step\":\"$(json_escape "$step_name")\",\"script\":\"$(json_escape "$script")\",\"stepNumber\":\"$(json_escape "$step_num")\"}"
 
   if bash "${INSTALL_DIR}/scripts/${script}"; then
     record_step_result "$step_name" "PASS"
     log_ok "${step_name} completed successfully"
+    collab_sites_event "info" "runtime.step_completed" "${step_name} completed successfully" "" "{\"step\":\"$(json_escape "$step_name")\",\"script\":\"$(json_escape "$script")\",\"stepNumber\":\"$(json_escape "$step_num")\"}"
   else
     local exit_code=$?
     record_step_result "$step_name" "FAIL" "exit code ${exit_code}"
     log_error "${step_name} FAILED with exit code ${exit_code}"
     log_error "Check ${DETAIL_LOG} for details"
+    collab_sites_event "error" "runtime.step_failed" "${step_name} failed" "failed" "{\"step\":\"$(json_escape "$step_name")\",\"script\":\"$(json_escape "$script")\",\"stepNumber\":\"$(json_escape "$step_num")\",\"exitCode\":${exit_code}}"
     # Do not exit — continue with remaining steps
   fi
 }
@@ -205,9 +246,11 @@ if [[ -f "$CLI_SRC" ]]; then
   chmod +x "$CLI_DEST"
   record_step_result "collab CLI" "PASS" "installed to ${CLI_DEST}"
   log_ok "collab CLI installed to ${CLI_DEST}"
+  collab_sites_event "info" "runtime.cli_installed" "collab CLI installed" "" "{\"path\":\"$(json_escape "$CLI_DEST")\"}"
 else
   record_step_result "collab CLI" "FAIL" "source file not found: ${CLI_SRC}"
   log_error "collab CLI source not found at ${CLI_SRC}"
+  collab_sites_event "error" "runtime.cli_failed" "collab CLI source not found" "failed" "{\"path\":\"$(json_escape "$CLI_SRC")\"}"
 fi
 
 # ── Step 8.5: Install collab-sites heartbeat agent ────────────────────────────
@@ -237,8 +280,10 @@ COLLAB_SITES_AGENT_VERSION=0.1.0
 EOF
   chmod 600 "$AGENT_ENV"
   record_step_result "collab-sites agent env" "PASS" "written to ${AGENT_ENV}"
+  collab_sites_event "info" "runtime.agent_env_written" "collab-sites agent env written" "" "{\"path\":\"$(json_escape "$AGENT_ENV")\"}"
 elif [[ -f "$AGENT_ENV" ]]; then
   record_step_result "collab-sites agent env" "PASS" "using existing ${AGENT_ENV}"
+  collab_sites_event "info" "runtime.agent_env_existing" "Using existing collab-sites agent env" "" "{\"path\":\"$(json_escape "$AGENT_ENV")\"}"
 else
   record_step_result "collab-sites agent env" "SKIP" "missing --server-id/--project-id/--sites-url/--agent-token"
 fi
@@ -295,6 +340,7 @@ EOF
     systemctl enable --now collab-sites-agent
     record_step_result "collab-sites agent service" "PASS" "enabled systemd service"
     log_ok "collab-sites agent service enabled"
+    collab_sites_event "info" "runtime.agent_started" "collab-sites agent service enabled" "" "{\"service\":\"collab-sites-agent\"}"
   else
     record_step_result "collab-sites agent service" "SKIP" "agent env not found: ${AGENT_ENV}"
     log_warn "Agent env file not found: ${AGENT_ENV}; service not enabled"
@@ -312,6 +358,12 @@ fi
 
 # ── Step 9: Finalize and print summary ─────────────────────────────────────────
 finalize_logs
+
+if grep -q "FAIL" "$SUMMARY_LOG"; then
+  collab_sites_event "error" "runtime.failed" "collab-runtime bootstrap finished with failures" "failed" "{\"summaryLog\":\"$(json_escape "$SUMMARY_LOG")\",\"detailLog\":\"$(json_escape "$DETAIL_LOG")\"}"
+else
+  collab_sites_event "info" "runtime.ready" "collab-runtime bootstrap finished" "ready" "{\"summaryLog\":\"$(json_escape "$SUMMARY_LOG")\",\"detailLog\":\"$(json_escape "$DETAIL_LOG")\"}"
+fi
 
 # ── Step 10: Print next steps ──────────────────────────────────────────────────
 echo ""

@@ -149,13 +149,14 @@ fn heartbeat_payload(config: &Config) -> String {
 
 fn status_payload(config: &Config) -> String {
     format!(
-        "{{\"hostname\":\"{}\",\"region\":\"{}\",\"dataRoot\":\"{}\",\"runtimeDir\":\"{}\",\"loadavg\":\"{}\",\"disk\":\"{}\",\"services\":{{\"nginx\":\"{}\",\"postgresql\":\"{}\",\"redis\":\"{}\"}}}}",
+        "{{\"hostname\":\"{}\",\"region\":\"{}\",\"dataRoot\":\"{}\",\"runtimeDir\":\"{}\",\"loadavg\":\"{}\",\"disk\":\"{}\",\"collabStatus\":\"{}\",\"services\":{{\"nginx\":\"{}\",\"postgresql\":\"{}\",\"redis\":\"{}\"}}}}",
         json_escape(&command_output("hostname", &[]).unwrap_or_default()),
         json_escape(&config.region),
         json_escape(&config.data_root),
         json_escape(&config.runtime_dir),
         json_escape(&fs::read_to_string("/proc/loadavg").unwrap_or_default().trim().to_string()),
         json_escape(&command_output("df", &["-h", config.data_root.as_str()]).unwrap_or_default()),
+        json_escape(&command_output("collab", &["status"]).unwrap_or_else(|| "collab status unavailable".to_string())),
         json_escape(&systemd_status("nginx")),
         json_escape(&systemd_status("postgresql")),
         json_escape(&systemd_status("redis-server")),
