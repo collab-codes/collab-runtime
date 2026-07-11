@@ -35,7 +35,7 @@ to decouple OS and data lifecycles. Recommended: `gp3`, at least 50 GB.
 ## Quick start
 
 ```bash
-git clone https://github.com/collabcodes/collab-runtime.git
+git clone https://github.com/collab-codes/collab-runtime.git
 cd collab-runtime
 sudo ./install.sh --profile=medium
 ```

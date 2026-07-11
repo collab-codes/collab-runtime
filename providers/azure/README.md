@@ -40,7 +40,7 @@ Recommended: Premium SSD, at least 64 GB.
 ## Quick start
 
 ```bash
-git clone https://github.com/collabcodes/collab-runtime.git
+git clone https://github.com/collab-codes/collab-runtime.git
 cd collab-runtime
 sudo ./install.sh --profile=medium
 ```

@@ -41,7 +41,7 @@ Also works inside a **Lima VM** on macOS M4 (aarch64).
 
 ```bash
 # Clone the repo on your target server
-git clone https://github.com/collabcodes/collab-runtime.git
+git clone https://github.com/collab-codes/collab-runtime.git
 cd collab-runtime
 
 # Run with the default (medium) profile
@@ -138,7 +138,7 @@ collab-runtime/
 limactl start --name=collab template://ubuntu-24.04
 limactl shell collab
 # inside Lima:
-git clone https://github.com/collabcodes/collab-runtime.git
+git clone https://github.com/collab-codes/collab-runtime.git
 cd collab-runtime
 sudo ./install.sh --profile=small
 ```
