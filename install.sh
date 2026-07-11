@@ -4,7 +4,7 @@
 # Bootstrap and install the full collab server stack on Ubuntu 24.04 LTS.
 #
 # Usage:
-#   sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--agent-env=/etc/collab/sites-agent.env]
+#   sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--agent-token=...] [--agent-env=/etc/collab/sites-agent.env]
 #
 # Requirements:
 #   - Ubuntu 24.04 LTS (exits immediately on any other OS)
@@ -46,6 +46,7 @@ PROFILE="medium"  # default
 SERVER_ID=""
 PROJECT_ID=""
 SITES_URL=""
+AGENT_TOKEN=""
 AGENT_ENV="/etc/collab/sites-agent.env"
 
 for arg in "$@"; do
@@ -62,12 +63,15 @@ for arg in "$@"; do
     --sites-url=*)
       SITES_URL="${arg#--sites-url=}"
       ;;
+    --agent-token=*)
+      AGENT_TOKEN="${arg#--agent-token=}"
+      ;;
     --agent-env=*)
       AGENT_ENV="${arg#--agent-env=}"
       ;;
     --help|-h)
       echo ""
-      echo "Usage: sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--agent-env=/etc/collab/sites-agent.env]"
+      echo "Usage: sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--agent-token=...] [--agent-env=/etc/collab/sites-agent.env]"
       echo ""
       echo "Profiles:"
       echo "  small      1-2 vCPU / 1-2 GB RAM"
@@ -78,13 +82,14 @@ for arg in "$@"; do
       echo "  --server-id   Server id registered in collab-sites"
       echo "  --project-id  Project id hosted by this runtime"
       echo "  --sites-url   collab-sites base URL"
+      echo "  --agent-token Runtime heartbeat token issued by collab-sites"
       echo "  --agent-env   Root-only env file with heartbeat token"
       echo ""
       exit 0
       ;;
     *)
       echo "[ERR]  Unknown argument: ${arg}" >&2
-      echo "Usage: sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--agent-env=/etc/collab/sites-agent.env]" >&2
+      echo "Usage: sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--agent-token=...] [--agent-env=/etc/collab/sites-agent.env]" >&2
       exit 1
       ;;
   esac
@@ -207,6 +212,31 @@ AGENT_SRC_PREBUILT="${INSTALL_DIR}/agent/target/release/collab-sites-agent"
 AGENT_MANIFEST="${INSTALL_DIR}/agent/Cargo.toml"
 AGENT_DEST="/usr/local/bin/collab-sites-agent"
 AGENT_SERVICE="/etc/systemd/system/collab-sites-agent.service"
+
+if [[ -n "$SERVER_ID" && -n "$PROJECT_ID" && -n "$SITES_URL" && -n "$AGENT_TOKEN" ]]; then
+  mkdir -p "$(dirname "$AGENT_ENV")"
+  cat > "$AGENT_ENV" <<EOF
+COLLAB_SITES_URL=${SITES_URL%/}
+COLLAB_SITES_SERVER_ID=${SERVER_ID}
+COLLAB_SITES_PROJECT_ID=${PROJECT_ID}
+COLLAB_SITES_AGENT_TOKEN=${AGENT_TOKEN}
+COLLAB_SITES_AGENT_BIND=127.0.0.1:5151
+COLLAB_SITES_ALLOWED_ORIGIN=sites.collab.codes
+COLLAB_SITES_HEARTBEAT_INTERVAL_SECONDS=30
+COLLAB_SITES_DATA_ROOT=/data
+COLLAB_SITES_RUNTIME_DIR=${INSTALL_DIR}
+COLLAB_SITES_REGION=
+COLLAB_SITES_INSTANCE_ID=
+COLLAB_SITES_INSTANCE_ID_FROM_IMDS=true
+COLLAB_SITES_AGENT_VERSION=0.1.0
+EOF
+  chmod 600 "$AGENT_ENV"
+  record_step_result "collab-sites agent env" "PASS" "written to ${AGENT_ENV}"
+elif [[ -f "$AGENT_ENV" ]]; then
+  record_step_result "collab-sites agent env" "PASS" "using existing ${AGENT_ENV}"
+else
+  record_step_result "collab-sites agent env" "SKIP" "missing --server-id/--project-id/--sites-url/--agent-token"
+fi
 
 install_agent_binary=false
 installed_cargo_for_agent=false

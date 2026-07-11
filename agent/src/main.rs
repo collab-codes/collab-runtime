@@ -56,8 +56,7 @@ impl Config {
         let mut instance_id = values.get("COLLAB_SITES_INSTANCE_ID").cloned().unwrap_or_default();
         let instance_id_from_imds = values.get("COLLAB_SITES_INSTANCE_ID_FROM_IMDS").map(|v| v == "true").unwrap_or(true);
         if instance_id.is_empty() && instance_id_from_imds {
-            instance_id = command_output("curl", &["-fsS", "--max-time", "2", "http://169.254.169.254/latest/meta-data/instance-id"])
-                .unwrap_or_default();
+            instance_id = metadata_instance_id().unwrap_or_default();
         }
 
         Ok(Self {
@@ -75,6 +74,34 @@ impl Config {
             agent_version: values.get("COLLAB_SITES_AGENT_VERSION").cloned().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
         })
     }
+}
+
+fn metadata_instance_id() -> Option<String> {
+    let token = command_output("curl", &[
+        "-fsS",
+        "--max-time", "2",
+        "-X", "PUT",
+        "-H", "X-aws-ec2-metadata-token-ttl-seconds: 21600",
+        "http://169.254.169.254/latest/api/token",
+    ]).unwrap_or_default();
+
+    if !token.is_empty() {
+        let value = command_output("curl", &[
+            "-fsS",
+            "--max-time", "2",
+            "-H", &format!("X-aws-ec2-metadata-token: {}", token),
+            "http://169.254.169.254/latest/meta-data/instance-id",
+        ]).unwrap_or_default();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+
+    command_output("curl", &[
+        "-fsS",
+        "--max-time", "2",
+        "http://169.254.169.254/latest/meta-data/instance-id",
+    ])
 }
 
 fn send_heartbeat(config: &Config) {
