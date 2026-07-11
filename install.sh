@@ -4,7 +4,7 @@
 # Bootstrap and install the full collab server stack on Ubuntu 24.04 LTS.
 #
 # Usage:
-#   sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--agent-token=...] [--agent-env=/etc/collab/sites-agent.env]
+#   sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--region=us-east-1] [--agent-token=...] [--agent-env=/etc/collab/sites-agent.env]
 #
 # Requirements:
 #   - Ubuntu 24.04 LTS (exits immediately on any other OS)
@@ -46,6 +46,7 @@ PROFILE="medium"  # default
 SERVER_ID=""
 PROJECT_ID=""
 SITES_URL=""
+REGION=""
 AGENT_TOKEN=""
 AGENT_ENV="/etc/collab/sites-agent.env"
 
@@ -63,6 +64,9 @@ for arg in "$@"; do
     --sites-url=*)
       SITES_URL="${arg#--sites-url=}"
       ;;
+    --region=*)
+      REGION="${arg#--region=}"
+      ;;
     --agent-token=*)
       AGENT_TOKEN="${arg#--agent-token=}"
       ;;
@@ -71,7 +75,7 @@ for arg in "$@"; do
       ;;
     --help|-h)
       echo ""
-      echo "Usage: sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--agent-token=...] [--agent-env=/etc/collab/sites-agent.env]"
+      echo "Usage: sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--region=us-east-1] [--agent-token=...] [--agent-env=/etc/collab/sites-agent.env]"
       echo ""
       echo "Profiles:"
       echo "  small      1-2 vCPU / 1-2 GB RAM"
@@ -82,6 +86,7 @@ for arg in "$@"; do
       echo "  --server-id   Server id registered in collab-sites"
       echo "  --project-id  Project id hosted by this runtime"
       echo "  --sites-url   collab-sites base URL"
+      echo "  --region      AWS region where this runtime is running"
       echo "  --agent-token Runtime heartbeat token issued by collab-sites"
       echo "  --agent-env   Root-only env file with heartbeat token"
       echo ""
@@ -89,7 +94,7 @@ for arg in "$@"; do
       ;;
     *)
       echo "[ERR]  Unknown argument: ${arg}" >&2
-      echo "Usage: sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--agent-token=...] [--agent-env=/etc/collab/sites-agent.env]" >&2
+      echo "Usage: sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--region=us-east-1] [--agent-token=...] [--agent-env=/etc/collab/sites-agent.env]" >&2
       exit 1
       ;;
   esac
@@ -225,7 +230,7 @@ COLLAB_SITES_ALLOWED_ORIGIN=sites.collab.codes
 COLLAB_SITES_HEARTBEAT_INTERVAL_SECONDS=30
 COLLAB_SITES_DATA_ROOT=/data
 COLLAB_SITES_RUNTIME_DIR=${INSTALL_DIR}
-COLLAB_SITES_REGION=
+COLLAB_SITES_REGION=${REGION}
 COLLAB_SITES_INSTANCE_ID=
 COLLAB_SITES_INSTANCE_ID_FROM_IMDS=true
 COLLAB_SITES_AGENT_VERSION=0.1.0
