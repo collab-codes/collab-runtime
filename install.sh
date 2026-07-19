@@ -249,6 +249,7 @@ run_step 07 "Install 7-Zip"           "07-install-7zip.sh"
 run_step 08 "Install PM2"             "08-install-pm2.sh"
 run_step 09 "Install Certbot"         "09-install-certbot.sh"
 run_step 10 "mls-base Runtime"        "10-mls-runtime.sh"
+run_step 11 "collab-messages"         "11-install-collab-messages.sh"
 
 # ── Step 8: Install collab CLI ────────────────────────────────────────────────
 log_section "Installing collab CLI"

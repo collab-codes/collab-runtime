@@ -368,6 +368,60 @@ cmd_update() {
   esac
 }
 
+# ── Subcommand: msg ────────────────────────────────────────────────────────────
+# Manages the collab-messages app (pm2 'msg'), installed by scripts/11-install-
+# collab-messages.sh, which copies itself to /usr/local/lib/collab/.
+cmd_msg() {
+  local mode="${1:-}"
+  local installer="/usr/local/lib/collab/install-collab-messages.sh"
+
+  case "$mode" in
+    update)
+      shift
+      if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+        echo "[ERR]  'collab msg update' must be run as root. Use: sudo collab msg update" >&2
+        exit 1
+      fi
+      if [[ ! -f "$installer" ]]; then
+        echo "[ERR]  Installer not found: ${installer}" >&2
+        echo "[ERR]  Run collab-runtime's scripts/11-install-collab-messages.sh once (or install.sh)." >&2
+        exit 1
+      fi
+      header "collab — updating collab-messages"
+      bash "$installer" "$@"
+      ;;
+    status)
+      header "collab — collab-messages status"
+      local version_file="/data/msg.collab.codes/node/collab-messages.version"
+      if [[ -f "$version_file" ]]; then
+        info "installed version: $(cat "$version_file")"
+      else
+        warn "no installed version recorded (${version_file} not found)"
+      fi
+      if command -v pm2 &>/dev/null; then
+        pm2 ls | grep -E "msg|─" || true
+      else
+        warn "pm2 not found"
+      fi
+      echo ""
+      ;;
+    "")
+      echo ""
+      echo -e "${C_BOLD}collab msg${C_RESET} — requires a subcommand:"
+      echo ""
+      echo "  collab msg update [--force]   Install/update collab-messages from S3 (requires sudo)"
+      echo "  collab msg status             Show installed version and pm2 state"
+      echo ""
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: ${mode}" >&2
+      echo "Usage: collab msg update [--force] | collab msg status" >&2
+      exit 1
+      ;;
+  esac
+}
+
 # ── Usage / help ───────────────────────────────────────────────────────────────
 cmd_help() {
   echo ""
@@ -382,6 +436,8 @@ cmd_help() {
   echo "  doctor              Run PASS/FAIL diagnostics for all components"
   echo "  update --check      List available apt upgrades (dry-run)"
   echo "  update --apply      Apply all apt upgrades (requires sudo)"
+  echo "  msg update [--force] Install/update collab-messages from S3 (requires sudo)"
+  echo "  msg status          Show collab-messages version and pm2 state"
   echo "  help                Show this help message"
   echo ""
   echo "Examples:"
@@ -404,6 +460,7 @@ case "$COMMAND" in
   statusdb) cmd_statusdb "$@" ;;
   doctor)   cmd_doctor   "$@" ;;
   update)  cmd_update "$@" ;;
+  msg)      cmd_msg      "$@" ;;
   help|--help|-h) cmd_help ;;
   *)
     echo "Unknown command: ${COMMAND}" >&2
