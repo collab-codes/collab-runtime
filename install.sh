@@ -274,6 +274,7 @@ log_section "Installing collab-sites agent"
 
 AGENT_SRC_PREBUILT="${INSTALL_DIR}/agent/target/release/collab-sites-agent"
 AGENT_MANIFEST="${INSTALL_DIR}/agent/Cargo.toml"
+AGENT_SRC_DIR="${INSTALL_DIR}/agent/src"
 AGENT_DEST="/usr/local/bin/collab-sites-agent"
 AGENT_SERVICE="/etc/systemd/system/collab-sites-agent.service"
 # Single source of truth for the agent version: the crate manifest.
@@ -307,11 +308,26 @@ else
   record_step_result "collab-sites agent env" "SKIP" "missing --server-id/--project-id/--sites-url/--agent-token"
 fi
 
+# target/ is gitignored, so a `git pull` brings new sources while keeping an old
+# artifact. Only trust the prebuilt binary when no source is newer than it.
+agent_prebuilt_is_current() {
+  [[ -x "$AGENT_SRC_PREBUILT" ]] || return 1
+  [[ -d "$AGENT_SRC_DIR" ]] || return 0
+  local newer
+  newer="$(find "$AGENT_SRC_DIR" "$AGENT_MANIFEST" -type f -newer "$AGENT_SRC_PREBUILT" -print -quit 2>/dev/null)"
+  [[ -z "$newer" ]]
+}
+
 install_agent_binary=false
 installed_cargo_for_agent=false
-if [[ -x "$AGENT_SRC_PREBUILT" ]]; then
+agent_binary_is_stale=false
+if agent_prebuilt_is_current; then
+  log_info "Using the existing collab-sites-agent build; no source is newer than it"
   install_agent_binary=true
 elif [[ -f "$AGENT_MANIFEST" ]]; then
+  if [[ -x "$AGENT_SRC_PREBUILT" ]]; then
+    log_info "collab-sites-agent sources are newer than the existing build; rebuilding"
+  fi
   if ! command -v cargo >/dev/null 2>&1; then
     log_info "cargo not found; installing cargo to build collab-sites-agent"
     if apt-get update -y && apt-get install -y cargo; then
@@ -329,20 +345,33 @@ elif [[ -f "$AGENT_MANIFEST" ]]; then
       log_error "collab-sites-agent cargo build failed"
     fi
   fi
+
+  if [[ "$install_agent_binary" != true && -x "$AGENT_SRC_PREBUILT" ]]; then
+    agent_binary_is_stale=true
+    install_agent_binary=true
+    log_warn "Could not rebuild collab-sites-agent; keeping the older build already in ${AGENT_SRC_PREBUILT}"
+  fi
 fi
 
 if [[ "$install_agent_binary" == true && -x "$AGENT_SRC_PREBUILT" ]]; then
   cp "$AGENT_SRC_PREBUILT" "$AGENT_DEST"
   chmod +x "$AGENT_DEST"
-  record_step_result "collab-sites agent binary" "PASS" "installed to ${AGENT_DEST} (version ${AGENT_VERSION})"
+  if [[ "$agent_binary_is_stale" == true ]]; then
+    record_step_result "collab-sites agent binary" "SKIP" "kept an older build at ${AGENT_DEST}; ${AGENT_VERSION} was not built"
+  else
+    record_step_result "collab-sites agent binary" "PASS" "installed to ${AGENT_DEST} (version ${AGENT_VERSION})"
+  fi
 
   if [[ -f "$AGENT_ENV" ]]; then
     chmod 600 "$AGENT_ENV"
-    # Only now the reported version is true: the binary of this version is installed.
-    if grep -q '^COLLAB_SITES_AGENT_VERSION=' "$AGENT_ENV"; then
-      sed -i "s|^COLLAB_SITES_AGENT_VERSION=.*|COLLAB_SITES_AGENT_VERSION=${AGENT_VERSION}|" "$AGENT_ENV"
-    else
-      echo "COLLAB_SITES_AGENT_VERSION=${AGENT_VERSION}" >> "$AGENT_ENV"
+    # Report the version only when the binary of this version was really built,
+    # so agentVersion in the heartbeat never claims more than what is running.
+    if [[ "$agent_binary_is_stale" != true ]]; then
+      if grep -q '^COLLAB_SITES_AGENT_VERSION=' "$AGENT_ENV"; then
+        sed -i "s|^COLLAB_SITES_AGENT_VERSION=.*|COLLAB_SITES_AGENT_VERSION=${AGENT_VERSION}|" "$AGENT_ENV"
+      else
+        echo "COLLAB_SITES_AGENT_VERSION=${AGENT_VERSION}" >> "$AGENT_ENV"
+      fi
     fi
     cat > "$AGENT_SERVICE" <<EOF
 [Unit]
