@@ -149,18 +149,47 @@ fn heartbeat_payload(config: &Config) -> String {
 
 fn status_payload(config: &Config) -> String {
     format!(
-        "{{\"hostname\":\"{}\",\"region\":\"{}\",\"dataRoot\":\"{}\",\"runtimeDir\":\"{}\",\"loadavg\":\"{}\",\"disk\":\"{}\",\"collabStatus\":\"{}\",\"services\":{{\"nginx\":\"{}\",\"postgresql\":\"{}\",\"redis\":\"{}\"}}}}",
+        "{{\"hostname\":\"{}\",\"region\":\"{}\",\"dataRoot\":\"{}\",\"runtimeDir\":\"{}\",\"loadavg\":\"{}\",\"disk\":\"{}\",\"cpus\":{},\"memTotalMb\":{},\"memAvailableMb\":{},\"collabStatus\":\"{}\",\"services\":{{\"nginx\":\"{}\",\"postgresql\":\"{}\",\"redis\":\"{}\"}}}}",
         json_escape(&command_output("hostname", &[]).unwrap_or_default()),
         json_escape(&config.region),
         json_escape(&config.data_root),
         json_escape(&config.runtime_dir),
         json_escape(&fs::read_to_string("/proc/loadavg").unwrap_or_default().trim().to_string()),
         json_escape(&command_output("df", &["-h", config.data_root.as_str()]).unwrap_or_default()),
+        json_number(cpu_count()),
+        json_number(meminfo_mb("MemTotal")),
+        json_number(meminfo_mb("MemAvailable")),
         json_escape(&command_output("collab", &["status"]).unwrap_or_else(|| "collab status unavailable".to_string())),
         json_escape(&systemd_status("nginx")),
         json_escape(&systemd_status("postgresql")),
         json_escape(&systemd_status("redis-server")),
     )
+}
+
+/// vCPU count the kernel actually reports, so it stays true even if the instance
+/// type is changed outside collab-sites.
+fn cpu_count() -> Option<u64> {
+    thread::available_parallelism().ok().map(|count| count.get() as u64)
+}
+
+/// Reads a /proc/meminfo entry (reported in kB) and returns it in MiB.
+fn meminfo_mb(key: &str) -> Option<u64> {
+    meminfo_mb_from(&fs::read_to_string("/proc/meminfo").ok()?, key)
+}
+
+fn meminfo_mb_from(content: &str, key: &str) -> Option<u64> {
+    for line in content.lines() {
+        let Some((name, rest)) = line.split_once(':') else { continue };
+        if name.trim() != key {
+            continue;
+        }
+        return rest.split_whitespace().next()?.parse::<u64>().ok().map(|kb| kb / 1024);
+    }
+    None
+}
+
+fn json_number(value: Option<u64>) -> String {
+    value.map(|number| number.to_string()).unwrap_or_else(|| "null".to_string())
 }
 
 fn runtime_status() -> String {
@@ -315,4 +344,30 @@ fn json_escape(value: &str) -> String {
         }
     }
     escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cpu_count, json_number, meminfo_mb_from};
+
+    const MEMINFO: &str = "MemTotal:        3996412 kB\nMemFree:          201884 kB\nMemAvailable:    2113664 kB\nBuffers:           12345 kB\n";
+
+    #[test]
+    fn reads_memory_entries_in_mib() {
+        assert_eq!(meminfo_mb_from(MEMINFO, "MemTotal"), Some(3902));
+        assert_eq!(meminfo_mb_from(MEMINFO, "MemAvailable"), Some(2064));
+    }
+
+    #[test]
+    fn ignores_unknown_or_malformed_entries() {
+        assert_eq!(meminfo_mb_from(MEMINFO, "SwapTotal"), None);
+        assert_eq!(meminfo_mb_from("garbage without colon\n", "MemTotal"), None);
+    }
+
+    #[test]
+    fn reports_cpu_count_and_json_nulls() {
+        assert!(cpu_count().unwrap_or(0) >= 1);
+        assert_eq!(json_number(Some(4)), "4");
+        assert_eq!(json_number(None), "null");
+    }
 }

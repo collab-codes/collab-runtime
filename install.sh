@@ -276,6 +276,9 @@ AGENT_SRC_PREBUILT="${INSTALL_DIR}/agent/target/release/collab-sites-agent"
 AGENT_MANIFEST="${INSTALL_DIR}/agent/Cargo.toml"
 AGENT_DEST="/usr/local/bin/collab-sites-agent"
 AGENT_SERVICE="/etc/systemd/system/collab-sites-agent.service"
+# Single source of truth for the agent version: the crate manifest.
+AGENT_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$AGENT_MANIFEST" 2>/dev/null | head -1)"
+AGENT_VERSION="${AGENT_VERSION:-0.0.0}"
 
 if [[ -n "$SERVER_ID" && -n "$PROJECT_ID" && -n "$SITES_URL" && -n "$AGENT_TOKEN" ]]; then
   mkdir -p "$(dirname "$AGENT_ENV")"
@@ -292,14 +295,21 @@ COLLAB_SITES_RUNTIME_DIR=${INSTALL_DIR}
 COLLAB_SITES_REGION=${REGION}
 COLLAB_SITES_INSTANCE_ID=
 COLLAB_SITES_INSTANCE_ID_FROM_IMDS=true
-COLLAB_SITES_AGENT_VERSION=0.1.0
+COLLAB_SITES_AGENT_VERSION=${AGENT_VERSION}
 EOF
   chmod 600 "$AGENT_ENV"
   record_step_result "collab-sites agent env" "PASS" "written to ${AGENT_ENV}"
   collab_sites_event "info" "runtime.agent_env_written" "collab-sites agent env written" "" "{\"path\":\"$(json_escape "$AGENT_ENV")\"}"
 elif [[ -f "$AGENT_ENV" ]]; then
-  record_step_result "collab-sites agent env" "PASS" "using existing ${AGENT_ENV}"
-  collab_sites_event "info" "runtime.agent_env_existing" "Using existing collab-sites agent env" "" "{\"path\":\"$(json_escape "$AGENT_ENV")\"}"
+  # Keep the existing token/ids, but refresh the agent version so the heartbeat
+  # reports which agent build is actually installed.
+  if grep -q '^COLLAB_SITES_AGENT_VERSION=' "$AGENT_ENV"; then
+    sed -i "s|^COLLAB_SITES_AGENT_VERSION=.*|COLLAB_SITES_AGENT_VERSION=${AGENT_VERSION}|" "$AGENT_ENV"
+  else
+    echo "COLLAB_SITES_AGENT_VERSION=${AGENT_VERSION}" >> "$AGENT_ENV"
+  fi
+  record_step_result "collab-sites agent env" "PASS" "using existing ${AGENT_ENV} (agent version ${AGENT_VERSION})"
+  collab_sites_event "info" "runtime.agent_env_existing" "Using existing collab-sites agent env" "" "{\"path\":\"$(json_escape "$AGENT_ENV")\",\"agentVersion\":\"$(json_escape "$AGENT_VERSION")\"}"
 else
   record_step_result "collab-sites agent env" "SKIP" "missing --server-id/--project-id/--sites-url/--agent-token"
 fi
