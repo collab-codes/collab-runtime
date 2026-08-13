@@ -2,6 +2,9 @@
 name = "collab-sites-agent"
 version = "0.2.0"
 edition = "2021"
+# Ubuntu 24.04 ships cargo 1.75, which only reads lockfile v3. Keep Cargo.lock at
+# version 3 so the VM can build the agent with the distro toolchain.
+rust-version = "1.75"
 
 [profile.release]
 strip = true

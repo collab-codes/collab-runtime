@@ -330,20 +330,24 @@ elif [[ -f "$AGENT_MANIFEST" ]]; then
   fi
   if ! command -v cargo >/dev/null 2>&1; then
     log_info "cargo not found; installing cargo to build collab-sites-agent"
-    if apt-get update -y && apt-get install -y cargo; then
+    if DEBIAN_FRONTEND=noninteractive apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y cargo; then
       installed_cargo_for_agent=true
+      # drop bash's cached command lookups so the cargo just installed is visible
+      hash -r
     else
       log_error "Could not install cargo for collab-sites-agent"
     fi
   fi
 
   if command -v cargo >/dev/null 2>&1; then
-    log_info "Building collab-sites-agent with cargo"
+    log_info "Building collab-sites-agent with cargo ($(cargo --version 2>/dev/null || echo "version unknown"))"
     if cargo build --release --manifest-path "$AGENT_MANIFEST"; then
       install_agent_binary=true
     else
       log_error "collab-sites-agent cargo build failed"
     fi
+  else
+    log_error "cargo is not available; cannot build collab-sites-agent ${AGENT_VERSION}"
   fi
 
   if [[ "$install_agent_binary" != true && -x "$AGENT_SRC_PREBUILT" ]]; then
@@ -354,15 +358,30 @@ elif [[ -f "$AGENT_MANIFEST" ]]; then
 fi
 
 if [[ "$install_agent_binary" == true && -x "$AGENT_SRC_PREBUILT" ]]; then
-  cp "$AGENT_SRC_PREBUILT" "$AGENT_DEST"
-  chmod +x "$AGENT_DEST"
-  if [[ "$agent_binary_is_stale" == true ]]; then
+  agent_binary_install_failed=false
+  if [[ "$agent_binary_is_stale" == true && -x "$AGENT_DEST" ]]; then
+    log_info "Keeping the agent binary already installed at ${AGENT_DEST}"
+  else
+    # install+mv instead of cp: overwriting a running executable fails with
+    # "Text file busy", while the rename swaps the inode safely. The `if` also
+    # keeps strict mode from aborting the whole installer on failure.
+    if install -m 755 "$AGENT_SRC_PREBUILT" "${AGENT_DEST}.new" && mv -f "${AGENT_DEST}.new" "$AGENT_DEST"; then
+      :
+    else
+      agent_binary_install_failed=true
+      rm -f "${AGENT_DEST}.new"
+      log_error "Could not install the agent binary at ${AGENT_DEST}"
+    fi
+  fi
+  if [[ "$agent_binary_install_failed" == true ]]; then
+    record_step_result "collab-sites agent binary" "FAIL" "could not install ${AGENT_VERSION} at ${AGENT_DEST}"
+  elif [[ "$agent_binary_is_stale" == true ]]; then
     record_step_result "collab-sites agent binary" "SKIP" "kept an older build at ${AGENT_DEST}; ${AGENT_VERSION} was not built"
   else
     record_step_result "collab-sites agent binary" "PASS" "installed to ${AGENT_DEST} (version ${AGENT_VERSION})"
   fi
 
-  if [[ -f "$AGENT_ENV" ]]; then
+  if [[ -f "$AGENT_ENV" && "$agent_binary_install_failed" != true ]]; then
     chmod 600 "$AGENT_ENV"
     # Report the version only when the binary of this version was really built,
     # so agentVersion in the heartbeat never claims more than what is running.
@@ -391,13 +410,18 @@ User=root
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable collab-sites-agent
     # restart, not `enable --now`: on an already active unit `--now` is a no-op and
     # would keep the previous binary (and the previous env) running.
-    systemctl restart collab-sites-agent
-    record_step_result "collab-sites agent service" "PASS" "restarted systemd service with agent ${AGENT_VERSION}"
-    log_ok "collab-sites agent service enabled and restarted"
-    collab_sites_event "info" "runtime.agent_started" "collab-sites agent service enabled" "" "{\"service\":\"collab-sites-agent\",\"agentVersion\":\"$(json_escape "$AGENT_VERSION")\"}"
+    if systemctl enable collab-sites-agent && systemctl restart collab-sites-agent; then
+      record_step_result "collab-sites agent service" "PASS" "restarted systemd service with agent ${AGENT_VERSION}"
+      log_ok "collab-sites agent service enabled and restarted"
+      collab_sites_event "info" "runtime.agent_started" "collab-sites agent service enabled" "" "{\"service\":\"collab-sites-agent\",\"agentVersion\":\"$(json_escape "$AGENT_VERSION")\"}"
+    else
+      record_step_result "collab-sites agent service" "FAIL" "systemd could not start collab-sites-agent"
+      log_error "collab-sites-agent service failed to start; check: systemctl status collab-sites-agent"
+    fi
+  elif [[ "$agent_binary_install_failed" == true ]]; then
+    record_step_result "collab-sites agent service" "SKIP" "binary install failed; service left untouched"
   else
     record_step_result "collab-sites agent service" "SKIP" "agent env not found: ${AGENT_ENV}"
     log_warn "Agent env file not found: ${AGENT_ENV}; service not enabled"
