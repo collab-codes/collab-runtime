@@ -301,15 +301,8 @@ EOF
   record_step_result "collab-sites agent env" "PASS" "written to ${AGENT_ENV}"
   collab_sites_event "info" "runtime.agent_env_written" "collab-sites agent env written" "" "{\"path\":\"$(json_escape "$AGENT_ENV")\"}"
 elif [[ -f "$AGENT_ENV" ]]; then
-  # Keep the existing token/ids, but refresh the agent version so the heartbeat
-  # reports which agent build is actually installed.
-  if grep -q '^COLLAB_SITES_AGENT_VERSION=' "$AGENT_ENV"; then
-    sed -i "s|^COLLAB_SITES_AGENT_VERSION=.*|COLLAB_SITES_AGENT_VERSION=${AGENT_VERSION}|" "$AGENT_ENV"
-  else
-    echo "COLLAB_SITES_AGENT_VERSION=${AGENT_VERSION}" >> "$AGENT_ENV"
-  fi
-  record_step_result "collab-sites agent env" "PASS" "using existing ${AGENT_ENV} (agent version ${AGENT_VERSION})"
-  collab_sites_event "info" "runtime.agent_env_existing" "Using existing collab-sites agent env" "" "{\"path\":\"$(json_escape "$AGENT_ENV")\",\"agentVersion\":\"$(json_escape "$AGENT_VERSION")\"}"
+  record_step_result "collab-sites agent env" "PASS" "using existing ${AGENT_ENV}"
+  collab_sites_event "info" "runtime.agent_env_existing" "Using existing collab-sites agent env" "" "{\"path\":\"$(json_escape "$AGENT_ENV")\"}"
 else
   record_step_result "collab-sites agent env" "SKIP" "missing --server-id/--project-id/--sites-url/--agent-token"
 fi
@@ -341,10 +334,16 @@ fi
 if [[ "$install_agent_binary" == true && -x "$AGENT_SRC_PREBUILT" ]]; then
   cp "$AGENT_SRC_PREBUILT" "$AGENT_DEST"
   chmod +x "$AGENT_DEST"
-  record_step_result "collab-sites agent binary" "PASS" "installed to ${AGENT_DEST}"
+  record_step_result "collab-sites agent binary" "PASS" "installed to ${AGENT_DEST} (version ${AGENT_VERSION})"
 
   if [[ -f "$AGENT_ENV" ]]; then
     chmod 600 "$AGENT_ENV"
+    # Only now the reported version is true: the binary of this version is installed.
+    if grep -q '^COLLAB_SITES_AGENT_VERSION=' "$AGENT_ENV"; then
+      sed -i "s|^COLLAB_SITES_AGENT_VERSION=.*|COLLAB_SITES_AGENT_VERSION=${AGENT_VERSION}|" "$AGENT_ENV"
+    else
+      echo "COLLAB_SITES_AGENT_VERSION=${AGENT_VERSION}" >> "$AGENT_ENV"
+    fi
     cat > "$AGENT_SERVICE" <<EOF
 [Unit]
 Description=collab-sites runtime heartbeat agent
@@ -363,10 +362,13 @@ User=root
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now collab-sites-agent
-    record_step_result "collab-sites agent service" "PASS" "enabled systemd service"
-    log_ok "collab-sites agent service enabled"
-    collab_sites_event "info" "runtime.agent_started" "collab-sites agent service enabled" "" "{\"service\":\"collab-sites-agent\"}"
+    systemctl enable collab-sites-agent
+    # restart, not `enable --now`: on an already active unit `--now` is a no-op and
+    # would keep the previous binary (and the previous env) running.
+    systemctl restart collab-sites-agent
+    record_step_result "collab-sites agent service" "PASS" "restarted systemd service with agent ${AGENT_VERSION}"
+    log_ok "collab-sites agent service enabled and restarted"
+    collab_sites_event "info" "runtime.agent_started" "collab-sites agent service enabled" "" "{\"service\":\"collab-sites-agent\",\"agentVersion\":\"$(json_escape "$AGENT_VERSION")\"}"
   else
     record_step_result "collab-sites agent service" "SKIP" "agent env not found: ${AGENT_ENV}"
     log_warn "Agent env file not found: ${AGENT_ENV}; service not enabled"
@@ -374,6 +376,10 @@ EOF
 else
   record_step_result "collab-sites agent" "SKIP" "prebuilt binary missing and cargo unavailable"
   log_warn "collab-sites-agent not installed; provide a prebuilt agent/target/release/collab-sites-agent or install cargo before running install.sh"
+  if [[ -x "$AGENT_DEST" ]]; then
+    log_warn "A previously installed agent keeps running at ${AGENT_DEST}; it may be older than ${AGENT_VERSION}"
+  fi
+  collab_sites_event "warn" "runtime.agent_not_installed" "collab-sites agent was not built or installed" "" "{\"expectedVersion\":\"$(json_escape "$AGENT_VERSION")\",\"previousBinary\":\"$(json_escape "$AGENT_DEST")\"}"
 fi
 
 if [[ "$installed_cargo_for_agent" == true ]]; then
