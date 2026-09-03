@@ -250,6 +250,9 @@ run_step 08 "Install PM2"             "08-install-pm2.sh"
 run_step 09 "Install Certbot"         "09-install-certbot.sh"
 run_step 10 "mls-base Runtime"        "10-mls-runtime.sh"
 run_step 11 "collab-messages"         "11-install-collab-messages.sh"
+# PROJECT_ID is exported so the step subshell sees it (run_step passes no arguments).
+export PROJECT_ID AGENT_ENV
+run_step 12 "mls client project"      "12-mls-project.sh"
 
 # ── Step 8: Install collab CLI ────────────────────────────────────────────────
 log_section "Installing collab CLI"
