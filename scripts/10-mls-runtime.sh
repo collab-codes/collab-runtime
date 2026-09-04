@@ -4,8 +4,10 @@
 #   - rsync / git : rsync is used by publishMlsBase.sh to copy sources; git is
 #                   used to clone the mls-base scaffold
 #   - pnpm        : enabled via corepack (ships with Node.js) to build on the VM
-#   - checkout    : /data/mls-base cloned from the mls-base repo and owned by the
-#                   deploy user, so the publish rsync does not need sudo
+#   - checkout    : /data/mls-base cloned from the mls-base repo, `pnpm install`
+#                   run there (no lockfile flag — mls-base `.npmrc` has
+#                   frozen-lockfile=false), and owned by the deploy user, so a
+#                   push can compile without a prior admin "Build release"
 # Idempotent: safe to re-run as part of install.sh.
 set -euo pipefail
 
@@ -59,7 +61,25 @@ else
   sudo -u "$DEPLOY_USER" git clone "$MLS_BASE_REPO" "$MLS_BASE_DIR" || log_warn "git clone failed (continuing)"
 fi
 chown -R "${DEPLOY_USER}:" "$MLS_BASE_DIR"
-log_ok "${MLS_BASE_DIR} ready (owner: ${DEPLOY_USER})"
+
+# After clone/pull. Without this, the first build dies at `Cannot find
+# package 'esbuild'` (measured 03/09, 102043 VM). No lockfile flag: mls-base
+# `.npmrc` has frozen-lockfile=false (gb55). As the deploy user so
+# node_modules is theirs; -H bash -lc for HOME + corepack PATH.
+if [[ -f "${MLS_BASE_DIR}/package.json" ]]; then
+  log_info "Installing mls-base dependencies (as ${DEPLOY_USER})…"
+  if sudo -u "$DEPLOY_USER" -H bash -lc "cd \"$MLS_BASE_DIR\" && pnpm install"; then
+    log_ok "mls-base dependencies installed"
+  else
+    log_warn "pnpm install failed in ${MLS_BASE_DIR} — no build will work on this VM until this passes"
+  fi
+else
+  log_warn "no package.json in ${MLS_BASE_DIR} — checkout did not land; no build will work on this VM until this passes"
+fi
+if [[ -d "${MLS_BASE_DIR}/node_modules" ]]; then
+  chown -R "${DEPLOY_USER}:" "${MLS_BASE_DIR}/node_modules"
+fi
+log_ok "${MLS_BASE_DIR} ready (cloned and installed, owner: ${DEPLOY_USER})"
 
 # ── application role, database and runtime .env ──────────────────────────────────
 # One owner for the three: scripts/lib/mls-app-db.sh, also sourced by mls-base's
