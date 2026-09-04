@@ -58,11 +58,11 @@ fi
 
 # As the owner of /data/mls-base, never as root: the repo the developer pushes to must
 # belong to the deploy user, exactly like the checkout step 10 creates.
-log_info "creating mls-${project_id} in ${MLS_BASE_DIR} (as ${DEPLOY_USER})"
+log_info "creating mls-${project_id} in ${MLS_BASE_DIR} from model (as ${DEPLOY_USER})"
 if [[ "$DEPLOY_USER" == "root" ]]; then
-  node "$PROJECT_INIT" "$project_id" --root "$MLS_BASE_DIR"
+  node "$PROJECT_INIT" "$project_id" --root "$MLS_BASE_DIR" --from-model
 else
-  sudo -u "$DEPLOY_USER" node "$PROJECT_INIT" "$project_id" --root "$MLS_BASE_DIR"
+  sudo -u "$DEPLOY_USER" node "$PROJECT_INIT" "$project_id" --root "$MLS_BASE_DIR" --from-model
 fi
 
 log_ok "mls-${project_id} is git-ready — clone it with: git clone <vm>:${MLS_BASE_DIR}/mls-${project_id}"
