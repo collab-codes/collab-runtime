@@ -273,16 +273,26 @@ else
 fi
 
 # ── Step 8.5: Install collab-sites heartbeat agent ────────────────────────────
+# Node source is copied as-is. No cargo, no prebuilt binary. If this step fails
+# the installer exits 1 after the summary — otherwise the VM stays
+# bootstrap_pending forever (no heartbeat).
 log_section "Installing collab-sites agent"
 
-AGENT_SRC_PREBUILT="${INSTALL_DIR}/agent/target/release/collab-sites-agent"
-AGENT_MANIFEST="${INSTALL_DIR}/agent/Cargo.toml"
-AGENT_SRC_DIR="${INSTALL_DIR}/agent/src"
-AGENT_DEST="/usr/local/bin/collab-sites-agent"
+AGENT_SRC="${INSTALL_DIR}/agent/collab-sites-agent.mjs"
+AGENT_LIB_DIR="/usr/local/lib/collab-sites-agent"
+AGENT_DEST="${AGENT_LIB_DIR}/collab-sites-agent.mjs"
 AGENT_SERVICE="/etc/systemd/system/collab-sites-agent.service"
-# Single source of truth for the agent version: the crate manifest.
-AGENT_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$AGENT_MANIFEST" 2>/dev/null | head -1)"
+AGENT_VERSION="$(sed -n 's/^export const AGENT_VERSION = "\(.*\)";/\1/p' "$AGENT_SRC" 2>/dev/null | head -1)"
 AGENT_VERSION="${AGENT_VERSION:-0.0.0}"
+AGENT_INSTALL_FAILED=false
+
+fail_agent() {
+  local reason="$1"
+  AGENT_INSTALL_FAILED=true
+  record_step_result "collab-sites agent" "FAIL" "$reason"
+  log_error "$reason"
+  collab_sites_event "error" "runtime.agent_not_installed" "$reason" "failed" "{\"expectedVersion\":\"$(json_escape "$AGENT_VERSION")\",\"reason\":\"$(json_escape "$reason")\"}"
+}
 
 if [[ -n "$SERVER_ID" && -n "$PROJECT_ID" && -n "$SITES_URL" && -n "$AGENT_TOKEN" ]]; then
   mkdir -p "$(dirname "$AGENT_ENV")"
@@ -311,90 +321,26 @@ else
   record_step_result "collab-sites agent env" "SKIP" "missing --server-id/--project-id/--sites-url/--agent-token"
 fi
 
-# target/ is gitignored, so a `git pull` brings new sources while keeping an old
-# artifact. Only trust the prebuilt binary when no source is newer than it.
-agent_prebuilt_is_current() {
-  [[ -x "$AGENT_SRC_PREBUILT" ]] || return 1
-  [[ -d "$AGENT_SRC_DIR" ]] || return 0
-  local newer
-  newer="$(find "$AGENT_SRC_DIR" "$AGENT_MANIFEST" -type f -newer "$AGENT_SRC_PREBUILT" -print -quit 2>/dev/null)"
-  [[ -z "$newer" ]]
-}
-
-install_agent_binary=false
-installed_cargo_for_agent=false
-agent_binary_is_stale=false
-if agent_prebuilt_is_current; then
-  log_info "Using the existing collab-sites-agent build; no source is newer than it"
-  install_agent_binary=true
-elif [[ -f "$AGENT_MANIFEST" ]]; then
-  if [[ -x "$AGENT_SRC_PREBUILT" ]]; then
-    log_info "collab-sites-agent sources are newer than the existing build; rebuilding"
-  fi
-  if ! command -v cargo >/dev/null 2>&1; then
-    log_info "cargo not found; installing cargo to build collab-sites-agent"
-    if DEBIAN_FRONTEND=noninteractive apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y cargo; then
-      installed_cargo_for_agent=true
-      # drop bash's cached command lookups so the cargo just installed is visible
-      hash -r
-    else
-      log_error "Could not install cargo for collab-sites-agent"
-    fi
-  fi
-
-  if command -v cargo >/dev/null 2>&1; then
-    log_info "Building collab-sites-agent with cargo ($(cargo --version 2>/dev/null || echo "version unknown"))"
-    if cargo build --release --manifest-path "$AGENT_MANIFEST"; then
-      install_agent_binary=true
-    else
-      log_error "collab-sites-agent cargo build failed"
-    fi
+if [[ ! -f "$AGENT_ENV" ]]; then
+  log_info "Skipping collab-sites agent install; env file not written"
+elif ! command -v node >/dev/null 2>&1; then
+  fail_agent "node is not on PATH; step 06 (Install Node.js) failed"
+elif [[ ! -f "$AGENT_SRC" ]]; then
+  fail_agent "agent source missing: ${AGENT_SRC}"
+else
+  mkdir -p "$AGENT_LIB_DIR"
+  if ! cp "$AGENT_SRC" "$AGENT_DEST"; then
+    fail_agent "could not copy agent to ${AGENT_DEST}"
   else
-    log_error "cargo is not available; cannot build collab-sites-agent ${AGENT_VERSION}"
-  fi
-
-  if [[ "$install_agent_binary" != true && -x "$AGENT_SRC_PREBUILT" ]]; then
-    agent_binary_is_stale=true
-    install_agent_binary=true
-    log_warn "Could not rebuild collab-sites-agent; keeping the older build already in ${AGENT_SRC_PREBUILT}"
-  fi
-fi
-
-if [[ "$install_agent_binary" == true && -x "$AGENT_SRC_PREBUILT" ]]; then
-  agent_binary_install_failed=false
-  if [[ "$agent_binary_is_stale" == true && -x "$AGENT_DEST" ]]; then
-    log_info "Keeping the agent binary already installed at ${AGENT_DEST}"
-  else
-    # install+mv instead of cp: overwriting a running executable fails with
-    # "Text file busy", while the rename swaps the inode safely. The `if` also
-    # keeps strict mode from aborting the whole installer on failure.
-    if install -m 755 "$AGENT_SRC_PREBUILT" "${AGENT_DEST}.new" && mv -f "${AGENT_DEST}.new" "$AGENT_DEST"; then
-      :
+    chmod 644 "$AGENT_DEST"
+    # Drop the old Rust binary so a previous install cannot keep answering.
+    rm -f /usr/local/bin/collab-sites-agent
+    if grep -q '^COLLAB_SITES_AGENT_VERSION=' "$AGENT_ENV"; then
+      sed -i "s|^COLLAB_SITES_AGENT_VERSION=.*|COLLAB_SITES_AGENT_VERSION=${AGENT_VERSION}|" "$AGENT_ENV"
     else
-      agent_binary_install_failed=true
-      rm -f "${AGENT_DEST}.new"
-      log_error "Could not install the agent binary at ${AGENT_DEST}"
+      echo "COLLAB_SITES_AGENT_VERSION=${AGENT_VERSION}" >> "$AGENT_ENV"
     fi
-  fi
-  if [[ "$agent_binary_install_failed" == true ]]; then
-    record_step_result "collab-sites agent binary" "FAIL" "could not install ${AGENT_VERSION} at ${AGENT_DEST}"
-  elif [[ "$agent_binary_is_stale" == true ]]; then
-    record_step_result "collab-sites agent binary" "SKIP" "kept an older build at ${AGENT_DEST}; ${AGENT_VERSION} was not built"
-  else
-    record_step_result "collab-sites agent binary" "PASS" "installed to ${AGENT_DEST} (version ${AGENT_VERSION})"
-  fi
-
-  if [[ -f "$AGENT_ENV" && "$agent_binary_install_failed" != true ]]; then
     chmod 600 "$AGENT_ENV"
-    # Report the version only when the binary of this version was really built,
-    # so agentVersion in the heartbeat never claims more than what is running.
-    if [[ "$agent_binary_is_stale" != true ]]; then
-      if grep -q '^COLLAB_SITES_AGENT_VERSION=' "$AGENT_ENV"; then
-        sed -i "s|^COLLAB_SITES_AGENT_VERSION=.*|COLLAB_SITES_AGENT_VERSION=${AGENT_VERSION}|" "$AGENT_ENV"
-      else
-        echo "COLLAB_SITES_AGENT_VERSION=${AGENT_VERSION}" >> "$AGENT_ENV"
-      fi
-    fi
     cat > "$AGENT_SERVICE" <<EOF
 [Unit]
 Description=collab-sites runtime heartbeat agent
@@ -404,7 +350,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=${AGENT_ENV}
-ExecStart=${AGENT_DEST} --env ${AGENT_ENV}
+ExecStart=/usr/bin/env node ${AGENT_DEST} --env ${AGENT_ENV}
 Restart=always
 RestartSec=10
 User=root
@@ -416,32 +362,13 @@ EOF
     # restart, not `enable --now`: on an already active unit `--now` is a no-op and
     # would keep the previous binary (and the previous env) running.
     if systemctl enable collab-sites-agent && systemctl restart collab-sites-agent; then
-      record_step_result "collab-sites agent service" "PASS" "restarted systemd service with agent ${AGENT_VERSION}"
+      record_step_result "collab-sites agent" "PASS" "installed ${AGENT_VERSION} at ${AGENT_DEST}"
       log_ok "collab-sites agent service enabled and restarted"
       collab_sites_event "info" "runtime.agent_started" "collab-sites agent service enabled" "" "{\"service\":\"collab-sites-agent\",\"agentVersion\":\"$(json_escape "$AGENT_VERSION")\"}"
     else
-      record_step_result "collab-sites agent service" "FAIL" "systemd could not start collab-sites-agent"
-      log_error "collab-sites-agent service failed to start; check: systemctl status collab-sites-agent"
+      fail_agent "systemd could not start collab-sites-agent; check: systemctl status collab-sites-agent"
     fi
-  elif [[ "$agent_binary_install_failed" == true ]]; then
-    record_step_result "collab-sites agent service" "SKIP" "binary install failed; service left untouched"
-  else
-    record_step_result "collab-sites agent service" "SKIP" "agent env not found: ${AGENT_ENV}"
-    log_warn "Agent env file not found: ${AGENT_ENV}; service not enabled"
   fi
-else
-  record_step_result "collab-sites agent" "SKIP" "prebuilt binary missing and cargo unavailable"
-  log_warn "collab-sites-agent not installed; provide a prebuilt agent/target/release/collab-sites-agent or install cargo before running install.sh"
-  if [[ -x "$AGENT_DEST" ]]; then
-    log_warn "A previously installed agent keeps running at ${AGENT_DEST}; it may be older than ${AGENT_VERSION}"
-  fi
-  collab_sites_event "warn" "runtime.agent_not_installed" "collab-sites agent was not built or installed" "" "{\"expectedVersion\":\"$(json_escape "$AGENT_VERSION")\",\"previousBinary\":\"$(json_escape "$AGENT_DEST")\"}"
-fi
-
-if [[ "$installed_cargo_for_agent" == true ]]; then
-  log_info "Removing cargo build toolchain installed for collab-sites-agent"
-  apt-get purge -y cargo rustc || true
-  apt-get autoremove -y || true
 fi
 
 # ── Step 9: Finalize and print summary ─────────────────────────────────────────
@@ -480,3 +407,8 @@ echo "  Logs written to:"
 echo "    Summary : ${SUMMARY_LOG}"
 echo "    Detail  : ${DETAIL_LOG}"
 echo ""
+
+if [[ "${AGENT_INSTALL_FAILED}" == true ]]; then
+  log_error "collab-sites agent was not installed; bootstrap exiting 1 so the VM is not reported as ready"
+  exit 1
+fi

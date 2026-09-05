@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "build": "cargo build --release --manifest-path agent/Cargo.toml",
+    "test": "node --test agent/*.test.mjs",
     "publish": "sh scripts/publish.sh"
   }
 }

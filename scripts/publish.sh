@@ -4,17 +4,14 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-echo "--- building collab-runtime ---"
-pnpm run build
-
 echo "--- staging collab-runtime files ---"
 git add \
   .gitignore \
   package.json \
   scripts/publish.sh \
-  agent/Cargo.toml \
-  agent/Cargo.lock \
-  agent/src/main.rs \
+  agent/collab-sites-agent.mjs \
+  agent/collab-sites-agent.test.mjs \
+  agent/fixtures/sites-agent.env \
   install.sh \
   collab
 

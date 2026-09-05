@@ -17,4 +17,3 @@ nosetests.xml
 .envrc
 .venv
 .DS_Store
-agent/target/
