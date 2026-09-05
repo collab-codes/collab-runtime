@@ -1,8 +1,8 @@
 #!/bin/bash
 # scripts/10-mls-runtime.sh
 # Prepare this VM to receive and build mls-base publishes:
-#   - rsync / git : rsync is used by publishMlsBase.sh to copy sources; git is
-#                   used to clone the mls-base scaffold
+#   - git         : clones the mls-base scaffold (platform arrives by git pull)
+#   - rsync       : still installed; was the tarball copy tool (path deleted)
 #   - pnpm        : enabled via corepack (ships with Node.js) to build on the VM
 #   - checkout    : /data/mls-base cloned from the mls-base repo, `pnpm install`
 #                   run there (no lockfile flag — mls-base `.npmrc` has
