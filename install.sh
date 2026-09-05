@@ -178,6 +178,11 @@ echo "  Started at: $(date '+%Y-%m-%d %H:%M:%S')"
 echo ""
 log_summary "Profile: ${PROFILE} | PG: ${PG_VERSION} | Node: ${NODE_VERSION}"
 
+# ── Step 6.4: Bound apt BEFORE the first apt-get ──────────────────────────────
+# Without this, a dead EC2 ports mirror hangs forever (102052, 32 min, no ESTAB).
+log_section "Pre-flight: apt network bounds"
+configure_apt_network
+
 # ── Step 6.5: Remove stale apt repos from any previous failed run ─────────────
 # Third-party repos added in a previous run may reference a wrong Ubuntu
 # codename (e.g. "questing") that is unsupported. If left in place, every
@@ -202,7 +207,7 @@ log_ok "Stale repo cleanup done"
 
 if collab_sites_can_report && ! command -v curl >/dev/null 2>&1; then
   log_section "Pre-flight: installing curl for collab-sites progress events"
-  if apt-get update -y && apt-get install -y curl; then
+  if apt_cmd install -y curl; then
     log_ok "curl installed for collab-sites progress events"
   else
     log_warn "Could not install curl; collab-sites progress events may be unavailable"

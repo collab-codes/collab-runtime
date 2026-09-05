@@ -19,7 +19,7 @@ if command_exists nginx; then
   log_info "NGINX is already installed: $(nginx -v 2>&1)"
 else
   log_info "Installing NGINX from apt…"
-  apt-get update -y
+  apt_update_safe
   apt_retry 3 install -y nginx
 fi
 

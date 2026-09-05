@@ -22,7 +22,7 @@ if command_exists pm2; then
   log_info "PM2 already installed: $(pm2 --version 2>/dev/null)"
 else
   log_info "Installing PM2 globally…"
-  npm install -g pm2
+  run_with_timeout "$NET_CMD_TIMEOUT_SECS" npm install -g pm2
   log_ok "PM2 installed: $(pm2 --version 2>/dev/null)"
 fi
 
@@ -34,7 +34,7 @@ env PATH="$PATH:/usr/bin" pm2 startup systemd -u "$USER" --hp "$HOME" || \
 
 # ── Log rotation ───────────────────────────────────────────────────────────────
 log_info "Installing pm2-logrotate…"
-pm2 install pm2-logrotate 2>/dev/null || log_warn "pm2-logrotate already installed or failed"
+run_with_timeout "$NET_CMD_TIMEOUT_SECS" pm2 install pm2-logrotate 2>/dev/null || log_warn "pm2-logrotate already installed or failed"
 pm2 set pm2-logrotate:max_size 100M  2>/dev/null || true
 pm2 set pm2-logrotate:retain 10      2>/dev/null || true
 pm2 set pm2-logrotate:compress false 2>/dev/null || true

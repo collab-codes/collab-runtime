@@ -28,11 +28,11 @@ fi
 
 # Keep the snap base up to date (recommended by Certbot docs).
 log_info "Preparing snap core…"
-snap install core 2>/dev/null || true
-snap refresh core 2>/dev/null || true
+run_with_timeout "$NET_CMD_TIMEOUT_SECS" snap install core 2>/dev/null || true
+run_with_timeout "$NET_CMD_TIMEOUT_SECS" snap refresh core 2>/dev/null || true
 
 log_info "Installing certbot via snap (classic)…"
-snap install --classic certbot
+run_with_timeout "$NET_CMD_TIMEOUT_SECS" snap install --classic certbot
 
 # Expose certbot on the standard PATH (snap installs binaries under /snap/bin).
 if [[ ! -e /usr/bin/certbot ]]; then

@@ -38,7 +38,7 @@ else
   log_info "Adding PGDG apt repository…"
   install -d /usr/share/postgresql-common/pgdg
 
-  curl -o "$PGDG_KEY" --fail \
+  curl -o "$PGDG_KEY" --fail --max-time 30 \
     https://www.postgresql.org/media/keys/ACCC4CF8.asc
 
   # shellcheck source=/dev/null

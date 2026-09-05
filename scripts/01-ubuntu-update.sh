@@ -18,14 +18,14 @@ log_info "Running apt-get update…"
 apt_update_safe
 
 log_info "Running full system upgrade…"
-DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+apt_cmd upgrade -y
 
 log_info "Running dist-upgrade…"
-DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y
+apt_cmd dist-upgrade -y
 
 log_info "Removing unused packages…"
-apt-get autoremove -y
-apt-get clean
+apt_cmd autoremove -y
+apt_cmd clean
 
 OS_DESC="$(lsb_release -d | cut -f2)"
 log_ok "System update complete. OS: ${OS_DESC}"

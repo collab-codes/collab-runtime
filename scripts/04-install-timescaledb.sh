@@ -56,7 +56,7 @@ if dpkg -s "$TSDB_PKG" &>/dev/null; then
 else
   log_info "Installing prerequisites…"
   apt_update_safe
-  apt-get install -y gnupg postgresql-common apt-transport-https lsb-release wget
+  apt_retry 3 install -y gnupg postgresql-common apt-transport-https lsb-release wget
 
   # Run PGDG setup if the apt source wasn't created by step 03.
   # In non-interactive context (stdout not a TTY) this script auto-proceeds.
@@ -71,7 +71,7 @@ else
   local_attempt=0
   while (( local_attempt < 3 )); do
     (( local_attempt++ )) || true
-    if curl -s https://packagecloud.io/install/repositories/timescale/timescaledb/script.deb.sh | bash; then
+    if run_with_timeout "$NET_CMD_TIMEOUT_SECS" bash -c 'curl -sS --fail --max-time 30 https://packagecloud.io/install/repositories/timescale/timescaledb/script.deb.sh | bash'; then
       log_ok "TimescaleDB repository added"
       break
     fi
@@ -85,8 +85,8 @@ else
   done
 
   log_info "Installing ${TSDB_PKG} (Community edition)…"
-  apt-get update -y
-  apt-get install -y "$TSDB_PKG"
+  apt_update_safe
+  apt_retry 3 install -y "$TSDB_PKG"
   log_ok "Package '${TSDB_PKG}' installed"
 fi
 

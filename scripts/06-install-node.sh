@@ -25,7 +25,7 @@ ensure_pnpm() {
     return 0
   fi
   log_info "Installing pnpm globally via npm…"
-  npm install -g pnpm
+  run_with_timeout "$NET_CMD_TIMEOUT_SECS" npm install -g pnpm
   log_ok "pnpm: $(pnpm --version)"
 }
 
@@ -37,7 +37,7 @@ if command_exists node; then
     if ! command_exists npm; then
       log_info "npm not found alongside existing Node.js — installing npm…"
       apt_update_safe
-      apt-get install -y npm
+      apt_retry 3 install -y npm
     fi
     log_info "npm: $(npm --version)"
     ensure_pnpm
@@ -50,16 +50,19 @@ fi
 # Ensure curl and gnupg are available for the NodeSource setup script
 log_info "Installing prerequisites (curl, gnupg)…"
 apt_update_safe
-apt-get install -y curl gnupg
+apt_retry 3 install -y curl gnupg
 
 # Set up NodeSource repository.
 # sudo -E is used as NodeSource's setup script expects a preserved environment,
 # which is also the approach documented by NodeSource.
+# The pipeline is wrapped: curl without --max-time (or the setup script's own
+# apt-get update) is the same unbounded hang as 102052.
 log_info "Setting up NodeSource repository for Node.js ${NODE_VERSION}.x…"
-curl -fsSL "https://deb.nodesource.com/setup_${NODE_VERSION}.x" | sudo -E bash -
+run_with_timeout "$NET_CMD_TIMEOUT_SECS" sudo -E bash -c \
+  "curl -fsSL --max-time 60 'https://deb.nodesource.com/setup_${NODE_VERSION}.x' | bash"
 
 log_info "Installing nodejs (includes npm)…"
-apt-get install -y nodejs
+apt_retry 3 install -y nodejs
 
 NODE_VER="$(node --version)"
 NPM_VER="$(npm --version 2>/dev/null || echo 'not found')"
@@ -69,7 +72,7 @@ NPM_VER="$(npm --version 2>/dev/null || echo 'not found')"
 # failed and Ubuntu's older nodejs was installed instead.
 if ! command_exists npm; then
   log_warn "npm not bundled with installed nodejs — installing npm from Ubuntu repos…"
-  apt-get install -y npm
+  apt_retry 3 install -y npm
   NPM_VER="$(npm --version)"
 fi
 

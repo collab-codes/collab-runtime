@@ -30,20 +30,20 @@ else
     REDIS_LIST="/etc/apt/sources.list.d/redis.list"
 
     log_info "Adding official Redis apt repository for Ubuntu ${CODENAME}…"
-    curl -fsSL https://packages.redis.io/gpg \
+    curl -fsSL --max-time 30 https://packages.redis.io/gpg \
       | gpg --dearmor -o "$REDIS_KEYRING"
     echo "deb [signed-by=${REDIS_KEYRING}] https://packages.redis.io/deb ${CODENAME} main" \
       > "$REDIS_LIST"
 
     log_info "Installing Redis from official repository…"
-    apt-get update -y
-    apt-get install -y redis
+    apt_update_safe
+    apt_retry 3 install -y redis
   else
     # ── Fallback: Ubuntu built-in redis-server ───────────────────────────────
     log_warn "Official Redis apt repo does not yet support Ubuntu ${CODENAME}"
     log_warn "Installing redis-server from Ubuntu's built-in repository instead"
     apt_update_safe
-    apt-get install -y redis-server
+    apt_retry 3 install -y redis-server
   fi
 fi
 

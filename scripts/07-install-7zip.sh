@@ -18,7 +18,7 @@ if command_exists 7z; then
 else
   log_info "Installing p7zip-full…"
   apt_update_safe
-  apt-get install -y p7zip-full
+  apt_retry 3 install -y p7zip-full
 fi
 
 log_ok "7-Zip: $(7z i 2>&1 | head -2 | tail -1)"

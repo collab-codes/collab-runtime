@@ -55,10 +55,12 @@ ensure_dir "$MLS_BASE_DIR"
 chown "${DEPLOY_USER}:" "$MLS_BASE_DIR"
 if [[ -d "${MLS_BASE_DIR}/.git" ]]; then
   log_info "mls-base checkout present — pulling latest…"
-  sudo -u "$DEPLOY_USER" git -C "$MLS_BASE_DIR" pull --ff-only || log_warn "git pull failed (continuing)"
+  run_with_timeout "$NET_CMD_TIMEOUT_SECS" sudo -u "$DEPLOY_USER" git -C "$MLS_BASE_DIR" pull --ff-only \
+    || log_warn "git pull failed (continuing)"
 else
   log_info "Cloning mls-base into ${MLS_BASE_DIR}…"
-  sudo -u "$DEPLOY_USER" git clone "$MLS_BASE_REPO" "$MLS_BASE_DIR" || log_warn "git clone failed (continuing)"
+  run_with_timeout "$NET_CMD_TIMEOUT_SECS" sudo -u "$DEPLOY_USER" git clone "$MLS_BASE_REPO" "$MLS_BASE_DIR" \
+    || log_warn "git clone failed (continuing)"
 fi
 chown -R "${DEPLOY_USER}:" "$MLS_BASE_DIR"
 
@@ -68,7 +70,7 @@ chown -R "${DEPLOY_USER}:" "$MLS_BASE_DIR"
 # node_modules is theirs; -H bash -lc for HOME + corepack PATH.
 if [[ -f "${MLS_BASE_DIR}/package.json" ]]; then
   log_info "Installing mls-base dependencies (as ${DEPLOY_USER})…"
-  if sudo -u "$DEPLOY_USER" -H bash -lc "cd \"$MLS_BASE_DIR\" && pnpm install"; then
+  if run_with_timeout 900 sudo -u "$DEPLOY_USER" -H bash -lc "cd \"$MLS_BASE_DIR\" && pnpm install"; then
     log_ok "mls-base dependencies installed"
   else
     log_warn "pnpm install failed in ${MLS_BASE_DIR} — no build will work on this VM until this passes"

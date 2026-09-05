@@ -1,7 +1,8 @@
 #!/bin/bash
 # core/utils.sh
 # Shared utility functions for collab-runtime install system.
-# Provides: command_exists, service_active, require_root, apt_retry
+# Provides: command_exists, service_active, require_root,
+#           configure_apt_network, run_with_timeout, apt_cmd, apt_update_safe, apt_retry
 #
 # Usage: source "$(dirname "${BASH_SOURCE[0]}")/utils.sh"
 
@@ -43,18 +44,138 @@ require_root() {
 }
 
 # ---------------------------------------------------------------------------
+# Apt / network bounds
+#
+# Measured 05/09/2026 on VM 102052: `apt-get update -y` sat 32 min with
+# /usr/lib/apt/methods/http alive, zero ESTAB sockets, last log line `Ign:`
+# on us-east-1.ec2.ports.ubuntu.com. Default apt has no Acquire::http::Timeout
+# and no Retries, so a dead mirror (or an IPv6 SYN blackhole) is infinite wait.
+# Bootstrap that never ends is worse than bootstrap that fails.
+# ---------------------------------------------------------------------------
+
+# Per-connection idle. A live archive in us-east-1 answers in <2s; 30s is slack
+# for a congested link. Without this, a SYN to a blackhole waits on the kernel
+# TCP timeout (many minutes per URI).
+APT_ACQUIRE_TIMEOUT_SECS="${APT_ACQUIRE_TIMEOUT_SECS:-30}"
+# One blip is not a dead mirror. 3 × 30s = 90s per URI, then apt gives up.
+APT_ACQUIRE_RETRIES="${APT_ACQUIRE_RETRIES:-3}"
+# `apt-get update` only fetches indexes. 3 min is ~90× a healthy InRelease.
+APT_UPDATE_TIMEOUT_SECS="${APT_UPDATE_TIMEOUT_SECS:-180}"
+# Ceiling for install/upgrade. The first 102052 that finished did the WHOLE
+# bootstrap in ~10 min; 15 min for a single apt-get is 1.5× that, still finite.
+APT_CMD_TIMEOUT_SECS="${APT_CMD_TIMEOUT_SECS:-900}"
+# Ceiling for other bootstrap network commands (git/npm/snap/curl|bash).
+NET_CMD_TIMEOUT_SECS="${NET_CMD_TIMEOUT_SECS:-300}"
+
+APT_NETWORK_CONF="/etc/apt/apt.conf.d/99collab-network"
+
+# ---------------------------------------------------------------------------
+# configure_apt_network
+# Writes apt.conf.d (timeout, retries, ForceIPv4) and replaces the EC2
+# regional mirror with the public archive. Idempotent. Must run BEFORE the
+# first apt-get — including the pre-flight curl install in install.sh.
+# ---------------------------------------------------------------------------
+configure_apt_network() {
+  mkdir -p /etc/apt/apt.conf.d
+  cat > "$APT_NETWORK_CONF" <<EOF
+// collab-runtime: apt must never hang the bootstrap.
+//
+// Timeout ${APT_ACQUIRE_TIMEOUT_SECS}s: a live archive in us-east-1 answers in <2s.
+// 30s is slack for a slow mirror. Default apt leaves this unset; a SYN to a
+// blackhole then waits on the kernel TCP timeout (measured 32 min on 102052
+// with /usr/lib/apt/methods/http alive and zero ESTAB sockets).
+// Retries ${APT_ACQUIRE_RETRIES}: one blip (packet loss, 503) is not a dead
+// mirror. 3 × Timeout is still well under a minute per URI.
+// ForceIPv4: AWS Ubuntu AMIs resolve AAAA for ports/archive.ubuntu.com but a
+// typical VPC has no IPv6 route. apt tries IPv6 first; the SYN never
+// completes; ss shows no ESTAB. Forcing v4 is the AWS workaround.
+Acquire::http::Timeout "${APT_ACQUIRE_TIMEOUT_SECS}";
+Acquire::https::Timeout "${APT_ACQUIRE_TIMEOUT_SECS}";
+Acquire::Retries "${APT_ACQUIRE_RETRIES}";
+Acquire::ForceIPv4 "true";
+EOF
+
+  local f
+  for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [[ -f "$f" ]] || continue
+    if grep -qE 'ec2\.(ports|archive)\.ubuntu\.com' "$f"; then
+      # Start on the public archive. The EC2 regional mirror
+      # (us-east-1.ec2.ports.ubuntu.com) produced Ign: on two consecutive
+      # VMs; keeping it first would cost Timeout seconds on every index file
+      # before failover. RTT vs regional is seconds; the hang was unbounded.
+      sed -i -E \
+        -e 's#https?://[^[:space:]]+\.ec2\.ports\.ubuntu\.com(/ubuntu-ports)?#http://ports.ubuntu.com/ubuntu-ports#g' \
+        -e 's#https?://[^[:space:]]+\.ec2\.archive\.ubuntu\.com(/ubuntu)?#http://archive.ubuntu.com/ubuntu#g' \
+        "$f"
+      echo "[INFO]  apt mirror: replaced EC2 regional URI in ${f} with ports/archive.ubuntu.com"
+    fi
+  done
+
+  if [[ -z "${_COLLAB_APT_NETWORK_LOGGED:-}" ]]; then
+    echo "[INFO]  apt network bounds: Timeout=${APT_ACQUIRE_TIMEOUT_SECS}s Retries=${APT_ACQUIRE_RETRIES} ForceIPv4=true (${APT_NETWORK_CONF})"
+    _COLLAB_APT_NETWORK_LOGGED=1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# run_with_timeout <seconds> <command...>
+# Hard ceiling around a network command. GNU timeout 124 (or 137 after
+# --kill-after SIGKILL) is logged loudly and returned as 124 so callers can
+# tell a hang-kill from a normal command failure.
+# Children of apt-get (the http methods) are in the same process group and
+# die with it — that is the point; they were the 32-min zombies on 102052.
+# ---------------------------------------------------------------------------
+run_with_timeout() {
+  local secs="$1"
+  shift
+  local label="$*"
+  if ! command_exists timeout; then
+    echo "[ERR]  timeout(1) missing; cannot bound: ${label}" >&2
+    return 1
+  fi
+  local rc=0
+  timeout --signal=TERM --kill-after=15 "$secs" "$@" || rc=$?
+  if (( rc == 124 || rc == 137 )); then
+    echo "[ERR]  command exceeded ${secs}s and was killed: ${label}" >&2
+    echo "[ERR]  bootstrap must not hang; failing this step" >&2
+    return 124
+  fi
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# apt_cmd <apt-get arguments...>
+# configure_apt_network + DEBIAN_FRONTEND + shell timeout. `update` uses the
+# shorter ceiling; everything else uses APT_CMD_TIMEOUT_SECS.
+# ---------------------------------------------------------------------------
+apt_cmd() {
+  configure_apt_network
+  local secs="$APT_CMD_TIMEOUT_SECS"
+  if [[ "${1:-}" == "update" ]]; then
+    secs="$APT_UPDATE_TIMEOUT_SECS"
+  fi
+  DEBIAN_FRONTEND=noninteractive run_with_timeout "$secs" apt-get "$@"
+}
+
+# ---------------------------------------------------------------------------
 # apt_update_safe
-# Runs apt-get update but treats individual repo failures as warnings, not
-# fatal errors. Third-party repos (Redis, TimescaleDB) may not support the
-# current Ubuntu version — that must not block packages from working repos.
+# Bounded apt-get update. A timeout or kill FAILS (must not hang, must not
+# be swallowed). A non-zero from apt itself (third-party repo 404 on a
+# non-LTS Ubuntu) stays a warning so Redis/TimescaleDB skip paths still work.
 # ---------------------------------------------------------------------------
 apt_update_safe() {
-  if apt-get update -y 2>&1; then
+  local rc=0
+  apt_cmd update -y || rc=$?
+  if (( rc == 0 )); then
     return 0
   fi
-  echo "[WARN]  apt-get update had errors — some repos may not support Ubuntu $(lsb_release -cs)" >&2
+  if (( rc == 124 )); then
+    echo "[ERR]  apt-get update timed out — failing" >&2
+    return 1
+  fi
+  echo "[WARN]  apt-get update had errors — some repos may not support Ubuntu $(lsb_release -cs 2>/dev/null || echo unknown)" >&2
   echo "[WARN]  Continuing with available package cache from working repositories" >&2
-  return 0  # intentionally succeed so the caller can still attempt installs
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -79,8 +200,14 @@ apt_retry() {
   local wait_secs=10
 
   while (( attempt <= max_attempts )); do
-    if DEBIAN_FRONTEND=noninteractive apt-get "$@"; then
+    local rc=0
+    apt_cmd "$@" || rc=$?
+    if (( rc == 0 )); then
       return 0
+    fi
+    if (( rc == 124 )); then
+      echo "[ERR]   apt-get $* timed out — not retrying" >&2
+      return 1
     fi
     if (( attempt < max_attempts )); then
       echo "[WARN]  apt-get $* failed (attempt ${attempt}/${max_attempts}). Retrying in ${wait_secs}s…" >&2
