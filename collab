@@ -374,12 +374,19 @@ cmd_update() {
 cmd_msg() {
   local mode="${1:-}"
   local installer="/usr/local/lib/collab/install-collab-messages.sh"
+  local configure="/usr/local/lib/collab/msg-configure.mjs"
+  if [[ ! -f "$installer" && -f /data/collab-runtime/scripts/11-install-collab-messages.sh ]]; then
+    installer="/data/collab-runtime/scripts/11-install-collab-messages.sh"
+  fi
+  if [[ ! -f "$configure" && -f /data/collab-runtime/scripts/msg-configure.mjs ]]; then
+    configure="/data/collab-runtime/scripts/msg-configure.mjs"
+  fi
 
   case "$mode" in
-    update)
+    install|update)
       shift
       if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-        echo "[ERR]  'collab msg update' must be run as root. Use: sudo collab msg update" >&2
+        echo "[ERR]  'collab msg ${mode}' must be run as root. Use: sudo collab msg ${mode}" >&2
         exit 1
       fi
       if [[ ! -f "$installer" ]]; then
@@ -387,8 +394,21 @@ cmd_msg() {
         echo "[ERR]  Run collab-runtime's scripts/11-install-collab-messages.sh once (or install.sh)." >&2
         exit 1
       fi
-      header "collab — updating collab-messages"
+      header "collab — installing collab-messages"
       bash "$installer" "$@"
+      ;;
+    configure)
+      shift
+      if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+        echo "[ERR]  'collab msg configure' must be run as root. Use: sudo collab msg configure" >&2
+        exit 1
+      fi
+      if [[ ! -f "$configure" ]]; then
+        echo "[ERR]  Configure script not found: ${configure}" >&2
+        exit 1
+      fi
+      header "collab — configuring collab-messages"
+      node "$configure" "$@"
       ;;
     status)
       header "collab — collab-messages status"
@@ -409,14 +429,16 @@ cmd_msg() {
       echo ""
       echo -e "${C_BOLD}collab msg${C_RESET} — requires a subcommand:"
       echo ""
-      echo "  collab msg update [--force]   Install/update collab-messages from S3 (requires sudo)"
+      echo "  collab msg install [--force]  Install/update collab-messages from S3 (requires sudo)"
+      echo "  collab msg update [--force]   Same as install"
+      echo "  collab msg configure --param <name> --role-arn <arn> --config-json '<public json>'"
       echo "  collab msg status             Show installed version and pm2 state"
       echo ""
       exit 0
       ;;
     *)
       echo "Unknown option: ${mode}" >&2
-      echo "Usage: collab msg update [--force] | collab msg status" >&2
+      echo "Usage: collab msg install|update [--force] | configure --param ... | status" >&2
       exit 1
       ;;
   esac
@@ -436,7 +458,8 @@ cmd_help() {
   echo "  doctor              Run PASS/FAIL diagnostics for all components"
   echo "  update --check      List available apt upgrades (dry-run)"
   echo "  update --apply      Apply all apt upgrades (requires sudo)"
-  echo "  msg update [--force] Install/update collab-messages from S3 (requires sudo)"
+  echo "  msg install [--force] Install/update collab-messages from S3 (requires sudo)"
+  echo "  msg configure        Write appconfig.json from Parameter Store (requires sudo)"
   echo "  msg status          Show collab-messages version and pm2 state"
   echo "  help                Show this help message"
   echo ""

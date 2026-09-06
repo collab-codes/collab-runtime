@@ -88,6 +88,8 @@ record_step_result() {
   _STEP_RESULTS+=("${result}|${name}|${msg}")
   if [[ "$result" == "PASS" ]]; then
     (( _PASS_COUNT++ )) || true
+  elif [[ "$result" == "SKIP" ]]; then
+    :
   else
     (( _FAIL_COUNT++ )) || true
   fi

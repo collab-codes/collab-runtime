@@ -4,7 +4,7 @@
 # Bootstrap and install the full collab server stack on Ubuntu 24.04 LTS.
 #
 # Usage:
-#   sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--region=us-east-1] [--agent-token=...] [--agent-env=/etc/collab/sites-agent.env]
+#   sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--region=us-east-1] [--agent-token=...] [--agent-env=/etc/collab/sites-agent.env] [--messages-host]
 #
 # Requirements:
 #   - Ubuntu 24.04 LTS (exits immediately on any other OS)
@@ -49,6 +49,7 @@ SITES_URL=""
 REGION=""
 AGENT_TOKEN=""
 AGENT_ENV="/etc/collab/sites-agent.env"
+MESSAGES_HOST=false
 
 for arg in "$@"; do
   case "$arg" in
@@ -73,9 +74,12 @@ for arg in "$@"; do
     --agent-env=*)
       AGENT_ENV="${arg#--agent-env=}"
       ;;
+    --messages-host)
+      MESSAGES_HOST=true
+      ;;
     --help|-h)
       echo ""
-      echo "Usage: sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--region=us-east-1] [--agent-token=...] [--agent-env=/etc/collab/sites-agent.env]"
+      echo "Usage: sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--region=us-east-1] [--agent-token=...] [--agent-env=/etc/collab/sites-agent.env] [--messages-host]"
       echo ""
       echo "Profiles:"
       echo "  small      1-2 vCPU / 1-2 GB RAM"
@@ -89,12 +93,13 @@ for arg in "$@"; do
       echo "  --region      AWS region where this runtime is running"
       echo "  --agent-token Runtime heartbeat token issued by collab-sites"
       echo "  --agent-env   Root-only env file with heartbeat token"
+      echo "  --messages-host  Install collab-messages on this VM (org host only; default: skip)"
       echo ""
       exit 0
       ;;
     *)
       echo "[ERR]  Unknown argument: ${arg}" >&2
-      echo "Usage: sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--region=us-east-1] [--agent-token=...] [--agent-env=/etc/collab/sites-agent.env]" >&2
+      echo "Usage: sudo ./install.sh [--profile=small|medium|enterprise] [--server-id=srv_...] [--project-id=102051] [--sites-url=https://sites.collab.codes] [--region=us-east-1] [--agent-token=...] [--agent-env=/etc/collab/sites-agent.env] [--messages-host]" >&2
       exit 1
       ;;
   esac
@@ -254,7 +259,13 @@ run_step 07 "Install 7-Zip"           "07-install-7zip.sh"
 run_step 08 "Install PM2"             "08-install-pm2.sh"
 run_step 09 "Install Certbot"         "09-install-certbot.sh"
 run_step 10 "mls-base Runtime"        "10-mls-runtime.sh"
-run_step 11 "collab-messages"         "11-install-collab-messages.sh"
+if [[ "$MESSAGES_HOST" == true ]]; then
+  run_step 11 "collab-messages"         "11-install-collab-messages.sh"
+else
+  log_section "collab-messages"
+  log_info "skipped: not the messages host"
+  record_step_result "collab-messages" "SKIP" "skipped: not the messages host"
+fi
 # PROJECT_ID is exported so the step subshell sees it (run_step passes no arguments).
 export PROJECT_ID AGENT_ENV
 run_step 12 "mls client project"      "12-mls-project.sh"
@@ -268,6 +279,11 @@ CLI_DEST="/usr/local/bin/collab"
 if [[ -f "$CLI_SRC" ]]; then
   cp "$CLI_SRC" "$CLI_DEST"
   chmod +x "$CLI_DEST"
+  mkdir -p /usr/local/lib/collab
+  cp "${INSTALL_DIR}/scripts/11-install-collab-messages.sh" /usr/local/lib/collab/install-collab-messages.sh
+  chmod +x /usr/local/lib/collab/install-collab-messages.sh
+  cp "${INSTALL_DIR}/scripts/msg-configure.mjs" /usr/local/lib/collab/msg-configure.mjs
+  chmod +x /usr/local/lib/collab/msg-configure.mjs
   record_step_result "collab CLI" "PASS" "installed to ${CLI_DEST}"
   log_ok "collab CLI installed to ${CLI_DEST}"
   collab_sites_event "info" "runtime.cli_installed" "collab CLI installed" "" "{\"path\":\"$(json_escape "$CLI_DEST")\"}"

@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "test": "node --test agent/*.test.mjs",
+    "test": "node --test agent/*.test.mjs scripts/*.test.mjs",
     "publish": "sh scripts/publish.sh"
   }
 }
