@@ -431,7 +431,7 @@ cmd_msg() {
       echo ""
       echo "  collab msg install [--force]  Install/update collab-messages from S3 (requires sudo)"
       echo "  collab msg update [--force]   Same as install"
-      echo "  collab msg configure --param <name> --role-arn <arn> --config-json '<public json>'"
+      echo "  collab msg configure --param <name> [--role-arn <arn>] --config-json '<public json>'"
       echo "  collab msg status             Show installed version and pm2 state"
       echo ""
       exit 0

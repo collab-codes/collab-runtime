@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // collab msg configure — write the org's collab-messages appconfig on the host VM.
 //
-// Reads the IAM key from Parameter Store AFTER assuming the member-account
-// role (cm04 E0 path b). Merges aws.accessKeyId/secretAccessKey, storage.*
+// Reads the IAM key from Parameter Store with the instance profile (local to
+// the org sub-account). --role-arn remains optional for hub VMs that still
+// hop via AssumeRole. Merges aws.accessKeyId/secretAccessKey, storage.*
 // and instanceId in place; every other key in appconfig.json is left alone.
 // The secret is never printed: not to stdout, not to stderr, not in errors.
 
@@ -41,7 +42,6 @@ export function parseConfigureArgs(argv) {
     else throw new Error(`unknown option: ${arg}`);
   }
   if (!out.param) throw new Error("--param is required");
-  if (!out.roleArn) throw new Error("--role-arn is required");
   if (!out.configJson) throw new Error("--config-json is required");
   return out;
 }
@@ -231,10 +231,13 @@ async function waitHealth(url, deps) {
 
 export async function configure(opts, deps = {}) {
   const publicConfig = parsePublicConfig(opts.configJson);
-  step("assume-role");
-  const assumed = deps.assumeRole
-    ? await deps.assumeRole(opts.roleArn)
-    : assumeRole(opts.roleArn);
+  let assumed;
+  if (opts.roleArn) {
+    step("assume-role");
+    assumed = deps.assumeRole
+      ? await deps.assumeRole(opts.roleArn)
+      : assumeRole(opts.roleArn);
+  }
   step("get-parameter");
   const raw = deps.getParameter
     ? await deps.getParameter(opts.param, assumed)

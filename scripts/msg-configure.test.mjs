@@ -23,12 +23,18 @@ const OLD_APPCONFIG = {
 
 const SECRET = { accessKeyId: "AKIAEXAMPLEPROBE0000", secretAccessKey: "probe-not-a-real-secret" };
 
-test("parseConfigureArgs requires param, role-arn and config-json", () => {
+test("parseConfigureArgs requires param and config-json; --role-arn is optional", () => {
   assert.throws(() => parseConfigureArgs([]), /--param is required/);
   assert.throws(
     () => parseConfigureArgs(["--param", "/collab/org/x/msg/aws"]),
-    /--role-arn is required/,
+    /--config-json is required/,
   );
+  const withoutRole = parseConfigureArgs([
+    "--param", "/collab/org/aabbccdd/msg/aws",
+    "--config-json", '{"instanceId":"i-abc","storage":{"bucket":"collab-msg-aabbccdd"}}',
+  ]);
+  assert.equal(withoutRole.param, "/collab/org/aabbccdd/msg/aws");
+  assert.equal(withoutRole.roleArn, "");
   const parsed = parseConfigureArgs([
     "--param", "/collab/org/aabbccdd/msg/aws",
     "--role-arn", "arn:aws:iam::331191958360:role/collab-messages-param-reader",
@@ -91,6 +97,34 @@ test("storageOkFromHealth reads cm01 storage.ok and surfaces the error code", ()
   assert.equal(storageOkFromHealth({ storage: { ok: true, accountId: "331191958360" } }).ok, true);
   assert.equal(storageOkFromHealth({ storage: { ok: false, error: "UnrecognizedClientException" } }).error, "UnrecognizedClientException");
   assert.equal(storageOkFromHealth("{not json").error, "health is not JSON");
+});
+
+test("configure without --role-arn reads the parameter with instance credentials", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "msg-configure-"));
+  const appconfig = join(dir, "appconfig.json");
+  writeFileSync(appconfig, `${JSON.stringify(OLD_APPCONFIG, null, 2)}\n`);
+  let assumed = false;
+  await configure({
+    param: "/collab/org/probe/msg/aws",
+    roleArn: "",
+    configJson: JSON.stringify({ instanceId: "i-host", storage: { bucket: "collab-msg-aabbccdd" } }),
+    appconfig,
+    healthUrl: "http://127.0.0.1:8180/health",
+  }, {
+    assumeRole: async () => {
+      assumed = true;
+      return {};
+    },
+    getParameter: async (_name, env) => {
+      assert.equal(env, undefined);
+      return JSON.stringify(SECRET);
+    },
+    reloadPm2: async () => {},
+    fetch: async () => ({ text: async () => JSON.stringify({ storage: { ok: true } }) }),
+    now: () => 0,
+    sleep: async () => {},
+  });
+  assert.equal(assumed, false);
 });
 
 test("configure writes atomically, reloads, waits health, and never prints the secret", async () => {
