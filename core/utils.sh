@@ -2,7 +2,8 @@
 # core/utils.sh
 # Shared utility functions for collab-runtime install system.
 # Provides: command_exists, service_active, require_root,
-#           configure_apt_network, run_with_timeout, apt_cmd, apt_update_safe, apt_retry
+#           configure_apt_network, run_with_timeout, apt_cmd, apt_update_safe, apt_retry,
+#           file_owner, deploy_home, resolve_deploy_user, run_as_deploy
 #
 # Usage: source "$(dirname "${BASH_SOURCE[0]}")/utils.sh"
 
@@ -232,6 +233,92 @@ ensure_dir() {
   if [[ ! -d "$dir" ]]; then
     mkdir -p "$dir"
     chmod "$perms" "$dir"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Deploy user — one process owner for the whole VM (pm2, msg, mls-base).
+#
+# collab-sites runs the release as dataOwnerUser (ubuntu). Cloud-init chowns
+# /data to that user, then `sudo install.sh` as root, so $USER/$HOME and even
+# SUDO_USER are root. The owner of /data is the one source of truth; ubuntu
+# is the fallback that matches the AMI and the sites default.
+# ---------------------------------------------------------------------------
+
+COLLAB_DATA_ROOT="${COLLAB_DATA_ROOT:-/data}"
+
+# file_owner <path>
+# Username that owns the path. GNU stat on the VM; BSD stat so the helper
+# can be exercised on macOS. Empty string if the path is missing.
+# ---------------------------------------------------------------------------
+file_owner() {
+  local path="$1"
+  [[ -e "$path" ]] || return 0
+  local owner=""
+  owner="$(stat -c '%U' "$path" 2>/dev/null || true)"
+  if [[ -z "$owner" ]]; then
+    owner="$(stat -f '%Su' "$path" 2>/dev/null || true)"
+  fi
+  printf '%s' "$owner"
+}
+
+# deploy_home <user>
+# Login home for the user. getent on Ubuntu; ~user / conventional paths as
+# fallback (macOS has no getent).
+# ---------------------------------------------------------------------------
+deploy_home() {
+  local user="$1"
+  local home=""
+  if command_exists getent; then
+    home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
+  fi
+  if [[ -z "$home" ]]; then
+    home="$(eval echo "~${user}" 2>/dev/null || true)"
+  fi
+  if [[ -z "$home" || "$home" == "~${user}" ]]; then
+    if [[ "$user" == "root" ]]; then
+      home="/root"
+    else
+      home="/home/${user}"
+    fi
+  fi
+  printf '%s' "$home"
+}
+
+# resolve_deploy_user
+# Sets DEPLOY_USER and DEPLOY_HOME. Override with COLLAB_DEPLOY_USER.
+# ---------------------------------------------------------------------------
+resolve_deploy_user() {
+  local owner=""
+  if [[ -n "${COLLAB_DEPLOY_USER:-}" ]]; then
+    DEPLOY_USER="$COLLAB_DEPLOY_USER"
+  else
+    owner="$(file_owner "${COLLAB_DATA_ROOT}")"
+    if [[ -n "$owner" && "$owner" != "root" ]]; then
+      DEPLOY_USER="$owner"
+    elif [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+      DEPLOY_USER="$SUDO_USER"
+    elif id -u ubuntu &>/dev/null; then
+      DEPLOY_USER="ubuntu"
+    else
+      DEPLOY_USER="${SUDO_USER:-root}"
+    fi
+  fi
+  DEPLOY_HOME="$(deploy_home "$DEPLOY_USER")"
+}
+
+# run_as_deploy <command...>
+# Run a command as DEPLOY_USER with that user's HOME. Call resolve_deploy_user
+# first. Extra env: `run_as_deploy env FOO=bar cmd`.
+# ---------------------------------------------------------------------------
+run_as_deploy() {
+  if [[ -z "${DEPLOY_USER:-}" ]]; then
+    resolve_deploy_user
+  fi
+  if [[ "$(id -un)" == "$DEPLOY_USER" ]]; then
+    env PATH="${PATH}:/usr/bin" "$@"
+  else
+    sudo -u "$DEPLOY_USER" -H env PATH="${PATH}:/usr/bin" "$@"
   fi
 }
 

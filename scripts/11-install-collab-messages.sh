@@ -17,12 +17,48 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# Self-contained logging: source core helpers when running from the repo
-# checkout, fall back to plain echo when running from /usr/local/lib/collab.
-if [[ -f "${REPO_ROOT}/core/logger.sh" ]]; then
-  source "${REPO_ROOT}/core/logger.sh"
-  source "${REPO_ROOT}/core/utils.sh"
-else
+# Self-contained: source core helpers from the repo checkout, from the copy
+# next to this script (/usr/local/lib/collab), or from the runtime checkout.
+_loaded_utils=false
+for _candidate in \
+  "${REPO_ROOT}/core/utils.sh" \
+  "${SCRIPT_DIR}/utils.sh" \
+  "/data/collab-runtime/core/utils.sh"
+do
+  if [[ -f "$_candidate" ]]; then
+    _dir="$(cd "$(dirname "$_candidate")" && pwd)"
+    if [[ -f "${_dir}/logger.sh" ]]; then
+      source "${_dir}/logger.sh"
+    fi
+    source "$_candidate"
+    _loaded_utils=true
+    break
+  fi
+done
+unset _candidate _dir
+if [[ "$_loaded_utils" != true ]]; then
+  resolve_deploy_user() {
+    if [[ -n "${COLLAB_DEPLOY_USER:-}" ]]; then
+      DEPLOY_USER="$COLLAB_DEPLOY_USER"
+    elif [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+      DEPLOY_USER="$SUDO_USER"
+    elif id -u ubuntu &>/dev/null; then
+      DEPLOY_USER="ubuntu"
+    else
+      DEPLOY_USER="${SUDO_USER:-root}"
+    fi
+    DEPLOY_HOME="$(eval echo "~${DEPLOY_USER}")"
+  }
+  run_as_deploy() {
+    if [[ "$(id -un)" == "$DEPLOY_USER" ]]; then
+      env PATH="${PATH}:/usr/bin" "$@"
+    else
+      sudo -u "$DEPLOY_USER" -H env PATH="${PATH}:/usr/bin" "$@"
+    fi
+  }
+fi
+unset _loaded_utils
+if ! declare -F log_info >/dev/null 2>&1; then
   log_section() { echo ""; echo "=== $* ==="; }
   log_info()    { echo "[INFO] $*"; }
   log_ok()      { echo "[OK]   $*"; }
@@ -31,6 +67,9 @@ else
 fi
 
 log_section "Step 11 — collab-messages (msg)"
+
+resolve_deploy_user
+log_info "collab-messages process user: ${DEPLOY_USER}"
 
 FORCE=false
 for arg in "$@"; do
@@ -60,13 +99,14 @@ log_info "Latest release: ${VERSION}"
 INSTALLED_VERSION=""
 [[ -f "$VERSION_FILE" ]] && INSTALLED_VERSION="$(cat "$VERSION_FILE")"
 
-if [[ "$INSTALLED_VERSION" == "$VERSION" && "$FORCE" != true ]] && pm2 describe msg &>/dev/null; then
+if [[ "$INSTALLED_VERSION" == "$VERSION" && "$FORCE" != true ]] && run_as_deploy pm2 describe msg &>/dev/null; then
   log_ok "collab-messages ${VERSION} already installed and running (use --force to reinstall)"
   exit 0
 fi
 
 # ── Download release ───────────────────────────────────────────────────────────
 mkdir -p "$INSTALL_DIR_MSG" "$NODE_DIR"
+chown -R "${DEPLOY_USER}:" "$ROOT"
 
 log_info "Downloading release ${VERSION}…"
 curl -fsS --max-time 300 -o "$INSTALL_DIR_MSG/nodefiles.7z"      "${S3_BASE}/${VERSION}/nodefiles.7z"
@@ -125,7 +165,13 @@ else
 }
 EOF
   chmod 600 "$NODE_DIR/appconfig.json"
+  chown "${DEPLOY_USER}:" "$NODE_DIR/appconfig.json"
   log_ok "appconfig.json created"
+fi
+chown -R "${DEPLOY_USER}:" "$ROOT"
+if [[ -f "$NODE_DIR/appconfig.json" ]]; then
+  chmod 600 "$NODE_DIR/appconfig.json"
+  chown "${DEPLOY_USER}:" "$NODE_DIR/appconfig.json"
 fi
 
 # ── Install release (release layout + pm2 startOrReload) ────────────────────────
@@ -134,10 +180,16 @@ if [[ -z "$PNPM_RESOLVED" ]]; then
   log_error "pnpm not found — run step 10 (mls-base runtime) first"
   exit 1
 fi
-log_info "Running addNewVersion --updatePackage…"
-PNPM_BIN="$PNPM_RESOLVED" COLLAB_MESSAGES_DEPLOY_ROOT="$ROOT" "$ROOT/addNewVersion" --updatePackage
+log_info "Running addNewVersion --updatePackage as ${DEPLOY_USER}…"
+run_as_deploy env PNPM_BIN="$PNPM_RESOLVED" COLLAB_MESSAGES_DEPLOY_ROOT="$ROOT" "$ROOT/addNewVersion" --updatePackage
 echo "$VERSION" > "$VERSION_FILE"
-log_ok "collab-messages ${VERSION} installed (pm2 app: msg)"
+chown "${DEPLOY_USER}:" "$VERSION_FILE"
+chown -R "${DEPLOY_USER}:" "$ROOT"
+if [[ -f "$NODE_DIR/appconfig.json" ]]; then
+  chmod 600 "$NODE_DIR/appconfig.json"
+  chown "${DEPLOY_USER}:" "$NODE_DIR/appconfig.json"
+fi
+log_ok "collab-messages ${VERSION} installed (pm2 app: msg, user: ${DEPLOY_USER})"
 
 # ── nginx: expose /msg → 127.0.0.1:8180 ────────────────────────────────────────
 SNIPPET="/etc/nginx/snippets/collab-messages.conf"
@@ -178,6 +230,9 @@ mkdir -p "$CLI_LIB_DIR"
 if [[ "$SCRIPT_DIR" != "$CLI_LIB_DIR" ]]; then
   cp "${BASH_SOURCE[0]}" "$CLI_LIB_DIR/install-collab-messages.sh"
   chmod +x "$CLI_LIB_DIR/install-collab-messages.sh"
+  if [[ -f "${REPO_ROOT}/core/utils.sh" ]]; then
+    cp "${REPO_ROOT}/core/utils.sh" "$CLI_LIB_DIR/utils.sh"
+  fi
 fi
 
-log_ok "collab-messages ready — check with: pm2 ls | grep msg"
+log_ok "collab-messages ready — check with: sudo -u ${DEPLOY_USER} -H pm2 ls | grep msg"

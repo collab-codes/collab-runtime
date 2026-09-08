@@ -40,6 +40,24 @@ warn()  { echo -e "  ${C_WARN}WARN${C_RESET}  $*"; }
 divider(){ echo -e "${C_DIM}────────────────────────────────────────────────────────${C_RESET}"; }
 header(){ echo -e "\n${C_BOLD}$*${C_RESET}"; divider; }
 
+# PM2 belongs to the deploy user (owner of /data). Talking to it as root
+# spawns a second daemon. Load the same resolver the installer uses.
+_load_deploy_user() {
+  local candidate
+  for candidate in \
+    /data/collab-runtime/core/utils.sh \
+    /usr/local/lib/collab/utils.sh
+  do
+    if [[ -f "$candidate" ]]; then
+      # shellcheck source=/dev/null
+      source "$candidate"
+      resolve_deploy_user
+      return 0
+    fi
+  done
+  return 1
+}
+
 # ── Subcommand: logs ───────────────────────────────────────────────────────────
 cmd_logs() {
   local detail=false
@@ -271,11 +289,20 @@ cmd_doctor() {
     (( failures++ )) || true
   fi
 
-  # Check if pm2 systemd unit exists
-  if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^pm2"; then
-    pass "pm2 systemd unit registered"
+  # Check if pm2 systemd unit exists — exactly one, on the deploy user.
+  local pm2_units pm2_unit_count
+  pm2_units="$(find /etc/systemd/system /lib/systemd/system -maxdepth 1 -name 'pm2-*.service' -printf '%f\n' 2>/dev/null | sort -u)"
+  pm2_unit_count=0
+  if [[ -n "$pm2_units" ]]; then
+    pm2_unit_count="$(printf '%s\n' "$pm2_units" | grep -c .)"
+  fi
+  if (( pm2_unit_count == 1 )); then
+    pass "pm2 systemd unit ${pm2_units}"
+  elif (( pm2_unit_count > 1 )); then
+    fail "multiple pm2 systemd units: $(printf '%s' "$pm2_units" | tr '\n' ' ')"
+    (( failures++ )) || true
   else
-    warn "pm2 systemd unit not found (run: pm2 startup systemd)"
+    warn "pm2 systemd unit not found (run: pm2 startup systemd -u <deploy-user>)"
   fi
 
   # ── PostgreSQL + TimescaleDB extension ───────────────────────────────────────
@@ -419,7 +446,11 @@ cmd_msg() {
         warn "no installed version recorded (${version_file} not found)"
       fi
       if command -v pm2 &>/dev/null; then
-        pm2 ls | grep -E "msg|─" || true
+        if _load_deploy_user && declare -F run_as_deploy >/dev/null; then
+          run_as_deploy pm2 ls | grep -E "msg|─" || true
+        else
+          pm2 ls | grep -E "msg|─" || true
+        fi
       else
         warn "pm2 not found"
       fi

@@ -8,7 +8,7 @@
 // The secret is never printed: not to stdout, not to stderr, not in errors.
 
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 export const DEFAULT_APPCONFIG = "/data/msg.collab.codes/node/appconfig.json";
@@ -118,11 +118,55 @@ export function atomicWriteJson(path, value) {
   if (!existsSync(dir)) {
     throw new Error(`appconfig directory missing: ${dir}`);
   }
+  let uid;
+  let gid;
+  if (existsSync(path)) {
+    const st = statSync(path);
+    uid = st.uid;
+    gid = st.gid;
+  }
   const tmp = `${path}.tmp.${process.pid}`;
   writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   chmodSync(tmp, 0o600);
   renameSync(tmp, path);
   chmodSync(path, 0o600);
+  if (uid != null) chownSync(path, uid, gid);
+}
+
+export function fileOwnerName(path) {
+  if (!path || !existsSync(path)) return "";
+  const gnu = spawnSync("stat", ["-c", "%U", path], { encoding: "utf8" });
+  if (gnu.status === 0) {
+    const name = (gnu.stdout || "").trim();
+    if (name) return name;
+  }
+  const bsd = spawnSync("stat", ["-f", "%Su", path], { encoding: "utf8" });
+  if (bsd.status === 0) {
+    const name = (bsd.stdout || "").trim();
+    if (name) return name;
+  }
+  return "";
+}
+
+export function pm2ProcessUser(appconfigPath) {
+  const fromFile = fileOwnerName(appconfigPath);
+  if (fromFile) return fromFile;
+  const fromData = fileOwnerName("/data");
+  if (fromData && fromData !== "root") return fromData;
+  return "ubuntu";
+}
+
+function currentUserName() {
+  const result = spawnSync("id", ["-un"], { encoding: "utf8" });
+  return (result.stdout || "").trim();
+}
+
+export function pm2ReloadSpawn(user, name) {
+  const me = currentUserName();
+  if (user && user !== me) {
+    return { command: "sudo", args: ["-u", user, "-H", "pm2", "reload", name, "--update-env"] };
+  }
+  return { command: "pm2", args: ["reload", name, "--update-env"] };
 }
 
 export function storageOkFromHealth(body) {
@@ -195,9 +239,11 @@ function getParameterValue(name, env) {
   return value.replace(/\n$/u, "");
 }
 
-function reloadPm2() {
+function reloadPm2(appconfigPath) {
+  const user = pm2ProcessUser(appconfigPath);
   for (const name of ["msg", "msg-worker"]) {
-    const result = spawnSync("pm2", ["reload", name, "--update-env"], { encoding: "utf8" });
+    const spawn = pm2ReloadSpawn(user, name);
+    const result = spawnSync(spawn.command, spawn.args, { encoding: "utf8" });
     if (result.status !== 0) {
       const err = (result.stderr || result.stdout || `exit ${result.status}`).trim().split("\n")[0];
       throw new Error(`pm2 reload ${name} failed: ${err}`);
@@ -253,7 +299,7 @@ export async function configure(opts, deps = {}) {
   (deps.writeAppconfig ?? atomicWriteJson)(opts.appconfig, merged);
   step("pm2-reload");
   if (deps.reloadPm2) await deps.reloadPm2();
-  else reloadPm2();
+  else reloadPm2(opts.appconfig);
   step("wait-health");
   await waitHealth(opts.healthUrl, deps);
   step("ok");

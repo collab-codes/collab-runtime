@@ -27,7 +27,7 @@ source "${REPO_ROOT}/core/utils.sh"
 log_section "Step 12 — client project on the VM (git-ready)"
 
 MLS_BASE_DIR="${MLS_BASE_DIR:-/data/mls-base}"
-DEPLOY_USER="${SUDO_USER:-root}"
+resolve_deploy_user
 AGENT_ENV="${AGENT_ENV:-/etc/collab/sites-agent.env}"
 
 # install.sh exports PROJECT_ID; the agent env is the fallback, so a re-run of this step

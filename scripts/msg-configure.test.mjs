@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
   DEFAULT_APPCONFIG,
+  atomicWriteJson,
   configure,
+  fileOwnerName,
   mergeAppConfig,
   parseConfigureArgs,
   parsePublicConfig,
   parseSecretParameter,
+  pm2ProcessUser,
+  pm2ReloadSpawn,
   storageOkFromHealth,
 } from "./msg-configure.mjs";
 
@@ -192,4 +196,40 @@ test("configure exits with the storage error code when /health is not ok", async
     }),
     /AccessDeniedException/,
   );
+});
+
+test("atomicWriteJson keeps mode 600 and the previous owner", () => {
+  const dir = mkdtempSync(join(tmpdir(), "msg-configure-"));
+  const appconfig = join(dir, "appconfig.json");
+  writeFileSync(appconfig, "{}\n", { mode: 0o600 });
+  chmodSync(appconfig, 0o600);
+  const before = statSync(appconfig);
+  atomicWriteJson(appconfig, { aws: { accessKeyId: "x" } });
+  const after = statSync(appconfig);
+  assert.equal(after.mode & 0o777, 0o600);
+  assert.equal(after.uid, before.uid);
+  assert.equal(after.gid, before.gid);
+});
+
+test("pm2 reload talks to the appconfig owner, not the installer root", () => {
+  const me = userInfo().username;
+  const asOther = pm2ReloadSpawn("ubuntu", "msg");
+  if (me === "ubuntu") {
+    assert.equal(asOther.command, "pm2");
+    assert.deepEqual(asOther.args, ["reload", "msg", "--update-env"]);
+  } else {
+    assert.equal(asOther.command, "sudo");
+    assert.deepEqual(asOther.args, ["-u", "ubuntu", "-H", "pm2", "reload", "msg", "--update-env"]);
+  }
+  const asMe = pm2ReloadSpawn(me, "msg-worker");
+  assert.equal(asMe.command, "pm2");
+  assert.deepEqual(asMe.args, ["reload", "msg-worker", "--update-env"]);
+});
+
+test("pm2ProcessUser reads the owner of the appconfig file", () => {
+  const dir = mkdtempSync(join(tmpdir(), "msg-configure-"));
+  const appconfig = join(dir, "appconfig.json");
+  writeFileSync(appconfig, "{}\n");
+  assert.equal(fileOwnerName(appconfig), userInfo().username);
+  assert.equal(pm2ProcessUser(appconfig), userInfo().username);
 });

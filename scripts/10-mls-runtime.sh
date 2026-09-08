@@ -21,9 +21,10 @@ log_section "Step 10 — mls-base runtime prerequisites"
 
 MLS_BASE_DIR="${MLS_BASE_DIR:-/data/mls-base}"
 MLS_BASE_REPO="${MLS_BASE_REPO:-https://github.com/expansiva/mls-base}"
-# When invoked through sudo, SUDO_USER is the real login user (the one that will
-# rsync from the dev machine). Fall back to root if not run via sudo.
-DEPLOY_USER="${SUDO_USER:-root}"
+# Same user as pm2 (step 08) and the collab-sites dataOwnerUser: the owner of
+# /data, typically ubuntu. Cloud-init runs `sudo install.sh` as root, so
+# SUDO_USER is not the deploy user.
+resolve_deploy_user
 
 # ── rsync + git ─────────────────────────────────────────────────────────────────
 if ! command_exists rsync || ! command_exists git; then
