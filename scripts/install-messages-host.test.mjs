@@ -20,3 +20,8 @@ test("collab CLI exposes msg install and msg configure", () => {
   assert.match(cli, /configure\)/);
   assert.match(cli, /msg-configure\.mjs/);
 });
+
+test("install.sh never installs the AWS CLI", () => {
+  assert.doesNotMatch(install, /aws-cli|awscli|snap install aws/);
+  assert.match(install, /run_step 11 "collab-messages"/);
+});

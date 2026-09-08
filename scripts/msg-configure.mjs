@@ -6,10 +6,13 @@
 // hop via AssumeRole. Merges aws.accessKeyId/secretAccessKey, storage.*
 // and instanceId in place; every other key in appconfig.json is left alone.
 // The secret is never printed: not to stdout, not to stderr, not in errors.
+// AWS calls go through the SDK (no `aws` CLI binary).
 
 import { spawnSync } from "node:child_process";
 import { chmodSync, chownSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export const DEFAULT_APPCONFIG = "/data/msg.collab.codes/node/appconfig.json";
 export const DEFAULT_HEALTH_URL = "http://127.0.0.1:8180/health";
@@ -186,36 +189,103 @@ export function storageOkFromHealth(body) {
   return { ok: false, error };
 }
 
+export const DEFAULT_MSG_NODE = "/data/msg.collab.codes/node";
+export const DEFAULT_CLI_DIR = "/usr/local/lib/collab";
+
 function step(name) {
   process.stdout.write(`${name}\n`);
 }
 
-function runAws(args, env, { hideStdout = false } = {}) {
-  const result = spawnSync("aws", args, {
-    encoding: "utf8",
-    env: { ...process.env, ...env },
-  });
-  if (result.error) throw new Error(`aws ${args[0]} failed: ${result.error.message}`);
-  if (result.status !== 0) {
-    const err = (result.stderr || result.stdout || `exit ${result.status}`).trim().split("\n")[0];
-    throw new Error(`aws ${args[0]} failed: ${err}`);
-  }
-  return hideStdout ? result.stdout : result.stdout;
+export function awsRegion() {
+  return process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1";
 }
 
-function assumeRole(roleArn) {
-  const raw = runAws([
-    "sts", "assume-role",
-    "--role-arn", roleArn,
-    "--role-session-name", "collab-msg-configure",
-    "--duration-seconds", "900",
-    "--output", "json",
-  ], undefined, { hideStdout: true });
+export function awsErrorCode(error) {
+  if (!error || typeof error !== "object") return "Error";
+  const name = typeof error.name === "string" && error.name && error.name !== "Error" ? error.name : "";
+  const code = typeof error.Code === "string" && error.Code
+    ? error.Code
+    : (typeof error.code === "string" && error.code ? error.code : "");
+  return name || code || "Error";
+}
+
+export function accountIdFromRoleArn(roleArn) {
+  const match = /^arn:aws:iam::(\d+):role\//.exec(roleArn || "");
+  return match ? match[1] : "";
+}
+
+export function wrapAssumeRoleError(roleArn, error) {
+  const code = awsErrorCode(error);
+  const account = accountIdFromRoleArn(roleArn);
+  const accountPart = account ? ` (account ${account})` : "";
+  return new Error(`assume-role failed for ${roleArn}${accountPart}: ${code}`);
+}
+
+export function wrapSsmError(name, error) {
+  return new Error(`get-parameter ${name} failed: ${awsErrorCode(error)}`);
+}
+
+export function hasAwsSdk(nodeModulesDir) {
+  if (!nodeModulesDir) return false;
+  return existsSync(join(nodeModulesDir, "@aws-sdk/client-sts"))
+    && existsSync(join(nodeModulesDir, "@aws-sdk/client-ssm"));
+}
+
+export function findAwsSdkDir(overrides = {}) {
+  const scriptDir = dirname(fileURLToPath(import.meta.url));
+  const candidates = overrides.candidates ?? [
+    overrides.msgNodeModules ?? join(overrides.msgNode ?? DEFAULT_MSG_NODE, "node_modules"),
+    overrides.cliNodeModules ?? join(overrides.cliDir ?? DEFAULT_CLI_DIR, "node_modules"),
+    join(scriptDir, "node_modules"),
+    join(scriptDir, "..", "node_modules"),
+  ];
+  for (const dir of candidates) {
+    if (hasAwsSdk(dir)) return dir;
+  }
+  throw new Error(
+    `AWS SDK not found (need @aws-sdk/client-sts and @aws-sdk/client-ssm). Looked in: ${candidates.join(", ")}. Run: sudo collab msg install. AWS CLI is not required.`,
+  );
+}
+
+export function loadAwsSdk(nodeModulesDir, requireImpl) {
+  const dir = nodeModulesDir ?? findAwsSdkDir();
+  const require = requireImpl ?? createRequire(join(dir, "..", "msg-configure-aws.cjs"));
+  const load = (pkg) => {
+    try {
+      return require(pkg);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `cannot load ${pkg} from ${dir}: ${detail}. Run: sudo collab msg install. AWS CLI is not required.`,
+      );
+    }
+  };
+  const sts = load("@aws-sdk/client-sts");
+  const ssm = load("@aws-sdk/client-ssm");
+  if (!sts?.STSClient || !sts?.AssumeRoleCommand || !ssm?.SSMClient || !ssm?.GetParameterCommand) {
+    throw new Error(
+      `AWS SDK from ${dir} is incomplete. Run: sudo collab msg install. AWS CLI is not required.`,
+    );
+  }
+  return {
+    STSClient: sts.STSClient,
+    AssumeRoleCommand: sts.AssumeRoleCommand,
+    SSMClient: ssm.SSMClient,
+    GetParameterCommand: ssm.GetParameterCommand,
+  };
+}
+
+async function assumeRole(roleArn, sdk, deps) {
+  const client = deps.stsClient ?? new sdk.STSClient({ region: awsRegion() });
   let parsed;
   try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error("assume-role did not return JSON");
+    parsed = await client.send(new sdk.AssumeRoleCommand({
+      RoleArn: roleArn,
+      RoleSessionName: "collab-msg-configure",
+      DurationSeconds: 900,
+    }));
+  } catch (error) {
+    throw wrapAssumeRoleError(roleArn, error);
   }
   const creds = parsed?.Credentials;
   if (!creds?.AccessKeyId || !creds?.SecretAccessKey || !creds?.SessionToken) {
@@ -228,14 +298,29 @@ function assumeRole(roleArn) {
   };
 }
 
-function getParameterValue(name, env) {
-  const value = runAws([
-    "ssm", "get-parameter",
-    "--name", name,
-    "--with-decryption",
-    "--query", "Parameter.Value",
-    "--output", "text",
-  ], env, { hideStdout: true });
+async function getParameterValue(name, env, sdk, deps) {
+  const config = { region: awsRegion() };
+  if (env?.AWS_ACCESS_KEY_ID && env?.AWS_SECRET_ACCESS_KEY && env?.AWS_SESSION_TOKEN) {
+    config.credentials = {
+      accessKeyId: env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
+      sessionToken: env.AWS_SESSION_TOKEN,
+    };
+  }
+  const client = deps.ssmClient ?? new sdk.SSMClient(config);
+  let out;
+  try {
+    out = await client.send(new sdk.GetParameterCommand({
+      Name: name,
+      WithDecryption: true,
+    }));
+  } catch (error) {
+    throw wrapSsmError(name, error);
+  }
+  const value = out?.Parameter?.Value;
+  if (typeof value !== "string") {
+    throw new Error("get-parameter did not return a value");
+  }
   return value.replace(/\n$/u, "");
 }
 
@@ -277,17 +362,14 @@ async function waitHealth(url, deps) {
 
 export async function configure(opts, deps = {}) {
   const publicConfig = parsePublicConfig(opts.configJson);
+  const sdk = deps.awsSdk ?? loadAwsSdk(deps.awsSdkDir, deps.require);
   let assumed;
   if (opts.roleArn) {
     step("assume-role");
-    assumed = deps.assumeRole
-      ? await deps.assumeRole(opts.roleArn)
-      : assumeRole(opts.roleArn);
+    assumed = await assumeRole(opts.roleArn, sdk, deps);
   }
   step("get-parameter");
-  const raw = deps.getParameter
-    ? await deps.getParameter(opts.param, assumed)
-    : getParameterValue(opts.param, assumed);
+  const raw = await getParameterValue(opts.param, assumed, sdk, deps);
   const secret = parseSecretParameter(raw);
   step("merge-appconfig");
   if (!existsSync(opts.appconfig)) {

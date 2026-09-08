@@ -49,6 +49,19 @@ test("11 runs addNewVersion as the deploy user and keeps appconfig at 600", () =
   assert.match(step11, /chown "\$\{DEPLOY_USER\}:" "\$NODE_DIR\/appconfig\.json"/);
 });
 
+test("11 installs AWS SDK for msg-configure even when msg is already installed, never AWS CLI", () => {
+  assert.match(step11, /ensure_msg_configure_sdk\(\)/);
+  assert.match(step11, /@aws-sdk\/client-sts@\^3\.1127\.0/);
+  assert.match(step11, /@aws-sdk\/client-ssm@\^3\.744\.0/);
+  assert.match(step11, /no AWS CLI/);
+  assert.doesNotMatch(step11, /aws-cli|awscli|amazon-linux-extras.*aws/);
+  const early = step11.slice(
+    step11.indexOf('INSTALLED_VERSION" == "$VERSION"'),
+    step11.indexOf("Download release"),
+  );
+  assert.match(early, /ensure_msg_configure_sdk/);
+});
+
 test("10 and 12 use resolve_deploy_user instead of SUDO_USER:-root", () => {
   assert.match(step10, /resolve_deploy_user/);
   assert.match(step12, /resolve_deploy_user/);

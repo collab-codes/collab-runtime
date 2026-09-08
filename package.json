@@ -5,5 +5,9 @@
   "scripts": {
     "test": "node --test agent/*.test.mjs scripts/*.test.mjs",
     "publish": "sh scripts/publish.sh"
+  },
+  "dependencies": {
+    "@aws-sdk/client-ssm": "^3.744.0",
+    "@aws-sdk/client-sts": "^3.1127.0"
   }
 }

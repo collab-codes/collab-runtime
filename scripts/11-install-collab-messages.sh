@@ -86,6 +86,31 @@ NODE_DIR="$ROOT/node"
 VERSION_FILE="$NODE_DIR/collab-messages.version"
 CLI_LIB_DIR="/usr/local/lib/collab"
 
+# AWS SDK for `collab msg configure` (no AWS CLI). Prefer the collab-messages
+# node_modules; current releases ship @aws-sdk/client-sts but not client-ssm,
+# so fall back to installing both next to the CLI script. Versions stay in
+# sync with collab-runtime/package.json.
+ensure_msg_configure_sdk() {
+  mkdir -p "$CLI_LIB_DIR"
+  local msg_nm="${NODE_DIR}/node_modules"
+  if [[ -d "${msg_nm}/@aws-sdk/client-sts" && -d "${msg_nm}/@aws-sdk/client-ssm" ]]; then
+    log_info "msg-configure AWS SDK: ${msg_nm}"
+    return 0
+  fi
+  if [[ -d "${CLI_LIB_DIR}/node_modules/@aws-sdk/client-sts" && -d "${CLI_LIB_DIR}/node_modules/@aws-sdk/client-ssm" ]]; then
+    log_info "msg-configure AWS SDK: ${CLI_LIB_DIR}/node_modules"
+    return 0
+  fi
+  if ! command -v npm >/dev/null 2>&1; then
+    log_error "npm not found — run step 06 (Node.js) before configuring collab-messages"
+    return 1
+  fi
+  log_info "Installing @aws-sdk/client-sts and @aws-sdk/client-ssm for msg-configure (no AWS CLI)"
+  npm install --prefix "$CLI_LIB_DIR" --omit=dev --no-fund --no-audit --no-progress \
+    "@aws-sdk/client-sts@^3.1127.0" \
+    "@aws-sdk/client-ssm@^3.744.0"
+}
+
 # ── Resolve latest version ─────────────────────────────────────────────────────
 log_info "Fetching ${S3_BASE}/latest.json…"
 LATEST_JSON="$(curl -fsS --max-time 30 "${S3_BASE}/latest.json")"
@@ -100,6 +125,7 @@ INSTALLED_VERSION=""
 [[ -f "$VERSION_FILE" ]] && INSTALLED_VERSION="$(cat "$VERSION_FILE")"
 
 if [[ "$INSTALLED_VERSION" == "$VERSION" && "$FORCE" != true ]] && run_as_deploy pm2 describe msg &>/dev/null; then
+  ensure_msg_configure_sdk
   log_ok "collab-messages ${VERSION} already installed and running (use --force to reinstall)"
   exit 0
 fi
@@ -189,6 +215,7 @@ if [[ -f "$NODE_DIR/appconfig.json" ]]; then
   chmod 600 "$NODE_DIR/appconfig.json"
   chown "${DEPLOY_USER}:" "$NODE_DIR/appconfig.json"
 fi
+ensure_msg_configure_sdk
 log_ok "collab-messages ${VERSION} installed (pm2 app: msg, user: ${DEPLOY_USER})"
 
 # ── nginx: expose /msg → 127.0.0.1:8180 ────────────────────────────────────────
