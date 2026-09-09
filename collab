@@ -402,11 +402,15 @@ cmd_msg() {
   local mode="${1:-}"
   local installer="/usr/local/lib/collab/install-collab-messages.sh"
   local configure="/usr/local/lib/collab/msg-configure.mjs"
+  local vapid="/usr/local/lib/collab/msg-vapid.mjs"
   if [[ ! -f "$installer" && -f /data/collab-runtime/scripts/11-install-collab-messages.sh ]]; then
     installer="/data/collab-runtime/scripts/11-install-collab-messages.sh"
   fi
   if [[ ! -f "$configure" && -f /data/collab-runtime/scripts/msg-configure.mjs ]]; then
     configure="/data/collab-runtime/scripts/msg-configure.mjs"
+  fi
+  if [[ ! -f "$vapid" && -f /data/collab-runtime/scripts/msg-vapid.mjs ]]; then
+    vapid="/data/collab-runtime/scripts/msg-vapid.mjs"
   fi
 
   case "$mode" in
@@ -437,6 +441,14 @@ cmd_msg() {
       header "collab — configuring collab-messages"
       node "$configure" "$@"
       ;;
+    vapid)
+      shift
+      if [[ ! -f "$vapid" ]]; then
+        echo "[ERR]  VAPID script not found: ${vapid}" >&2
+        exit 1
+      fi
+      node "$vapid" "$@"
+      ;;
     status)
       header "collab — collab-messages status"
       local version_file="/data/msg.collab.codes/node/collab-messages.version"
@@ -463,13 +475,15 @@ cmd_msg() {
       echo "  collab msg install [--force]  Install/update collab-messages from S3 (requires sudo)"
       echo "  collab msg update [--force]   Same as install"
       echo "  collab msg configure --param <name> [--role-arn <arn>] --config-json '<public json>'"
+      echo "  collab msg vapid init [--project <orgShortId>] [--force]"
+      echo "  collab msg vapid show [--project <orgShortId>]"
       echo "  collab msg status             Show installed version and pm2 state"
       echo ""
       exit 0
       ;;
     *)
       echo "Unknown option: ${mode}" >&2
-      echo "Usage: collab msg install|update [--force] | configure --param ... | status" >&2
+      echo "Usage: collab msg install|update [--force] | configure --param ... | vapid init|show | status" >&2
       exit 1
       ;;
   esac
@@ -491,6 +505,7 @@ cmd_help() {
   echo "  update --apply      Apply all apt upgrades (requires sudo)"
   echo "  msg install [--force] Install/update collab-messages from S3 (requires sudo)"
   echo "  msg configure        Write appconfig.json from Parameter Store (requires sudo)"
+  echo "  msg vapid init|show  Create or show the org VAPID public key"
   echo "  msg status          Show collab-messages version and pm2 state"
   echo "  help                Show this help message"
   echo ""

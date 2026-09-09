@@ -12,15 +12,19 @@ import {
   configure,
   fileOwnerName,
   findAwsSdkDir,
+  generateVapidKeys,
   hasAwsSdk,
   loadAwsSdk,
   mergeAppConfig,
   parseConfigureArgs,
   parsePublicConfig,
   parseSecretParameter,
+  parseWebPushParameter,
   pm2ProcessUser,
   pm2ReloadSpawn,
+  publicKeyFingerprint,
   storageOkFromHealth,
+  webPushParamFromStorageParam,
   wrapAssumeRoleError,
   wrapSsmError,
 } from "./msg-configure.mjs";
@@ -35,18 +39,26 @@ const OLD_APPCONFIG = {
 
 const SECRET = { accessKeyId: "AKIAEXAMPLEPROBE0000", secretAccessKey: "probe-not-a-real-secret" };
 const ROLE_ARN = "arn:aws:iam::331191958360:role/collab-messages-param-reader";
+const WEBPUSH = {
+  publicKey: "vapid-public-example-key",
+  privateKey: "vapid-private-example-key",
+  subject: "mailto:webpush@collab.codes",
+};
 
 function mockAwsSdk({
   assume = { Credentials: { AccessKeyId: "ASIA", SecretAccessKey: "x", SessionToken: "t" } },
   parameter = JSON.stringify(SECRET),
+  parameters = null,
   assumeError = null,
   parameterError = null,
 } = {}) {
   const stsSends = [];
   const ssmSends = [];
+  const ssmPuts = [];
   const ssmConfigs = [];
   class AssumeRoleCommand { constructor(input) { this.input = input; } }
   class GetParameterCommand { constructor(input) { this.input = input; } }
+  class PutParameterCommand { constructor(input) { this.input = input; } }
   class STSClient {
     constructor(config) { this.config = config; }
     async send(cmd) {
@@ -59,14 +71,34 @@ function mockAwsSdk({
     constructor(config) { ssmConfigs.push(config); this.config = config; }
     async send(cmd) {
       ssmSends.push(cmd);
+      if (cmd instanceof PutParameterCommand) {
+        ssmPuts.push(cmd);
+        return { Version: 1 };
+      }
+      const name = cmd.input?.Name;
+      if (parameters && Object.prototype.hasOwnProperty.call(parameters, name)) {
+        const value = parameters[name];
+        if (value == null) {
+          const missing = new Error("Parameter not found");
+          missing.name = "ParameterNotFound";
+          throw missing;
+        }
+        return { Parameter: { Value: value } };
+      }
+      if (typeof name === "string" && name.endsWith("/webpush") && !parameters) {
+        const missing = new Error("Parameter not found");
+        missing.name = "ParameterNotFound";
+        throw missing;
+      }
       if (parameterError) throw parameterError;
       return { Parameter: { Value: parameter } };
     }
   }
   return {
-    awsSdk: { STSClient, AssumeRoleCommand, SSMClient, GetParameterCommand },
+    awsSdk: { STSClient, AssumeRoleCommand, SSMClient, GetParameterCommand, PutParameterCommand },
     stsSends,
     ssmSends,
+    ssmPuts,
     ssmConfigs,
   };
 }
@@ -89,7 +121,8 @@ function writeFakeAwsSdk(nodeModules, { sts = true, ssm = true } = {}) {
     writeFileSync(join(d, "index.js"), `
       class SSMClient { async send() { return { Parameter: { Value: ${JSON.stringify(JSON.stringify(SECRET))} } }; } }
       class GetParameterCommand { constructor(input) { this.input = input; } }
-      module.exports = { SSMClient, GetParameterCommand };
+      class PutParameterCommand { constructor(input) { this.input = input; } }
+      module.exports = { SSMClient, GetParameterCommand, PutParameterCommand };
     `);
   }
 }
@@ -159,9 +192,17 @@ test("parseSecretParameter rejects a payload that is not the key pair", () => {
 });
 
 test("parsePublicConfig rejects a secret smuggled in as config", () => {
-  const parsed = parsePublicConfig('{"instanceId":"i-1","aws":{"accessKeyId":"AKIA"}}');
-  assert.equal(parsed.aws, undefined);
-  assert.equal(parsed.instanceId, "i-1");
+  assert.throws(
+    () => parsePublicConfig('{"instanceId":"i-1","aws":{"accessKeyId":"AKIA"}}'),
+    /must have key "storage".*unknown key: aws/,
+  );
+});
+
+test("parsePublicConfig rejects flattened storage keys (cm40 P1)", () => {
+  assert.throws(
+    () => parsePublicConfig('{"bucket":"collab-msg-x","dynamoRegion":"us-east-1"}'),
+    /must have key "storage".*unknown key: bucket, dynamoRegion/,
+  );
 });
 
 test("storageOkFromHealth reads cm01 storage.ok and surfaces the error code", () => {
@@ -189,9 +230,10 @@ test("configure without --role-arn reads the parameter with instance credentials
     sleep: async () => {},
   });
   assert.equal(mock.stsSends.length, 0);
-  assert.equal(mock.ssmSends.length, 1);
+  assert.equal(mock.ssmSends.length, 2);
   assert.equal(mock.ssmSends[0].input.Name, "/collab/org/probe/msg/aws");
   assert.equal(mock.ssmSends[0].input.WithDecryption, true);
+  assert.equal(mock.ssmSends[1].input.Name, "/collab/org/probe/webpush");
   assert.equal(mock.ssmConfigs[0].credentials, undefined);
 });
 
@@ -243,7 +285,7 @@ test("configure writes atomically, reloads, waits health, and never prints the s
   assert.equal(mock.ssmSends[0].input.WithDecryption, true);
   assert.equal(mock.ssmConfigs[0].credentials.accessKeyId, "ASIA");
   const output = lines.join("");
-  assert.match(output, /^assume-role\nget-parameter\nmerge-appconfig\nwrite-appconfig\npm2-reload\nwait-health\nok\n$/u);
+  assert.match(output, /^assume-role\nget-parameter\nget-parameter-webpush\nweb push not configured\nmerge-appconfig\nwrite-appconfig\npm2-reload\nwait-health\nok\n$/u);
   assert.equal(output.includes(SECRET.secretAccessKey), false);
   assert.equal(output.includes(SECRET.accessKeyId), false);
   assert.equal(output.includes("ASIA"), false);
@@ -418,6 +460,7 @@ test("loadAwsSdk requires both clients from the given node_modules", () => {
   assert.equal(typeof sdk.AssumeRoleCommand, "function");
   assert.equal(typeof sdk.SSMClient, "function");
   assert.equal(typeof sdk.GetParameterCommand, "function");
+  assert.equal(typeof sdk.PutParameterCommand, "function");
 });
 
 test("loadAwsSdk fails clearly when client-ssm is missing", () => {
@@ -436,4 +479,106 @@ test("msg-configure does not spawn the aws CLI", () => {
   assert.match(src, /@aws-sdk\/client-ssm/);
   assert.match(src, /AssumeRoleCommand/);
   assert.match(src, /GetParameterCommand/);
+});
+
+test("webPushParamFromStorageParam derives /webpush from the storage param", () => {
+  assert.equal(webPushParamFromStorageParam("/collab/org/o1/msg/aws"), "/collab/org/o1/webpush");
+  assert.equal(webPushParamFromStorageParam("/elsewhere"), "");
+  assert.deepEqual(
+    parseWebPushParameter(JSON.stringify(WEBPUSH)),
+    WEBPUSH,
+  );
+  const keys = generateVapidKeys();
+  assert.match(keys.publicKey, /^[A-Za-z0-9_-]+$/);
+  assert.match(keys.privateKey, /^[A-Za-z0-9_-]+$/);
+  assert.equal(publicKeyFingerprint(keys.publicKey).length, 16);
+});
+
+test("configure with webpush parameter writes webPush at mode 600 (T2)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "msg-configure-"));
+  const appconfig = join(dir, "appconfig.json");
+  writeFileSync(appconfig, `${JSON.stringify(OLD_APPCONFIG, null, 2)}\n`);
+  chmodSync(appconfig, 0o600);
+  const before = statSync(appconfig);
+  const mock = mockAwsSdk({
+    parameters: {
+      "/collab/org/probe/msg/aws": JSON.stringify(SECRET),
+      "/collab/org/probe/webpush": JSON.stringify(WEBPUSH),
+    },
+  });
+  await configure({
+    param: "/collab/org/probe/msg/aws",
+    roleArn: "",
+    configJson: JSON.stringify({ instanceId: "i-host", storage: { bucket: "collab-msg-probe" } }),
+    appconfig,
+    healthUrl: "http://127.0.0.1:8180/health",
+  }, {
+    awsSdk: mock.awsSdk,
+    reloadPm2: async () => {},
+    fetch: async () => ({ text: async () => JSON.stringify({ storage: { ok: true } }) }),
+    now: () => 0,
+    sleep: async () => {},
+  });
+  const written = JSON.parse(readFileSync(appconfig, "utf8"));
+  assert.deepEqual(written.webPush, WEBPUSH);
+  assert.equal(written.aws.accessKeyId, SECRET.accessKeyId);
+  assert.equal(statSync(appconfig).mode & 0o777, 0o600);
+  assert.equal(statSync(appconfig).uid, before.uid);
+  assert.equal(mock.ssmSends.some((cmd) => cmd.input?.Name === "/collab/org/probe/webpush"), true);
+});
+
+test("configure with flattened --config-json exits != 0 and leaves the file intact (T3)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "msg-configure-"));
+  const appconfig = join(dir, "appconfig.json");
+  const original = `${JSON.stringify(OLD_APPCONFIG, null, 2)}\n`;
+  writeFileSync(appconfig, original);
+  const mock = mockAwsSdk();
+  await assert.rejects(
+    () => configure({
+      param: "/collab/org/probe/msg/aws",
+      roleArn: "",
+      configJson: '{"bucket":"collab-msg-x","dynamoRegion":"us-east-1"}',
+      appconfig,
+      healthUrl: "http://127.0.0.1:8180/health",
+    }, {
+      awsSdk: mock.awsSdk,
+      reloadPm2: async () => {},
+    }),
+    /must have key "storage"/,
+  );
+  assert.equal(readFileSync(appconfig, "utf8"), original);
+  assert.equal(mock.ssmSends.length, 0);
+});
+
+test("configure with missing webpush parameter exits 0 without a webPush block (T4)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "msg-configure-"));
+  const appconfig = join(dir, "appconfig.json");
+  writeFileSync(appconfig, `${JSON.stringify(OLD_APPCONFIG, null, 2)}\n`);
+  const mock = mockAwsSdk();
+  const lines = [];
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk, ...rest) => {
+    lines.push(String(chunk));
+    return originalWrite.call(process.stdout, chunk, ...rest);
+  };
+  try {
+    await configure({
+      param: "/collab/org/probe/msg/aws",
+      roleArn: "",
+      configJson: JSON.stringify({ instanceId: "i-host" }),
+      appconfig,
+      healthUrl: "http://127.0.0.1:8180/health",
+    }, {
+      awsSdk: mock.awsSdk,
+      reloadPm2: async () => {},
+      fetch: async () => ({ text: async () => JSON.stringify({ storage: { ok: true } }) }),
+      now: () => 0,
+      sleep: async () => {},
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  const written = JSON.parse(readFileSync(appconfig, "utf8"));
+  assert.equal(written.webPush, undefined);
+  assert.match(lines.join(""), /web push not configured/);
 });

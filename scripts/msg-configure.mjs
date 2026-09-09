@@ -9,6 +9,7 @@
 // AWS calls go through the SDK (no `aws` CLI binary).
 
 import { spawnSync } from "node:child_process";
+import { createECDH, createHash } from "node:crypto";
 import { chmodSync, chownSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
@@ -77,6 +78,11 @@ export function parsePublicConfig(raw) {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("--config-json must be a JSON object");
   }
+  const allowed = new Set(["storage", "instanceId"]);
+  const unknown = Object.keys(parsed).filter((key) => !allowed.has(key));
+  if (unknown.length > 0) {
+    throw new Error(`--config-json must have key "storage" (unknown key: ${unknown.join(", ")})`);
+  }
   const next = {};
   if (parsed.storage != null) {
     if (typeof parsed.storage !== "object" || Array.isArray(parsed.storage)) {
@@ -93,7 +99,7 @@ export function parsePublicConfig(raw) {
   return next;
 }
 
-export function mergeAppConfig(current, secret, publicConfig) {
+export function mergeAppConfig(current, secret, publicConfig, webPush) {
   if (!current || typeof current !== "object" || Array.isArray(current)) {
     throw new Error("appconfig.json must be a JSON object");
   }
@@ -113,7 +119,63 @@ export function mergeAppConfig(current, secret, publicConfig) {
   if (Object.prototype.hasOwnProperty.call(publicConfig, "instanceId")) {
     next.instanceId = publicConfig.instanceId;
   }
+  if (webPush) {
+    next.webPush = {
+      publicKey: webPush.publicKey,
+      privateKey: webPush.privateKey,
+      subject: webPush.subject,
+    };
+  }
   return next;
+}
+
+export const DEFAULT_WEBPUSH_SUBJECT = "mailto:webpush@collab.codes";
+
+export function orgShortIdFromParam(param) {
+  const match = /^\/collab\/org\/([^/]+)\//.exec(param || "");
+  return match ? match[1] : "";
+}
+
+export function webPushParamName(orgShortId) {
+  if (!orgShortId) throw new Error("orgShortId is required");
+  return `/collab/org/${orgShortId}/webpush`;
+}
+
+export function webPushParamFromStorageParam(param) {
+  const orgShortId = orgShortIdFromParam(param);
+  return orgShortId ? webPushParamName(orgShortId) : "";
+}
+
+export function parseWebPushParameter(raw) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("webpush parameter value is not JSON");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("webpush parameter value is not a JSON object");
+  }
+  const publicKey = typeof parsed.publicKey === "string" ? parsed.publicKey.trim() : "";
+  const privateKey = typeof parsed.privateKey === "string" ? parsed.privateKey.trim() : "";
+  const subject = typeof parsed.subject === "string" ? parsed.subject.trim() : "";
+  if (!publicKey || !privateKey || !subject) {
+    throw new Error("webpush parameter is missing publicKey, privateKey or subject");
+  }
+  return { publicKey, privateKey, subject };
+}
+
+export function generateVapidKeys() {
+  const ecdh = createECDH("prime256v1");
+  ecdh.generateKeys();
+  return {
+    publicKey: ecdh.getPublicKey(null, "uncompressed").toString("base64url"),
+    privateKey: ecdh.getPrivateKey().toString("base64url"),
+  };
+}
+
+export function publicKeyFingerprint(publicKey) {
+  return createHash("sha256").update(publicKey, "utf8").digest("hex").slice(0, 16);
 }
 
 export function atomicWriteJson(path, value) {
@@ -225,6 +287,16 @@ export function wrapSsmError(name, error) {
   return new Error(`get-parameter ${name} failed: ${awsErrorCode(error)}`);
 }
 
+export function wrapSsmPutError(name, error) {
+  return new Error(`put-parameter ${name} failed: ${awsErrorCode(error)}`);
+}
+
+export function isSsmParameterNotFound(error) {
+  if (awsErrorCode(error) === "ParameterNotFound") return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("ParameterNotFound");
+}
+
 export function hasAwsSdk(nodeModulesDir) {
   if (!nodeModulesDir) return false;
   return existsSync(join(nodeModulesDir, "@aws-sdk/client-sts"))
@@ -262,7 +334,7 @@ export function loadAwsSdk(nodeModulesDir, requireImpl) {
   };
   const sts = load("@aws-sdk/client-sts");
   const ssm = load("@aws-sdk/client-ssm");
-  if (!sts?.STSClient || !sts?.AssumeRoleCommand || !ssm?.SSMClient || !ssm?.GetParameterCommand) {
+  if (!sts?.STSClient || !sts?.AssumeRoleCommand || !ssm?.SSMClient || !ssm?.GetParameterCommand || !ssm?.PutParameterCommand) {
     throw new Error(
       `AWS SDK from ${dir} is incomplete. Run: sudo collab msg install. AWS CLI is not required.`,
     );
@@ -272,10 +344,23 @@ export function loadAwsSdk(nodeModulesDir, requireImpl) {
     AssumeRoleCommand: sts.AssumeRoleCommand,
     SSMClient: ssm.SSMClient,
     GetParameterCommand: ssm.GetParameterCommand,
+    PutParameterCommand: ssm.PutParameterCommand,
   };
 }
 
-async function assumeRole(roleArn, sdk, deps) {
+function ssmClientConfig(env) {
+  const config = { region: awsRegion() };
+  if (env?.AWS_ACCESS_KEY_ID && env?.AWS_SECRET_ACCESS_KEY && env?.AWS_SESSION_TOKEN) {
+    config.credentials = {
+      accessKeyId: env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
+      sessionToken: env.AWS_SESSION_TOKEN,
+    };
+  }
+  return config;
+}
+
+export async function assumeRole(roleArn, sdk, deps) {
   const client = deps.stsClient ?? new sdk.STSClient({ region: awsRegion() });
   let parsed;
   try {
@@ -298,16 +383,8 @@ async function assumeRole(roleArn, sdk, deps) {
   };
 }
 
-async function getParameterValue(name, env, sdk, deps) {
-  const config = { region: awsRegion() };
-  if (env?.AWS_ACCESS_KEY_ID && env?.AWS_SECRET_ACCESS_KEY && env?.AWS_SESSION_TOKEN) {
-    config.credentials = {
-      accessKeyId: env.AWS_ACCESS_KEY_ID,
-      secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
-      sessionToken: env.AWS_SESSION_TOKEN,
-    };
-  }
-  const client = deps.ssmClient ?? new sdk.SSMClient(config);
+export async function getParameterValue(name, env, sdk, deps) {
+  const client = deps.ssmClient ?? new sdk.SSMClient(ssmClientConfig(env));
   let out;
   try {
     out = await client.send(new sdk.GetParameterCommand({
@@ -322,6 +399,29 @@ async function getParameterValue(name, env, sdk, deps) {
     throw new Error("get-parameter did not return a value");
   }
   return value.replace(/\n$/u, "");
+}
+
+export async function getParameterValueOptional(name, env, sdk, deps) {
+  try {
+    return await getParameterValue(name, env, sdk, deps);
+  } catch (error) {
+    if (isSsmParameterNotFound(error)) return null;
+    throw error;
+  }
+}
+
+export async function putParameterValue(name, value, env, sdk, deps, overwrite) {
+  const client = deps.ssmClient ?? new sdk.SSMClient(ssmClientConfig(env));
+  try {
+    await client.send(new sdk.PutParameterCommand({
+      Name: name,
+      Type: "SecureString",
+      Overwrite: overwrite === true,
+      Value: value,
+    }));
+  } catch (error) {
+    throw wrapSsmPutError(name, error);
+  }
 }
 
 function reloadPm2(appconfigPath) {
@@ -371,12 +471,23 @@ export async function configure(opts, deps = {}) {
   step("get-parameter");
   const raw = await getParameterValue(opts.param, assumed, sdk, deps);
   const secret = parseSecretParameter(raw);
+  let webPush;
+  const webPushName = webPushParamFromStorageParam(opts.param);
+  if (webPushName) {
+    step("get-parameter-webpush");
+    const rawPush = await getParameterValueOptional(webPushName, assumed, sdk, deps);
+    if (rawPush == null) {
+      step("web push not configured");
+    } else {
+      webPush = parseWebPushParameter(rawPush);
+    }
+  }
   step("merge-appconfig");
   if (!existsSync(opts.appconfig)) {
     throw new Error(`appconfig.json not found: ${opts.appconfig}`);
   }
   const current = JSON.parse(readFileSync(opts.appconfig, "utf8"));
-  const merged = mergeAppConfig(current, secret, publicConfig);
+  const merged = mergeAppConfig(current, secret, publicConfig, webPush);
   step("write-appconfig");
   (deps.writeAppconfig ?? atomicWriteJson)(opts.appconfig, merged);
   step("pm2-reload");

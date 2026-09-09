@@ -21,6 +21,13 @@ test("collab CLI exposes msg install and msg configure", () => {
   assert.match(cli, /msg-configure\.mjs/);
 });
 
+test("collab CLI exposes msg vapid and install.sh copies the script", () => {
+  assert.match(cli, /vapid\)/);
+  assert.match(cli, /msg-vapid\.mjs/);
+  assert.match(cli, /vapid init\|show/);
+  assert.match(install, /msg-vapid\.mjs/);
+});
+
 test("install.sh never installs the AWS CLI", () => {
   assert.doesNotMatch(install, /aws-cli|awscli|snap install aws/);
   assert.match(install, /run_step 11 "collab-messages"/);
