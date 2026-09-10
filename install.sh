@@ -119,32 +119,74 @@ collab_sites_can_report() {
   [[ -n "$SERVER_ID" && -n "$PROJECT_ID" && -n "$SITES_URL" && -n "$AGENT_TOKEN" ]]
 }
 
+collab_sites_redact() {
+  local text="$1"
+  if [[ -n "${AGENT_TOKEN:-}" ]]; then
+    text="${text//$AGENT_TOKEN/}"
+  fi
+  printf '%s' "$text"
+}
+
+collab_sites_append_event_log() {
+  local code="$1"
+  local level="$2"
+  local status="$3"
+  local http_code="$4"
+  local ok="$5"
+  local events_log="${LOG_DIR}/sites-events.jsonl"
+  local ts http_n
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  http_n=0
+  if [[ "${http_code:-0}" =~ ^[0-9]+$ ]]; then
+    http_n=$((10#$http_code)) || http_n=0
+  fi
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+  printf '%s\n' "{\"ts\":\"$(json_escape "$ts")\",\"code\":\"$(json_escape "$code")\",\"level\":\"$(json_escape "$level")\",\"status\":\"$(json_escape "$status")\",\"http\":${http_n},\"ok\":${ok}}" >> "$events_log" || true
+}
+
 collab_sites_event() {
   local level="$1"
   local code="$2"
   local message="$3"
   local status="${4:-}"
   local details="${5:-{}}"
+  local http_code="000"
+  local ok="false"
+  local body=""
+  local tmp payload
 
   if ! collab_sites_can_report || ! command -v curl >/dev/null 2>&1; then
     if collab_sites_can_report; then
       log_warn "Cannot report collab-sites event '${code}': curl is not installed yet"
     fi
+    collab_sites_append_event_log "$code" "$level" "$status" "$http_code" "$ok"
     return 0
   fi
 
-  local payload
   payload="{\"projectId\":\"$(json_escape "$PROJECT_ID")\",\"token\":\"$(json_escape "$AGENT_TOKEN")\",\"level\":\"$(json_escape "$level")\",\"code\":\"$(json_escape "$code")\",\"message\":\"$(json_escape "$message")\",\"status\":\"$(json_escape "$status")\",\"details\":${details}}"
-
-  if ! curl -fsS \
+  tmp="$(mktemp)"
+  http_code="$(curl -sS \
+    -o "$tmp" \
+    -w '%{http_code}' \
     --max-time 10 \
     -H "Content-Type: application/json" \
     -H "X-Collab-Origin: collab-runtime-install" \
     -X POST \
     --data-binary "$payload" \
-    "${SITES_URL%/}/api/v1/servers/${SERVER_ID}/events" >/dev/null; then
-    log_warn "Failed to report collab-sites event '${code}'"
+    "${SITES_URL%/}/api/v1/servers/${SERVER_ID}/events" || true)"
+  [[ -n "$http_code" ]] || http_code="000"
+
+  body="$(head -c 200 "$tmp" 2>/dev/null || true)"
+  body="${body//$'\n'/ }"
+  rm -f "$tmp"
+
+  if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+    ok="true"
+  else
+    log_warn "Failed to report collab-sites event '${code}': http=${http_code} body=$(collab_sites_redact "$body")"
   fi
+  collab_sites_append_event_log "$code" "$level" "$status" "$http_code" "$ok"
+  return 0
 }
 
 # ── Step 3: Load profile ───────────────────────────────────────────────────────
