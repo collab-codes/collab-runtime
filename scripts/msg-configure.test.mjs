@@ -582,3 +582,55 @@ test("configure with missing webpush parameter exits 0 without a webPush block (
   assert.equal(written.webPush, undefined);
   assert.match(lines.join(""), /web push not configured/);
 });
+
+test("configure with --param outside org format skips webpush with a reason (T8)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "msg-configure-"));
+  const appconfig = join(dir, "appconfig.json");
+  writeFileSync(appconfig, `${JSON.stringify(OLD_APPCONFIG, null, 2)}\n`);
+  const mock = mockAwsSdk({
+    parameters: { "/elsewhere": JSON.stringify(SECRET) },
+  });
+  const lines = [];
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk, ...rest) => {
+    lines.push(String(chunk));
+    return originalWrite.call(process.stdout, chunk, ...rest);
+  };
+  try {
+    await configure({
+      param: "/elsewhere",
+      roleArn: "",
+      configJson: JSON.stringify({ instanceId: "i-host" }),
+      appconfig,
+      healthUrl: "http://127.0.0.1:8180/health",
+    }, {
+      awsSdk: mock.awsSdk,
+      reloadPm2: async () => {},
+      fetch: async () => ({ text: async () => JSON.stringify({ storage: { ok: true } }) }),
+      now: () => 0,
+      sleep: async () => {},
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  const skip = "get-parameter-webpush skipped: no webpush param derived from /elsewhere";
+  const output = lines.join("");
+  assert.equal(
+    output,
+    `get-parameter\n${skip}\nmerge-appconfig\nwrite-appconfig\npm2-reload\nwait-health\n${skip}\nok\n`,
+  );
+  const written = JSON.parse(readFileSync(appconfig, "utf8"));
+  assert.equal(written.webPush, undefined);
+  assert.equal(written.aws.accessKeyId, SECRET.accessKeyId);
+  assert.equal(written.instanceId, "i-host");
+  assert.equal(mock.ssmSends.length, 1);
+  assert.equal(mock.ssmSends[0].input.Name, "/elsewhere");
+});
+
+test("11 calls addNewVersion with COLLAB_WEBPUSH_SOURCE=parameter-store (T9)", () => {
+  const step11 = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "11-install-collab-messages.sh"), "utf8");
+  assert.match(
+    step11,
+    /run_as_deploy env PNPM_BIN=.*COLLAB_WEBPUSH_SOURCE=parameter-store "\$ROOT\/addNewVersion" --updatePackage/,
+  );
+});

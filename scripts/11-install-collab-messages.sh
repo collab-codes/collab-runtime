@@ -207,7 +207,7 @@ if [[ -z "$PNPM_RESOLVED" ]]; then
   exit 1
 fi
 log_info "Running addNewVersion --updatePackage as ${DEPLOY_USER}…"
-run_as_deploy env PNPM_BIN="$PNPM_RESOLVED" COLLAB_MESSAGES_DEPLOY_ROOT="$ROOT" "$ROOT/addNewVersion" --updatePackage
+run_as_deploy env PNPM_BIN="$PNPM_RESOLVED" COLLAB_MESSAGES_DEPLOY_ROOT="$ROOT" COLLAB_WEBPUSH_SOURCE=parameter-store "$ROOT/addNewVersion" --updatePackage
 echo "$VERSION" > "$VERSION_FILE"
 chown "${DEPLOY_USER}:" "$VERSION_FILE"
 chown -R "${DEPLOY_USER}:" "$ROOT"

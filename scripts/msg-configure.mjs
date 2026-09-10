@@ -473,6 +473,7 @@ export async function configure(opts, deps = {}) {
   const secret = parseSecretParameter(raw);
   let webPush;
   const webPushName = webPushParamFromStorageParam(opts.param);
+  let webPushSkip;
   if (webPushName) {
     step("get-parameter-webpush");
     const rawPush = await getParameterValueOptional(webPushName, assumed, sdk, deps);
@@ -481,6 +482,9 @@ export async function configure(opts, deps = {}) {
     } else {
       webPush = parseWebPushParameter(rawPush);
     }
+  } else {
+    webPushSkip = `get-parameter-webpush skipped: no webpush param derived from ${opts.param}`;
+    step(webPushSkip);
   }
   step("merge-appconfig");
   if (!existsSync(opts.appconfig)) {
@@ -495,6 +499,7 @@ export async function configure(opts, deps = {}) {
   else reloadPm2(opts.appconfig);
   step("wait-health");
   await waitHealth(opts.healthUrl, deps);
+  if (webPushSkip) step(webPushSkip);
   step("ok");
 }
 
