@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,24 +23,46 @@ function installHelpers() {
 
 function listen(status, body) {
   return new Promise((resolve) => {
+    const received = [];
     const server = createServer((req, res) => {
-      req.resume();
+      const chunks = [];
+      req.on("data", (c) => chunks.push(c));
       req.on("end", () => {
+        received.push(Buffer.concat(chunks).toString("utf8"));
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(body);
       });
     });
     server.listen(0, "127.0.0.1", () => {
       const address = server.address();
-      resolve({ server, url: `http://127.0.0.1:${address.port}` });
+      resolve({ server, url: `http://127.0.0.1:${address.port}`, received });
     });
   });
 }
 
-async function runEvent({ sitesUrl, code = "runtime.step_started", status = "", extra = "" }) {
+function leftovers(dir) {
+  return readdirSync(dir).filter(
+    (name) => !["install-summary.log", "install-detail.log", "sites-events.jsonl"].includes(name),
+  );
+}
+
+async function runEvent({
+  sitesUrl,
+  code = "runtime.step_started",
+  status = "",
+  extra = "",
+  details = "{}",
+  includeDetails = true,
+  call,
+}) {
   const dir = mkdtempSync(join(tmpdir(), "clone04-sites-event-"));
+  const detailsArg = includeDetails ? ` ${JSON.stringify(details)}` : "";
+  const eventCall =
+    call ??
+    `collab_sites_event "info" ${JSON.stringify(code)} "Starting node" ${JSON.stringify(status)}${detailsArg}`;
   const script = `
 set -euo pipefail
+export TMPDIR=${JSON.stringify(dir)}
 export LOG_DIR=${JSON.stringify(dir)}
 export SUMMARY_LOG="\$LOG_DIR/install-summary.log"
 export DETAIL_LOG="\$LOG_DIR/install-detail.log"
@@ -54,7 +76,7 @@ PROJECT_ID="102057"
 SITES_URL=${JSON.stringify(sitesUrl)}
 AGENT_TOKEN=${JSON.stringify(TOKEN)}
 ${extra}
-collab_sites_event "info" ${JSON.stringify(code)} "Starting node" ${JSON.stringify(status)} "{}"
+${eventCall}
 echo EXIT:$?
 `;
   let stdout = "";
@@ -86,7 +108,7 @@ test("T1 collab_sites_event logs http=400 and truncated body, exit 0", async () 
     const { stdout, exitCode, jsonl } = await runEvent({ sitesUrl: url, code: "runtime.step_started" });
     assert.equal(exitCode, 0);
     assert.match(stdout, /EXIT:0/);
-    assert.match(stdout, /Failed to report collab-sites event 'runtime\.step_started': http=400 body=/);
+    assert.match(stdout, /Failed to report collab-sites event 'runtime\.step_started': http=400 bytes=\d+ body=/);
     assert.match(stdout, /"error":"/);
     assert.ok(!stdout.includes("x".repeat(250)), "body is truncated to 200 chars");
     assert.equal(stdout.includes(TOKEN), false);
@@ -106,7 +128,7 @@ test("T2 unreachable endpoint logs http=000 and exit 0", async () => {
   });
   assert.equal(exitCode, 0);
   assert.match(stdout, /EXIT:0/);
-  assert.match(stdout, /Failed to report collab-sites event 'runtime\.ready': http=000 body=/);
+  assert.match(stdout, /Failed to report collab-sites event 'runtime\.ready': http=000 bytes=\d+ body=/);
   assert.equal(stdout.includes(TOKEN), false);
   const row = JSON.parse(jsonl.trim().split("\n").at(-1));
   assert.equal(row.ok, false);
@@ -130,6 +152,7 @@ test("T4 jsonl appends one line per event and survives consecutive writes", asyn
     const dir = mkdtempSync(join(tmpdir(), "clone04-sites-event-"));
     const script = `
 set -euo pipefail
+export TMPDIR=${JSON.stringify(dir)}
 export LOG_DIR=${JSON.stringify(dir)}
 export SUMMARY_LOG="\$LOG_DIR/install-summary.log"
 export DETAIL_LOG="\$LOG_DIR/install-detail.log"
@@ -157,7 +180,111 @@ echo EXIT:$?
     assert.equal(rows[1].status, "failed");
     assert.equal(rows[1].ok, false);
     assert.equal(JSON.stringify(rows).includes(TOKEN), false);
+    assert.deepEqual(leftovers(dir), []);
   } finally {
     server.close();
   }
+});
+
+test("clone08 T1 details {step:x} yields valid JSON payload without extra brace", async () => {
+  const { server, url, received } = await listen(200, '{"ok":true}');
+  try {
+    const { stdout, exitCode, dir } = await runEvent({
+      sitesUrl: url,
+      details: '{"step":"x"}',
+    });
+    assert.equal(exitCode, 0);
+    assert.match(stdout, /EXIT:0/);
+    assert.equal(received.length, 1);
+    const payload = received[0];
+    assert.ok(!payload.endsWith("}}}"), "no leftover } from ${5:-{}}");
+    const parsed = JSON.parse(payload);
+    assert.deepEqual(parsed.details, { step: "x" });
+    assert.equal(stdout.includes(TOKEN), false);
+    assert.deepEqual(leftovers(dir), []);
+  } finally {
+    server.close();
+  }
+});
+
+test("clone08 T2 omitted 5th argument defaults details to {}", async () => {
+  const { server, url, received } = await listen(200, '{"ok":true}');
+  try {
+    const { stdout, exitCode, dir } = await runEvent({
+      sitesUrl: url,
+      includeDetails: false,
+    });
+    assert.equal(exitCode, 0);
+    assert.match(stdout, /EXIT:0/);
+    assert.equal(received.length, 1);
+    const parsed = JSON.parse(received[0]);
+    assert.deepEqual(parsed.details, {});
+    assert.equal(stdout.includes(TOKEN), false);
+    assert.deepEqual(leftovers(dir), []);
+  } finally {
+    server.close();
+  }
+});
+
+test("clone08 T3 details with quotes and backslashes stay valid JSON", async () => {
+  const { server, url, received } = await listen(200, '{"ok":true}');
+  try {
+    const { stdout, exitCode, dir } = await runEvent({
+      sitesUrl: url,
+      call: `note=$(json_escape 'say "hi" and path C:\\tmp')
+collab_sites_event "info" "runtime.step_started" "Starting node" "" "{\\"note\\":\\"$note\\"}"`,
+    });
+    assert.equal(exitCode, 0);
+    assert.match(stdout, /EXIT:0/);
+    assert.equal(received.length, 1);
+    const parsed = JSON.parse(received[0]);
+    assert.equal(parsed.details.note, 'say "hi" and path C:\\tmp');
+    assert.equal(stdout.includes(TOKEN), false);
+    assert.deepEqual(leftovers(dir), []);
+  } finally {
+    server.close();
+  }
+});
+
+test("clone08 T4 invalid payload is logged and not sent, exit 0", async () => {
+  const { server, url, received } = await listen(200, '{"ok":true}');
+  try {
+    const { stdout, exitCode, jsonl, dir } = await runEvent({
+      sitesUrl: url,
+      details: "{not-json",
+    });
+    assert.equal(exitCode, 0);
+    assert.match(stdout, /EXIT:0/);
+    assert.match(stdout, /event 'runtime\.step_started': payload inválido localmente \(bytes=\d+\) — não enviado/);
+    assert.equal(received.length, 0, "must not send invalid payload");
+    assert.equal(stdout.includes(TOKEN), false);
+    const row = JSON.parse(jsonl.trim().split("\n").at(-1));
+    assert.equal(row.ok, false);
+    assert.equal(row.http, 0);
+    assert.deepEqual(leftovers(dir), []);
+  } finally {
+    server.close();
+  }
+});
+
+test("clone08 T5 failure line includes bytes= with the real payload size", async () => {
+  const { server, url, received } = await listen(400, '{"error":"nope"}');
+  try {
+    const { stdout, exitCode, dir } = await runEvent({
+      sitesUrl: url,
+      details: '{"step":"x"}',
+    });
+    assert.equal(exitCode, 0);
+    assert.equal(received.length, 1);
+    const bytes = Buffer.byteLength(received[0], "utf8");
+    assert.match(stdout, new RegExp(`Failed to report collab-sites event 'runtime\\.step_started': http=400 bytes=${bytes} body=`));
+    assert.equal(stdout.includes(TOKEN), false);
+    assert.deepEqual(leftovers(dir), []);
+  } finally {
+    server.close();
+  }
+});
+
+test("clone08 T6 ratchet: install.sh must not contain ${5:-{}}", () => {
+  assert.equal(installSrc.includes("${5:-{}}"), false);
 });

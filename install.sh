@@ -149,11 +149,12 @@ collab_sites_event() {
   local code="$2"
   local message="$3"
   local status="${4:-}"
-  local details="${5:-{}}"
+  local details="${5:-}"
+  [ -n "$details" ] || details='{}'
   local http_code="000"
   local ok="false"
   local body=""
-  local tmp payload
+  local tmp payload payload_file payload_bytes
 
   if ! collab_sites_can_report || ! command -v curl >/dev/null 2>&1; then
     if collab_sites_can_report; then
@@ -164,7 +165,23 @@ collab_sites_event() {
   fi
 
   payload="{\"projectId\":\"$(json_escape "$PROJECT_ID")\",\"token\":\"$(json_escape "$AGENT_TOKEN")\",\"level\":\"$(json_escape "$level")\",\"code\":\"$(json_escape "$code")\",\"message\":\"$(json_escape "$message")\",\"status\":\"$(json_escape "$status")\",\"details\":${details}}"
+  payload_file="$(mktemp)"
   tmp="$(mktemp)"
+  printf '%s' "$payload" > "$payload_file"
+  payload_bytes="$(wc -c < "$payload_file")"
+  payload_bytes="${payload_bytes// /}"
+
+  if command -v python3 >/dev/null 2>&1; then
+    if ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$payload_file" >/dev/null 2>&1; then
+      log_warn "event '${code}': payload inválido localmente (bytes=${payload_bytes}) — não enviado"
+      rm -f "$payload_file" "$tmp"
+      collab_sites_append_event_log "$code" "$level" "$status" "$http_code" "$ok"
+      return 0
+    fi
+  else
+    log_info "event '${code}': validação local pulada (python3 ainda não instalado)"
+  fi
+
   http_code="$(curl -sS \
     -o "$tmp" \
     -w '%{http_code}' \
@@ -172,18 +189,18 @@ collab_sites_event() {
     -H "Content-Type: application/json" \
     -H "X-Collab-Origin: collab-runtime-install" \
     -X POST \
-    --data-binary "$payload" \
+    --data-binary @"$payload_file" \
     "${SITES_URL%/}/api/v1/servers/${SERVER_ID}/events" || true)"
   [[ -n "$http_code" ]] || http_code="000"
 
   body="$(head -c 200 "$tmp" 2>/dev/null || true)"
   body="${body//$'\n'/ }"
-  rm -f "$tmp"
+  rm -f "$tmp" "$payload_file"
 
   if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
     ok="true"
   else
-    log_warn "Failed to report collab-sites event '${code}': http=${http_code} body=$(collab_sites_redact "$body")"
+    log_warn "Failed to report collab-sites event '${code}': http=${http_code} bytes=${payload_bytes} body=$(collab_sites_redact "$body")"
   fi
   collab_sites_append_event_log "$code" "$level" "$status" "$http_code" "$ok"
   return 0
