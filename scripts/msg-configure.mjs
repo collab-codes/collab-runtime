@@ -3,8 +3,10 @@
 //
 // Reads the IAM key from Parameter Store with the instance profile (local to
 // the org sub-account). --role-arn remains optional for hub VMs that still
-// hop via AssumeRole. Merges aws.accessKeyId/secretAccessKey, storage.*
-// and instanceId in place; every other key in appconfig.json is left alone.
+// hop via AssumeRole. Merges aws.accessKeyId/secretAccessKey, storage.*,
+// instanceId, and hook.collabtoken (only when the secret carries it and the
+// current value is empty) in place; every other key in appconfig.json is left
+// alone.
 // The secret is never printed: not to stdout, not to stderr, not in errors.
 // AWS calls go through the SDK (no `aws` CLI binary).
 
@@ -65,7 +67,12 @@ export function parseSecretParameter(raw) {
   if (!accessKeyId || !secretAccessKey) {
     throw new Error("parameter is missing accessKeyId or secretAccessKey");
   }
-  return { accessKeyId, secretAccessKey };
+  const out = { accessKeyId, secretAccessKey };
+  if (typeof parsed.collabtoken === "string") {
+    const collabtoken = parsed.collabtoken.trim();
+    if (collabtoken) out.collabtoken = collabtoken;
+  }
+  return out;
 }
 
 export function parsePublicConfig(raw) {
@@ -99,6 +106,12 @@ export function parsePublicConfig(raw) {
   return next;
 }
 
+function currentHookCollabtoken(current) {
+  const hook = current.hook;
+  if (!hook || typeof hook !== "object" || Array.isArray(hook)) return "";
+  return typeof hook.collabtoken === "string" ? hook.collabtoken.trim() : "";
+}
+
 export function mergeAppConfig(current, secret, publicConfig, webPush) {
   if (!current || typeof current !== "object" || Array.isArray(current)) {
     throw new Error("appconfig.json must be a JSON object");
@@ -110,6 +123,14 @@ export function mergeAppConfig(current, secret, publicConfig, webPush) {
   aws.accessKeyId = secret.accessKeyId;
   aws.secretAccessKey = secret.secretAccessKey;
   next.aws = aws;
+  const currentToken = currentHookCollabtoken(current);
+  if (secret.collabtoken && !currentToken) {
+    const hook = (current.hook && typeof current.hook === "object" && !Array.isArray(current.hook))
+      ? { ...current.hook }
+      : {};
+    hook.collabtoken = secret.collabtoken;
+    next.hook = hook;
+  }
   if (publicConfig.storage) {
     const storage = (current.storage && typeof current.storage === "object" && !Array.isArray(current.storage))
       ? { ...current.storage }
@@ -492,6 +513,9 @@ export async function configure(opts, deps = {}) {
   }
   const current = JSON.parse(readFileSync(opts.appconfig, "utf8"));
   const merged = mergeAppConfig(current, secret, publicConfig, webPush);
+  if (!secret.collabtoken) {
+    step("hook.collabtoken: absent (secret has no collabtoken)");
+  }
   step("write-appconfig");
   (deps.writeAppconfig ?? atomicWriteJson)(opts.appconfig, merged);
   step("pm2-reload");

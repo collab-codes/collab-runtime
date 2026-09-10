@@ -285,7 +285,7 @@ test("configure writes atomically, reloads, waits health, and never prints the s
   assert.equal(mock.ssmSends[0].input.WithDecryption, true);
   assert.equal(mock.ssmConfigs[0].credentials.accessKeyId, "ASIA");
   const output = lines.join("");
-  assert.match(output, /^assume-role\nget-parameter\nget-parameter-webpush\nweb push not configured\nmerge-appconfig\nwrite-appconfig\npm2-reload\nwait-health\nok\n$/u);
+  assert.match(output, /^assume-role\nget-parameter\nget-parameter-webpush\nweb push not configured\nmerge-appconfig\nhook.collabtoken: absent \(secret has no collabtoken\)\nwrite-appconfig\npm2-reload\nwait-health\nok\n$/u);
   assert.equal(output.includes(SECRET.secretAccessKey), false);
   assert.equal(output.includes(SECRET.accessKeyId), false);
   assert.equal(output.includes("ASIA"), false);
@@ -617,7 +617,7 @@ test("configure with --param outside org format skips webpush with a reason (T8)
   const output = lines.join("");
   assert.equal(
     output,
-    `get-parameter\n${skip}\nmerge-appconfig\nwrite-appconfig\npm2-reload\nwait-health\n${skip}\nok\n`,
+    `get-parameter\n${skip}\nmerge-appconfig\nhook.collabtoken: absent (secret has no collabtoken)\nwrite-appconfig\npm2-reload\nwait-health\n${skip}\nok\n`,
   );
   const written = JSON.parse(readFileSync(appconfig, "utf8"));
   assert.equal(written.webPush, undefined);
@@ -632,5 +632,147 @@ test("11 calls addNewVersion with COLLAB_WEBPUSH_SOURCE=parameter-store (T9)", (
   assert.match(
     step11,
     /run_as_deploy env PNPM_BIN=.*COLLAB_WEBPUSH_SOURCE=parameter-store "\$ROOT\/addNewVersion" --updatePackage/,
+  );
+});
+
+const INSTALLER_APPCONFIG_TOP_KEYS = ["hook", "redis", "aws", "storage", "notificationLog"];
+
+function installerAppconfigTemplate() {
+  const step11 = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "11-install-collab-messages.sh"), "utf8");
+  const match = /cat > "\$NODE_DIR\/appconfig\.json" <<'EOF'\n([\s\S]*?)\nEOF/.exec(step11);
+  assert.ok(match, "installer appconfig.json heredoc not found");
+  try {
+    return JSON.parse(match[1]);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    assert.fail(`installer appconfig template is not parseable JSON: ${detail}`);
+  }
+}
+
+test("installer appconfig template is parseable and has no dead top-level keys (E3)", () => {
+  const parsed = installerAppconfigTemplate();
+  const keys = Object.keys(parsed);
+  const extra = keys.filter((key) => !INSTALLER_APPCONFIG_TOP_KEYS.includes(key));
+  assert.equal(
+    extra.length,
+    0,
+    `installer appconfig template has disallowed top-level keys: ${extra.join(", ")}`,
+  );
+  assert.deepEqual([...keys].sort(), [...INSTALLER_APPCONFIG_TOP_KEYS].sort());
+  assert.equal(parsed.hook?.collabtoken, "");
+});
+
+const COLLABTOKEN_PROBE = "probe-collabtoken-never-print";
+
+test("mergeAppConfig writes collabtoken from the secret when the current value is empty (T3)", () => {
+  const current = { ...OLD_APPCONFIG, hook: { collabtoken: "" } };
+  const merged = mergeAppConfig(
+    current,
+    { ...SECRET, collabtoken: COLLABTOKEN_PROBE },
+    { instanceId: "i-host" },
+  );
+  assert.equal(merged.hook.collabtoken, COLLABTOKEN_PROBE);
+  assert.equal(merged.aws.accessKeyId, SECRET.accessKeyId);
+});
+
+test("mergeAppConfig preserves a non-empty hook.collabtoken even when the secret has one (T4)", () => {
+  const merged = mergeAppConfig(
+    OLD_APPCONFIG,
+    { ...SECRET, collabtoken: COLLABTOKEN_PROBE },
+    { instanceId: "i-host" },
+  );
+  assert.equal(merged.hook.collabtoken, "hand-written");
+});
+
+test("configure declares hook.collabtoken absent when the secret has no collabtoken (T5)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "msg-configure-"));
+  const appconfig = join(dir, "appconfig.json");
+  const current = { ...OLD_APPCONFIG, hook: { collabtoken: "" } };
+  writeFileSync(appconfig, `${JSON.stringify(current, null, 2)}\n`);
+  const mock = mockAwsSdk();
+  const lines = [];
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk, ...rest) => {
+    lines.push(String(chunk));
+    return originalWrite.call(process.stdout, chunk, ...rest);
+  };
+  try {
+    await configure({
+      param: "/collab/org/probe/msg/aws",
+      roleArn: "",
+      configJson: JSON.stringify({ instanceId: "i-host" }),
+      appconfig,
+      healthUrl: "http://127.0.0.1:8180/health",
+    }, {
+      awsSdk: mock.awsSdk,
+      reloadPm2: async () => {},
+      fetch: async () => ({ text: async () => JSON.stringify({ storage: { ok: true } }) }),
+      now: () => 0,
+      sleep: async () => {},
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  const written = JSON.parse(readFileSync(appconfig, "utf8"));
+  assert.equal(written.hook.collabtoken, "");
+  const output = lines.join("");
+  assert.match(output, /hook\.collabtoken: absent \(secret has no collabtoken\)/);
+  assert.equal(output.includes(SECRET.secretAccessKey), false);
+});
+
+test("configure never prints the collabtoken (T6)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "msg-configure-"));
+  const appconfig = join(dir, "appconfig.json");
+  writeFileSync(appconfig, `${JSON.stringify({ ...OLD_APPCONFIG, hook: { collabtoken: "" } }, null, 2)}\n`);
+  const mock = mockAwsSdk({
+    parameter: JSON.stringify({ ...SECRET, collabtoken: COLLABTOKEN_PROBE }),
+  });
+  const lines = [];
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk, ...rest) => {
+    lines.push(String(chunk));
+    return originalWrite.call(process.stdout, chunk, ...rest);
+  };
+  try {
+    await configure({
+      param: "/collab/org/probe/msg/aws",
+      roleArn: "",
+      configJson: JSON.stringify({ instanceId: "i-host" }),
+      appconfig,
+      healthUrl: "http://127.0.0.1:8180/health",
+    }, {
+      awsSdk: mock.awsSdk,
+      reloadPm2: async () => {},
+      fetch: async () => ({ text: async () => JSON.stringify({ storage: { ok: true } }) }),
+      now: () => 0,
+      sleep: async () => {},
+    });
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  const written = JSON.parse(readFileSync(appconfig, "utf8"));
+  assert.equal(written.hook.collabtoken, COLLABTOKEN_PROBE);
+  const output = lines.join("");
+  assert.equal(output.includes(COLLABTOKEN_PROBE), false);
+  assert.equal(output.includes(SECRET.secretAccessKey), false);
+  assert.equal(output.includes(SECRET.accessKeyId), false);
+  assert.doesNotMatch(output, /hook\.collabtoken: absent/);
+});
+
+test("parseSecretParameter still accepts an old secret without collabtoken (T7)", () => {
+  assert.deepEqual(
+    parseSecretParameter(JSON.stringify({ ...SECRET, leftover: "ignored" })),
+    SECRET,
+  );
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(
+      parseSecretParameter(JSON.stringify(SECRET)),
+      "collabtoken",
+    ),
+    false,
+  );
+  assert.deepEqual(
+    parseSecretParameter(JSON.stringify({ ...SECRET, collabtoken: COLLABTOKEN_PROBE })),
+    { ...SECRET, collabtoken: COLLABTOKEN_PROBE },
   );
 });

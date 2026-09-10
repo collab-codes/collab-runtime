@@ -150,44 +150,11 @@ else
   log_info "Creating basic ${NODE_DIR}/appconfig.json (fill in credentials later)…"
   cat > "$NODE_DIR/appconfig.json" <<'EOF'
 {
-  "llm": {
-    "openai": "",
-    "google": "",
-    "openrouter": "",
-    "azure": "",
-    "anthropic": "",
-    "grok": "",
-    "deepseek": "",
-    "collab": ""
-  },
-  "hook": {
-    "collabtoken": ""
-  },
-  "redis": {
-    "host": "127.0.0.1",
-    "port": 6379
-  },
-  "langchain": {
-    "langsmith": ""
-  },
-  "aws": {
-    "accessKeyId": "",
-    "secretAccessKey": "",
-    "bucketName": ""
-  },
-  "firebase": {
-    "apiKey": "",
-    "authDomain": "",
-    "projectId": "",
-    "storageBucket": "",
-    "messagingSenderId": "",
-    "appId": ""
-  },
-  "firebaseBackEnd": {
-    "project_id": "",
-    "client_email": "",
-    "private_key": ""
-  }
+  "hook": { "collabtoken": "" },
+  "redis": { "host": "127.0.0.1", "port": 6379 },
+  "aws": { "accessKeyId": "", "secretAccessKey": "", "bucketName": "" },
+  "storage": { "dynamoRegion": "", "s3Region": "", "bucket": "" },
+  "notificationLog": { "enabled": false, "keepDays": 7 }
 }
 EOF
   chmod 600 "$NODE_DIR/appconfig.json"
