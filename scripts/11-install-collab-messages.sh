@@ -2,8 +2,9 @@
 # scripts/11-install-collab-messages.sh
 # Install or update collab-messages (the 'msg' pm2 app) from the public S3
 # release published by collab-messages/publishCollabMessages.sh:
-#   - downloads the latest release (nodefiles.7z, package.json, pm2.config.js,
-#     addNewVersion) from s3://www.collab.codes/collab-messages/ (public,
+#   - downloads the latest release (nodefiles.7z, package.json,
+#     pnpm-workspace.yaml, pnpm-lock.yaml, pm2.config.js, addNewVersion) from
+#     s3://www.collab.codes/collab-messages/ (public,
 #     path-style URL — no AWS credentials needed on the VM)
 #   - creates a basic /data/msg.collab.codes/node/appconfig.json if missing
 #     (real credentials must be filled in later)
@@ -138,6 +139,16 @@ log_info "Downloading release ${VERSION}…"
 curl -fsS --max-time 300 -o "$INSTALL_DIR_MSG/nodefiles.7z"      "${S3_BASE}/${VERSION}/nodefiles.7z"
 curl -fsS --max-time 60  -o "$INSTALL_DIR_MSG/package.json"      "${S3_BASE}/${VERSION}/package.json"
 curl -fsS --max-time 60  -o "$INSTALL_DIR_MSG/pnpm-workspace.yaml" "${S3_BASE}/${VERSION}/pnpm-workspace.yaml"
+# pnpm-lock.yaml pins the dependency tree for every VM on this release. Releases
+# published before the lock shipped return 404: tolerate it (addNewVersion falls
+# back to installing without a lock) and drop any lock left by a previous
+# release, so an old lock is never reused as if it were this release's.
+if ! curl -fsS --max-time 60 -o "$INSTALL_DIR_MSG/pnpm-lock.yaml.download" "${S3_BASE}/${VERSION}/pnpm-lock.yaml"; then
+  rm -f "$INSTALL_DIR_MSG/pnpm-lock.yaml.download" "$INSTALL_DIR_MSG/pnpm-lock.yaml"
+  log_warn "release ${VERSION} has no pnpm-lock.yaml — installing without it (dependency tree may differ between VMs)"
+else
+  mv -f "$INSTALL_DIR_MSG/pnpm-lock.yaml.download" "$INSTALL_DIR_MSG/pnpm-lock.yaml"
+fi
 curl -fsS --max-time 60  -o "$ROOT/pm2.config.js"                "${S3_BASE}/${VERSION}/pm2.config.js"
 curl -fsS --max-time 60  -o "$ROOT/addNewVersion"                "${S3_BASE}/${VERSION}/addNewVersion"
 chmod +x "$ROOT/addNewVersion"
