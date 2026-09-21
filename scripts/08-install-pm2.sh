@@ -179,6 +179,21 @@ assert_one_pm2_unit() {
   log_ok "pm2 systemd unit: ${units}"
 }
 
+# Drop-in, not the unit: `pm2 startup` rewrites the unit and would drop any
+# edit. RequiresMountsFor the configured data root so resurrect does not race
+# the EBS mount. fstab keeps nofail so a missing volume still boots.
+write_pm2_data_mount_dropin() {
+  local unit="pm2-${DEPLOY_USER}.service"
+  local dropin_dir="/etc/systemd/system/${unit}.d"
+  mkdir -p "$dropin_dir"
+  cat > "${dropin_dir}/data-mount.conf" <<EOF
+[Unit]
+RequiresMountsFor=${COLLAB_DATA_ROOT}
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  log_info "systemd drop-in ${dropin_dir}/data-mount.conf RequiresMountsFor=${COLLAB_DATA_ROOT}"
+}
+
 # ── Register PM2 as a systemd service for the deploy user ─────────────────────
 # 'pm2 startup' writes the unit; it must run as root with -u/--hp of the
 # deploy user. Never $USER/$HOME of the installer (cloud-init is root).
@@ -187,6 +202,7 @@ mkdir -p "${DEPLOY_HOME}/.pm2"
 chown "${DEPLOY_USER}:" "${DEPLOY_HOME}/.pm2" 2>/dev/null || true
 env PATH="$PATH:/usr/bin" pm2 startup systemd -u "$DEPLOY_USER" --hp "$DEPLOY_HOME" || \
   log_warn "pm2 startup returned non-zero (may already be configured)"
+write_pm2_data_mount_dropin
 
 if ! migrate_pm2_root_if_needed; then
   exit 1

@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
 import os from "node:os";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 export const AGENT_VERSION = "0.3.0";
@@ -122,9 +122,9 @@ export async function loadConfig(path, deps = {}) {
   return configFromValues(parseEnvFile(content), deps);
 }
 
-export function commandOutput(command, args) {
+export function commandOutput(command, args, opts = {}) {
   try {
-    const result = spawnSync(command, args, { encoding: "utf8", timeout: 8000 });
+    const result = spawnSync(command, args, { encoding: "utf8", timeout: 8000, ...opts });
     if (result.status !== 0) return null;
     return (result.stdout ?? "").trim();
   } catch {
@@ -136,10 +136,143 @@ function systemdStatus(service) {
   return commandOutput("systemctl", ["is-active", service]) ?? "unknown";
 }
 
+function fileOwner(path) {
+  return commandOutput("stat", ["-c", "%U", path]) ?? commandOutput("stat", ["-f", "%Su", path]) ?? "";
+}
+
+function pm2ServiceUser() {
+  const listed = commandOutput("bash", [
+    "-c",
+    "find /etc/systemd/system /lib/systemd/system -maxdepth 1 -name 'pm2-*.service' -printf '%f\\n' 2>/dev/null | sort -u",
+  ]);
+  if (!listed) return "";
+  const lines = listed.split("\n").filter(Boolean);
+  if (lines.length !== 1) return "";
+  const match = /^pm2-(.+)\.service$/.exec(lines[0]);
+  return match ? match[1] : "";
+}
+
+function resolveDeployUser(dataRoot) {
+  const fromUnit = pm2ServiceUser();
+  if (fromUnit) return fromUnit;
+  const owner = fileOwner(dataRoot);
+  if (owner && owner !== "root") return owner;
+  if (commandOutput("id", ["-u", "ubuntu"]) != null) return "ubuntu";
+  return owner || "";
+}
+
+function userHome(user) {
+  if (!user) return os.homedir();
+  const passwd = commandOutput("getent", ["passwd", user]);
+  if (passwd) {
+    const home = passwd.split(":")[5];
+    if (home) return home;
+  }
+  if (user === "root") return "/root";
+  return `/home/${user}`;
+}
+
+export function parsePm2Processes(raw) {
+  if (!raw) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  const out = [];
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== "object") continue;
+    if (entry.pmx_module === true || entry.pm2_env?.pmx_module === true) continue;
+    const name =
+      typeof entry.name === "string" && entry.name
+        ? entry.name
+        : typeof entry.pm2_env?.name === "string"
+          ? entry.pm2_env.name
+          : "";
+    if (!name || name === "pm2-logrotate") continue;
+    const status = entry.pm2_env?.status ?? entry.status ?? "unknown";
+    out.push({ name, status: String(status) });
+  }
+  return out;
+}
+
+function uniqueNames(processes) {
+  const seen = new Set();
+  const names = [];
+  for (const process of processes) {
+    if (seen.has(process.name)) continue;
+    seen.add(process.name);
+    names.push(process.name);
+  }
+  return names;
+}
+
+function liveStatusFor(live, name) {
+  const instances = live.filter((process) => process.name === name);
+  if (instances.length === 0) return "missing";
+  const bad = instances.find((process) => process.status !== "online");
+  return bad ? bad.status : "online";
+}
+
+export function pm2FactsFrom(dumpRaw, liveRaw) {
+  const dumpPresent = dumpRaw !== null;
+  const expected = uniqueNames(parsePm2Processes(dumpRaw ?? ""));
+  const live = parsePm2Processes(liveRaw ?? "");
+  return {
+    dump: dumpPresent ? "present" : "absent",
+    expected,
+    processes: expected.map((name) => ({ name, status: liveStatusFor(live, name) })),
+  };
+}
+
+export function runtimeStatusFrom(services, pm2) {
+  const infra =
+    services?.nginx === "active" && services?.postgresql === "active" && services?.redis === "active";
+  if (!infra) return "degraded";
+  if (pm2?.dump !== "present") return "ready";
+  const expected = Array.isArray(pm2.expected) ? pm2.expected : [];
+  if (expected.length === 0) return "ready";
+  const processes = Array.isArray(pm2.processes) ? pm2.processes : [];
+  const ok = expected.every((name) => {
+    const process = processes.find((entry) => entry.name === name);
+    return process != null && process.status === "online";
+  });
+  return ok ? "ready" : "degraded";
+}
+
+function readPm2Dump(pm2Home) {
+  try {
+    return readFileSync(join(pm2Home, "dump.pm2"), "utf8");
+  } catch (err) {
+    if (err && err.code === "ENOENT") return null;
+    return "";
+  }
+}
+
+function pm2Jlist(pm2Home) {
+  return commandOutput("pm2", ["jlist"], {
+    env: {
+      ...process.env,
+      PM2_HOME: pm2Home,
+      PATH: `${process.env.PATH || ""}:/usr/bin:/usr/local/bin`,
+    },
+  });
+}
+
+export function collectPm2Facts(config) {
+  const home = userHome(resolveDeployUser(config.dataRoot));
+  const pm2Home = join(home, ".pm2");
+  return pm2FactsFrom(readPm2Dump(pm2Home), pm2Jlist(pm2Home));
+}
+
 export function collectFacts(config) {
   const nginx = systemdStatus("nginx");
   const postgresql = systemdStatus("postgresql");
   const redis = systemdStatus("redis-server");
+  const services = { nginx, postgresql, redis };
+  const pm2 = collectPm2Facts(config);
   let loadavg = "";
   try {
     loadavg = readFileSync("/proc/loadavg", "utf8").trim();
@@ -160,8 +293,9 @@ export function collectFacts(config) {
     memTotalMb: meminfoMbFrom(meminfo, "MemTotal"),
     memAvailableMb: meminfoMbFrom(meminfo, "MemAvailable"),
     collabStatus: commandOutput("collab", ["status"]) ?? "collab status unavailable",
-    services: { nginx, postgresql, redis },
-    runtimeStatus: nginx === "active" && postgresql === "active" && redis === "active" ? "ready" : "degraded",
+    services,
+    pm2,
+    runtimeStatus: runtimeStatusFrom(services, pm2),
     runtimeVersion:
       commandOutput("git", ["-C", config.runtimeDir, "rev-parse", "--short", "HEAD"]) ?? "unknown",
   };
@@ -184,6 +318,7 @@ export function buildStatusPayload(config, facts) {
       postgresql: facts.services?.postgresql ?? "unknown",
       redis: facts.services?.redis ?? "unknown",
     },
+    pm2: facts.pm2 ?? { dump: "absent", expected: [], processes: [] },
   };
 }
 

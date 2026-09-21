@@ -12,9 +12,11 @@ import {
   loadConfig,
   meminfoMbFrom,
   parseEnvFile,
+  pm2FactsFrom,
   requestAllowed,
   routeStatusRequest,
   run,
+  runtimeStatusFrom,
 } from "./collab-sites-agent.mjs";
 
 const FIXTURE_ENV = `
@@ -43,6 +45,11 @@ const FACTS = {
   memAvailableMb: 2064,
   collabStatus: "nginx: active",
   services: { nginx: "active", postgresql: "active", redis: "active" },
+  pm2: {
+    dump: "present",
+    expected: ["app"],
+    processes: [{ name: "app", status: "online" }],
+  },
   runtimeStatus: "ready",
   runtimeVersion: "abc1234",
 };
@@ -146,6 +153,7 @@ test("heartbeat body keeps every field the sites server already consumes", async
     "memAvailableMb",
     "collabStatus",
     "services",
+    "pm2",
   ]);
   assert.equal(body.payload.hostname, "ip-10-0-0-5");
   assert.equal(body.payload.region, "us-east-1");
@@ -158,6 +166,52 @@ test("heartbeat body keeps every field the sites server already consumes", async
   assert.equal(body.payload.memAvailableMb, 2064);
   assert.equal(body.payload.collabStatus, "nginx: active");
   assert.deepEqual(body.payload.services, { nginx: "active", postgresql: "active", redis: "active" });
+  assert.deepEqual(body.payload.pm2, {
+    dump: "present",
+    expected: ["app"],
+    processes: [{ name: "app", status: "online" }],
+  });
+});
+
+const INFRA_UP = { nginx: "active", postgresql: "active", redis: "active" };
+
+test("runtimeStatus is ready when there is no dump (VM without an app)", () => {
+  const pm2 = pm2FactsFrom(null, "[]");
+  assert.equal(pm2.dump, "absent");
+  assert.deepEqual(pm2.expected, []);
+  assert.equal(runtimeStatusFrom(INFRA_UP, pm2), "ready");
+});
+
+test("runtimeStatus stays ready when the dump only has pm2-logrotate", () => {
+  const pm2 = pm2FactsFrom(JSON.stringify([{ name: "pm2-logrotate" }]), "[]");
+  assert.equal(pm2.dump, "present");
+  assert.deepEqual(pm2.expected, []);
+  assert.equal(runtimeStatusFrom(INFRA_UP, pm2), "ready");
+});
+
+test("runtimeStatus is degraded when the dump expects apps and none are online", () => {
+  const pm2 = pm2FactsFrom(JSON.stringify([{ name: "app" }]), "[]");
+  assert.equal(pm2.dump, "present");
+  assert.deepEqual(pm2.expected, ["app"]);
+  assert.deepEqual(pm2.processes, [{ name: "app", status: "missing" }]);
+  assert.equal(runtimeStatusFrom(INFRA_UP, pm2), "degraded");
+});
+
+test("runtimeStatus is degraded when an expected app is errored", () => {
+  const pm2 = pm2FactsFrom(
+    JSON.stringify([{ name: "app" }]),
+    JSON.stringify([{ name: "app", pm2_env: { status: "errored" } }]),
+  );
+  assert.equal(runtimeStatusFrom(INFRA_UP, pm2), "degraded");
+});
+
+test("runtimeStatus is ready when dump apps are online", () => {
+  const pm2 = pm2FactsFrom(
+    JSON.stringify([{ name: "app" }, { name: "pm2-logrotate" }]),
+    JSON.stringify([{ name: "app", pm2_env: { status: "online" } }]),
+  );
+  assert.deepEqual(pm2.expected, ["app"]);
+  assert.equal(runtimeStatusFrom(INFRA_UP, pm2), "ready");
 });
 
 test("status body keeps serverId and the same payload shape", async () => {

@@ -24,6 +24,20 @@ test("08 registers pm2 startup for DEPLOY_USER, not the installer USER/HOME", ()
   assert.doesNotMatch(step08, /pm2 startup systemd -u "\$USER" --hp "\$HOME"/);
 });
 
+test("08 writes a systemd drop-in so pm2 waits for the configured data root", () => {
+  assert.match(step08, /write_pm2_data_mount_dropin/);
+  assert.match(step08, /unit="pm2-\$\{DEPLOY_USER\}\.service"/);
+  assert.match(step08, /dropin_dir="\/etc\/systemd\/system\/\$\{unit\}\.d"/);
+  assert.match(step08, /data-mount\.conf/);
+  assert.match(step08, /RequiresMountsFor=\$\{COLLAB_DATA_ROOT\}/);
+  assert.match(step08, /cat > "\$\{dropin_dir\}\/data-mount\.conf"/);
+  assert.doesNotMatch(step08, /RequiresMountsFor=\/data/);
+  const startupAt = step08.indexOf('pm2 startup systemd -u "$DEPLOY_USER" --hp "$DEPLOY_HOME"');
+  const dropinAt = step08.indexOf("write_pm2_data_mount_dropin");
+  const callAt = step08.lastIndexOf("write_pm2_data_mount_dropin");
+  assert.ok(startupAt > 0 && dropinAt > 0 && callAt > startupAt, "drop-in is written after pm2 startup so a unit rewrite cannot drop it");
+});
+
 test("08 fails the step when more than one pm2 systemd unit exists", () => {
   assert.match(step08, /assert_one_pm2_unit/);
   assert.match(step08, /expected exactly one pm2 systemd unit/);
