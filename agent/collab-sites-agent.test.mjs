@@ -13,6 +13,7 @@ import {
   meminfoMbFrom,
   parseEnvFile,
   pm2FactsFrom,
+  pm2Jlist,
   requestAllowed,
   routeStatusRequest,
   run,
@@ -305,4 +306,16 @@ test("argValue reads --env <path>", () => {
 
 test("default agent version is the Node rewrite", () => {
   assert.equal(AGENT_VERSION, "0.3.0");
+});
+
+/**
+ * rt27. Este agente roda como ROOT, e qualquer comando `pm2` SOBE um daemon quando nao ha' nenhum.
+ * No boot ele corre com o `pm2-<user>.service`: ganhando a corrida, criava o God Daemon sobre o
+ * PM2_HOME do deploy user com os sockets de root, e o servico do usuario nunca mais subia — VM sem
+ * app e dominio em 502 (medido na 102056 em 23/09/2026). A guarda e' nao tocar no `pm2` enquanto o
+ * daemon nao existir.
+ */
+test("pm2Jlist nao invoca o pm2 quando o daemon nao existe (nao cria daemon no boot)", () => {
+  const home = mkdtempSync(join(tmpdir(), "pm2home-"));
+  assert.equal(pm2Jlist(home), null);
 });

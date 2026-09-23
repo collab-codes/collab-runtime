@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
 import os from "node:os";
@@ -251,7 +251,19 @@ function readPm2Dump(pm2Home) {
   }
 }
 
-function pm2Jlist(pm2Home) {
+/**
+ * O `jlist` e' opcional: o `dump.pm2` ja' da' a lista esperada. Ele so' roda quando o daemon JA'
+ * existe (rpc.sock presente).
+ *
+ * Por que a guarda: este agente roda como ROOT, e qualquer comando `pm2` SOBE um daemon quando nao
+ * ha' nenhum. No boot o agente corre com o `pm2-<user>.service`; ganhando a corrida, ele criava o
+ * God Daemon sobre o PM2_HOME do deploy user, com `rpc.sock`/`pub.sock` de root — e a' o servico do
+ * usuario nunca mais subia ("Permission denied", 6 tentativas, "Start request repeated too
+ * quickly"), deixando a VM sem app nenhum e o dominio em 502. Medido na 102056 em 23/09/2026, boot
+ * das 10:00 UTC; o boot anterior passou, porque e' corrida.
+ */
+export function pm2Jlist(pm2Home) {
+  if (!existsSync(join(pm2Home, "rpc.sock"))) return null;
   return commandOutput("pm2", ["jlist"], {
     env: {
       ...process.env,
