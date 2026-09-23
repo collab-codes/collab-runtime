@@ -252,31 +252,38 @@ function readPm2Dump(pm2Home) {
 }
 
 /**
- * O `jlist` e' opcional: o `dump.pm2` ja' da' a lista esperada. Ele so' roda quando o daemon JA'
- * existe (rpc.sock presente).
+ * O `jlist` e' opcional: o `dump.pm2` ja' da' a lista esperada. Duas protecoes, porque este agente
+ * roda como ROOT e qualquer comando `pm2` SOBE um daemon quando nao consegue falar com um:
  *
- * Por que a guarda: este agente roda como ROOT, e qualquer comando `pm2` SOBE um daemon quando nao
- * ha' nenhum. No boot o agente corre com o `pm2-<user>.service`; ganhando a corrida, ele criava o
- * God Daemon sobre o PM2_HOME do deploy user, com `rpc.sock`/`pub.sock` de root — e a' o servico do
- * usuario nunca mais subia ("Permission denied", 6 tentativas, "Start request repeated too
- * quickly"), deixando a VM sem app nenhum e o dominio em 502. Medido na 102056 em 23/09/2026, boot
- * das 10:00 UTC; o boot anterior passou, porque e' corrida.
+ * 1. so' tenta quando o `rpc.sock` existe — no boot, antes do `pm2-<user>.service`, nao existe, e
+ *    a' o agente nao encosta no pm2;
+ * 2. e mesmo assim chama como o DEPLOY USER, nunca como root.
+ *
+ * A (2) existe porque a (1) sozinha nao basta: um `rpc.sock` que sobrou de um desligamento sujo faz
+ * a (1) passar, e a' o root recria `rpc.sock`/`pub.sock` como root — medido na 102056 em 23/09/2026,
+ * com um PM2_HOME de teste: daemons 2 -> 3 e os dois sockets nascendo `root root`. Foi assim que a
+ * VM ficou sem app nenhum e o dominio em 502: o `pm2-ubuntu.service` (User=ubuntu) nao consegue mais
+ * subir ("Permission denied", 6 tentativas, "Start request repeated too quickly").
  */
-export function pm2Jlist(pm2Home) {
+export function pm2Jlist(pm2Home, deployUser = "") {
   if (!existsSync(join(pm2Home, "rpc.sock"))) return null;
-  return commandOutput("pm2", ["jlist"], {
-    env: {
-      ...process.env,
-      PM2_HOME: pm2Home,
-      PATH: `${process.env.PATH || ""}:/usr/bin:/usr/local/bin`,
-    },
-  });
+  const env = {
+    ...process.env,
+    PM2_HOME: pm2Home,
+    PATH: `${process.env.PATH || ""}:/usr/bin:/usr/local/bin`,
+  };
+  const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+  if (isRoot && deployUser && deployUser !== "root") {
+    // `-n`: nunca pedir senha. `PM2_HOME` vai explicito porque o `-H` troca o HOME do alvo.
+    return commandOutput("sudo", ["-n", "-u", deployUser, "-H", "env", `PM2_HOME=${pm2Home}`, "pm2", "jlist"], { env });
+  }
+  return commandOutput("pm2", ["jlist"], { env });
 }
 
 export function collectPm2Facts(config) {
-  const home = userHome(resolveDeployUser(config.dataRoot));
-  const pm2Home = join(home, ".pm2");
-  return pm2FactsFrom(readPm2Dump(pm2Home), pm2Jlist(pm2Home));
+  const deployUser = resolveDeployUser(config.dataRoot);
+  const pm2Home = join(userHome(deployUser), ".pm2");
+  return pm2FactsFrom(readPm2Dump(pm2Home), pm2Jlist(pm2Home, deployUser));
 }
 
 export function collectFacts(config) {
