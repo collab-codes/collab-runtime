@@ -110,6 +110,10 @@ fi
 systemctl is-active --quiet postgresql
 log_ok "PostgreSQL running with timescaledb in shared_preload_libraries"
 
+# Every later CREATE DATABASE inherits extensions from template1, including
+# databases created by the non-superuser migrate role.
+sudo -u postgres psql -d template1 -c 'CREATE EXTENSION IF NOT EXISTS timescaledb;'
+
 # ── Create persistent test database ───────────────────────────────────────────
 # Postgres has no "CREATE DATABASE IF NOT EXISTS", so guard on pg_database.
 if sudo -u postgres psql -Atqc \
