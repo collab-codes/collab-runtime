@@ -220,6 +220,7 @@ source "$PROFILE_CONF"
 # Export version variables so child scripts can inherit them
 export PG_VERSION="${PG_VERSION:-17}"
 export NODE_VERSION="${NODE_VERSION:-24}"
+export DENO_VERSION="${DENO_VERSION:-2}"
 
 # ── Step 4: Validate OS ────────────────────────────────────────────────────────
 check_os   # hard-exits if not Ubuntu 24.04 LTS
@@ -314,6 +315,7 @@ run_step 03 "Install PostgreSQL"      "03-install-postgres.sh"
 run_step 04 "Install TimescaleDB"     "04-install-timescaledb.sh"
 run_step 05 "Install Redis"           "05-install-redis.sh"
 run_step 06 "Install Node.js"         "06-install-node.sh"
+run_step 06b "Install Deno"           "06b-install-deno.sh"
 run_step 07 "Install 7-Zip"           "07-install-7zip.sh"
 run_step 08 "Install PM2"             "08-install-pm2.sh"
 run_step 09 "Install Certbot"         "09-install-certbot.sh"
