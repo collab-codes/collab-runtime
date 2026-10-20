@@ -218,6 +218,18 @@ export function mergeAppConfig(current, secret, publicConfig, webPush) {
       subject: webPush.subject,
     };
   }
+  if (Object.prototype.hasOwnProperty.call(publicConfig, "apps")) {
+    const hasModules = Object.prototype.hasOwnProperty.call(current, "modules");
+    const modules = current.modules;
+    if (hasModules && (!modules || typeof modules !== "object" || Array.isArray(modules))) {
+      throw new Error("appconfig modules must be an object");
+    }
+    const apps = {};
+    for (const key of Object.keys(publicConfig.apps)) {
+      apps[key] = { token: publicConfig.apps[key].token, baseUrl: publicConfig.apps[key].baseUrl };
+    }
+    next.modules = { ...(hasModules ? modules : {}), apps };
+  }
   return next;
 }
 

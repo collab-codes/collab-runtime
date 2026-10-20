@@ -182,6 +182,58 @@ test("mergeAppConfig does not drop extra storage keys already present", () => {
   assert.equal(merged.storage.extra, "keep");
 });
 
+test("mergeAppConfig replaces modules.apps and leaves the rest untouched", () => {
+  const current = {
+    ...OLD_APPCONFIG,
+    modules: {
+      testControls: { enabled: true },
+      db: { host: "127.0.0.1" },
+      apps: {
+        "7": { token: "tok-stale", baseUrl: "https://stale.example" },
+      },
+    },
+  };
+  const apps = {
+    "102034": { token: "tok-app-a", baseUrl: "https://app.example" },
+    "102035": { token: "tok-app-b", baseUrl: "https://other.example:8443" },
+  };
+  const currentBefore = JSON.parse(JSON.stringify(current));
+  const appsBefore = JSON.parse(JSON.stringify(apps));
+  const merged = mergeAppConfig(current, SECRET, { apps });
+  assert.deepEqual(current, currentBefore);
+  assert.deepEqual(apps, appsBefore);
+  assert.deepEqual(merged.modules.apps, apps);
+  assert.equal(merged.modules.apps === apps, false);
+  assert.deepEqual(merged.modules.testControls, { enabled: true });
+  assert.deepEqual(merged.modules.db, { host: "127.0.0.1" });
+  assert.equal(merged.hook.collabtoken, "hand-written");
+  assert.equal(merged.redis.port, 6379);
+  assert.equal(Object.prototype.hasOwnProperty.call(merged, "webPush"), false);
+
+  const kept = mergeAppConfig(current, SECRET, { instanceId: "i-host" });
+  assert.deepEqual(kept.modules, current.modules);
+  assert.equal(kept.instanceId, "i-host");
+
+  const cleared = mergeAppConfig(current, SECRET, { apps: {} });
+  assert.deepEqual(cleared.modules.apps, {});
+  assert.deepEqual(cleared.modules.testControls, { enabled: true });
+
+  const bare = { llm: { openai: "keep-me" } };
+  const created = mergeAppConfig(bare, SECRET, { apps });
+  assert.deepEqual(created.modules, { apps });
+  assert.equal(Object.prototype.hasOwnProperty.call(bare, "modules"), false);
+
+  for (const modules of [null, [], "scalar", 1]) {
+    assert.throws(
+      () => mergeAppConfig({ modules }, SECRET, { apps: {} }),
+      /appconfig modules must be an object/,
+    );
+  }
+  const malformed = { modules: null, sentinel: "keep" };
+  assert.throws(() => mergeAppConfig(malformed, SECRET, { apps: {} }), /appconfig modules must be an object/);
+  assert.equal(malformed.modules, null);
+});
+
 test("parseSecretParameter rejects a payload that is not the key pair", () => {
   assert.throws(() => parseSecretParameter("not-json"), /not JSON/);
   assert.throws(() => parseSecretParameter("{}"), /missing accessKeyId/);
@@ -337,6 +389,121 @@ test("parsePublicConfig rejects an unknown app field and broken JSON without the
       return true;
     },
   );
+});
+
+test("configure replaces modules.apps and leaves a bad map or malformed modules unwritten", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "msg-configure-"));
+  const appconfig = join(dir, "appconfig.json");
+  const initial = {
+    ...OLD_APPCONFIG,
+    modules: {
+      testControls: { enabled: true },
+      apps: {
+        "102034": { token: "tok-app-a", baseUrl: "https://app.example" },
+        "7": { token: "tok-stale", baseUrl: "https://stale.example" },
+      },
+    },
+  };
+  writeFileSync(appconfig, `${JSON.stringify(initial, null, 2)}\n`, { mode: 0o600 });
+  chmodSync(appconfig, 0o600);
+  const owner = statSync(appconfig);
+  const mock = mockAwsSdk();
+  let reloads = 0;
+  const run = (config) => configure({
+    param: "/collab/org/probe/msg/aws",
+    roleArn: ROLE_ARN,
+    configJson: JSON.stringify(config),
+    appconfig,
+    healthUrl: "http://127.0.0.1:8180/health",
+  }, {
+    awsSdk: mock.awsSdk,
+    reloadPm2: async () => { reloads += 1; },
+    fetch: async () => ({ text: async () => JSON.stringify({ storage: { ok: true } }) }),
+    now: () => 0,
+    sleep: async () => {},
+  });
+  const two = {
+    "102034": { token: "tok-app-a", baseUrl: "https://app.example/" },
+    "102035": { token: "tok-app-b", baseUrl: "https://other.example:8443" },
+  };
+  const expected = {
+    "102034": { token: "tok-app-a", baseUrl: "https://app.example" },
+    "102035": { token: "tok-app-b", baseUrl: "https://other.example:8443" },
+  };
+  await run({ apps: two });
+  let written = JSON.parse(readFileSync(appconfig, "utf8"));
+  assert.deepEqual(written.modules.apps, expected);
+  assert.deepEqual(written.modules.testControls, { enabled: true });
+  assert.equal(written.hook.collabtoken, "hand-written");
+  assert.equal(written.redis.host, "127.0.0.1");
+  assert.equal(written.firebase.apiKey, "hand-written");
+  assert.equal(Object.prototype.hasOwnProperty.call(written, "webPush"), false);
+  assert.equal(mock.ssmSends.length, 2);
+  assert.equal(mock.ssmSends[0].input.Name, "/collab/org/probe/msg/aws");
+  assert.equal(mock.ssmSends[1].input.Name, "/collab/org/probe/webpush");
+
+  await run({ apps: two });
+  written = JSON.parse(readFileSync(appconfig, "utf8"));
+  assert.deepEqual(written.modules.apps, expected);
+  assert.equal(mock.ssmSends.length, 4);
+  assert.equal(reloads, 2);
+
+  await run({ apps: { "102034": two["102034"] } });
+  written = JSON.parse(readFileSync(appconfig, "utf8"));
+  assert.deepEqual(Object.keys(written.modules.apps), ["102034"]);
+  assert.deepEqual(written.modules.apps["102034"], expected["102034"]);
+  assert.deepEqual(written.modules.testControls, { enabled: true });
+
+  await run({ apps: {} });
+  written = JSON.parse(readFileSync(appconfig, "utf8"));
+  assert.deepEqual(written.modules.apps, {});
+  assert.deepEqual(written.modules.testControls, { enabled: true });
+
+  await run({ instanceId: "i-host" });
+  written = JSON.parse(readFileSync(appconfig, "utf8"));
+  assert.deepEqual(written.modules.apps, {});
+  assert.deepEqual(written.modules.testControls, { enabled: true });
+  assert.equal(written.instanceId, "i-host");
+  const after = statSync(appconfig);
+  assert.equal(after.mode & 0o777, 0o600);
+  assert.equal(after.uid, owner.uid);
+  assert.equal(after.gid, owner.gid);
+
+  const malformed = `${JSON.stringify({ modules: null, sentinel: "keep-bytes" })}\n`;
+  writeFileSync(appconfig, malformed);
+  chmodSync(appconfig, 0o600);
+  const reloadsBeforeReject = reloads;
+  await assert.rejects(
+    () => run({ apps: two }),
+    /appconfig modules must be an object/,
+  );
+  assert.equal(readFileSync(appconfig, "utf8"), malformed);
+  assert.equal(reloads, reloadsBeforeReject);
+
+  const intact = readFileSync(appconfig, "utf8");
+  let sdkTouched = false;
+  await assert.rejects(
+    () => configure({
+      param: "/collab/org/probe/msg/aws",
+      roleArn: "",
+      configJson: JSON.stringify({
+        apps: {
+          "102034": { token: "tok-app-a", baseUrl: "https://app.example" },
+          "102035": { token: "bad\nitem", baseUrl: "http://nope.example" },
+        },
+      }),
+      appconfig,
+      healthUrl: "http://127.0.0.1:9/health",
+    }, {
+      awsSdk: new Proxy({}, { get() { sdkTouched = true; return undefined; } }),
+      reloadPm2: async () => { reloads += 1; },
+      fetch: async () => { throw new Error("health was called"); },
+    }),
+    /project 102035/,
+  );
+  assert.equal(sdkTouched, false);
+  assert.equal(reloads, reloadsBeforeReject);
+  assert.equal(readFileSync(appconfig, "utf8"), intact);
 });
 
 test("configure rejects invalid apps before sdk, file, or reload", async () => {
