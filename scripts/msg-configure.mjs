@@ -5,9 +5,10 @@
 // the org sub-account). --role-arn remains optional for hub VMs that still
 // hop via AssumeRole. Merges aws.accessKeyId/secretAccessKey, storage.*,
 // instanceId, and hook.collabtoken (only when the secret carries it and the
-// current value is empty) in place; every other key in appconfig.json is left
-// alone.
-// The secret is never printed: not to stdout, not to stderr, not in errors.
+// current value is empty) in place; when apps is present, modules.apps is
+// replaced by that map. Every other key in appconfig.json is left alone.
+// --config-json is config json and may carry app tokens. Those values are
+// never printed: not to stdout, not to stderr, not in errors.
 // AWS calls go through the SDK (no `aws` CLI binary).
 
 import { spawnSync } from "node:child_process";
@@ -564,8 +565,49 @@ async function waitHealth(url, deps) {
   throw new Error(`health not ready: ${lastError}`);
 }
 
+function secretValues(publicConfig, configJson) {
+  const values = [];
+  if (typeof configJson === "string" && configJson) values.push(configJson);
+  const apps = publicConfig?.apps;
+  if (apps && typeof apps === "object") {
+    for (const item of Object.values(apps)) {
+      if (typeof item?.token === "string" && item.token) values.push(item.token);
+    }
+  }
+  values.sort((a, b) => b.length - a.length);
+  return values;
+}
+
+function redact(text, secrets) {
+  let out = String(text);
+  for (const secret of secrets) {
+    if (secret) out = out.split(secret).join("[redacted]");
+  }
+  return out;
+}
+
+function scrubError(error, secrets) {
+  const message = redact(error instanceof Error ? error.message : String(error), secrets);
+  const clean = new Error(message);
+  if (error instanceof Error) {
+    if (typeof error.name === "string" && error.name) clean.name = redact(error.name, secrets);
+    if (typeof error.code === "string" && error.code) clean.code = redact(error.code, secrets);
+    if (error.cause != null) clean.cause = scrubError(error.cause, secrets);
+  }
+  return clean;
+}
+
 export async function configure(opts, deps = {}) {
   const publicConfig = parsePublicConfig(opts.configJson);
+  const secrets = secretValues(publicConfig, opts.configJson);
+  try {
+    await configureValidated(opts, deps, publicConfig);
+  } catch (error) {
+    throw scrubError(error, secrets);
+  }
+}
+
+async function configureValidated(opts, deps, publicConfig) {
   const sdk = deps.awsSdk ?? loadAwsSdk(deps.awsSdkDir, deps.require);
   let assumed;
   if (opts.roleArn) {
@@ -594,7 +636,13 @@ export async function configure(opts, deps = {}) {
   if (!existsSync(opts.appconfig)) {
     throw new Error(`appconfig.json not found: ${opts.appconfig}`);
   }
-  const current = JSON.parse(readFileSync(opts.appconfig, "utf8"));
+  let current;
+  try {
+    current = JSON.parse(readFileSync(opts.appconfig, "utf8"));
+  } catch (error) {
+    if (error instanceof SyntaxError) throw new Error("appconfig.json is not JSON");
+    throw error;
+  }
   const merged = mergeAppConfig(current, secret, publicConfig, webPush);
   if (!secret.collabtoken) {
     step("hook.collabtoken: absent (secret has no collabtoken)");

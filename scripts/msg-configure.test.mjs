@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
@@ -1094,6 +1095,163 @@ test("configure never prints the collabtoken (T6)", async () => {
   assert.equal(output.includes(SECRET.secretAccessKey), false);
   assert.equal(output.includes(SECRET.accessKeyId), false);
   assert.doesNotMatch(output, /hook\.collabtoken: absent/);
+});
+
+async function captureStreams(fn) {
+  const lines = [];
+  const originalOut = process.stdout.write;
+  const originalErr = process.stderr.write;
+  const record = (chunk) => { lines.push(String(chunk)); };
+  process.stdout.write = (chunk, ...rest) => {
+    record(chunk);
+    return originalOut.call(process.stdout, chunk, ...rest);
+  };
+  process.stderr.write = (chunk, ...rest) => {
+    record(chunk);
+    return originalErr.call(process.stderr, chunk, ...rest);
+  };
+  let value;
+  let error;
+  try {
+    value = await fn();
+  } catch (caught) {
+    error = caught;
+  } finally {
+    process.stdout.write = originalOut;
+    process.stderr.write = originalErr;
+  }
+  return { value, error, output: lines.join("") };
+}
+
+function hidden(text, secret) {
+  return !text.includes(secret);
+}
+
+test("configure output hides app tokens on success and on post-write failure", async () => {
+  const tokenA = "SENTINEL-APP-A";
+  const tokenB = "SENTINEL-APP-B";
+  const dir = mkdtempSync(join(tmpdir(), "msg-configure-"));
+  const appconfig = join(dir, "appconfig.json");
+  const initial = `${JSON.stringify({ ...OLD_APPCONFIG, modules: { testControls: { enabled: true } } }, null, 2)}\n`;
+  writeFileSync(appconfig, initial, { mode: 0o600 });
+  const config = {
+    instanceId: "i-host",
+    storage: { bucket: "collab-msg-x" },
+    apps: {
+      "102034": { token: tokenA, baseUrl: "https://app.example" },
+      "102035": { token: tokenB, baseUrl: "https://other.example" },
+    },
+  };
+  const deps = {
+    awsSdk: mockAwsSdk().awsSdk,
+    reloadPm2: async () => {},
+    fetch: async () => ({ text: async () => JSON.stringify({ storage: { ok: true } }) }),
+    now: () => 0,
+    sleep: async () => {},
+  };
+  const opts = {
+    param: "/collab/org/probe/msg/aws",
+    roleArn: ROLE_ARN,
+    configJson: JSON.stringify(config),
+    appconfig,
+    healthUrl: "http://127.0.0.1:8180/health",
+  };
+  const ok = await captureStreams(() => configure(opts, deps));
+  assert.equal(ok.error, undefined);
+  const written = JSON.parse(readFileSync(appconfig, "utf8"));
+  assert.equal(written.modules.apps["102034"].token === tokenA, true);
+  assert.equal(written.modules.apps["102035"].token === tokenB, true);
+  assert.equal(written.modules.testControls.enabled, true);
+  assert.equal(hidden(ok.output, tokenA), true);
+  assert.equal(hidden(ok.output, tokenB), true);
+  assert.equal(hidden(ok.output, opts.configJson), true);
+  assert.match(ok.output, /\nok\n$/u);
+
+  const leaked = new Error(`pm2 reload msg failed: exit 1 ${tokenA}`, { cause: new Error(`worker ${tokenB}`) });
+  const failed = await captureStreams(() => configure(opts, {
+    ...deps,
+    reloadPm2: async () => { throw leaked; },
+  }));
+  assert.equal(failed.error instanceof Error, true);
+  assert.match(failed.error.message, /pm2 reload msg failed/);
+  assert.equal(hidden(failed.output, tokenA), true);
+  assert.equal(hidden(failed.output, tokenB), true);
+  assert.equal(hidden(failed.error.message, tokenA), true);
+  assert.equal(hidden(failed.error.message, tokenB), true);
+  assert.equal(hidden(String(failed.error.cause?.message ?? ""), tokenA), true);
+  assert.equal(hidden(String(failed.error.cause?.message ?? ""), tokenB), true);
+  assert.equal(hidden(failed.error.message, opts.configJson), true);
+  assert.equal(failed.error.cause instanceof Error, true);
+  const again = JSON.parse(readFileSync(appconfig, "utf8"));
+  assert.equal(again.modules.apps["102034"].token === tokenA, true);
+});
+
+test("configure hides invalid config json, invalid app item, and broken appconfig", async () => {
+  const sentinel = "SENTINEL-PARSE";
+  const fileSentinel = "SENTINEL-FILE-APPS";
+  const dir = mkdtempSync(join(tmpdir(), "msg-configure-"));
+  const appconfig = join(dir, "appconfig.json");
+  const intact = `${JSON.stringify(OLD_APPCONFIG)}\n`;
+  writeFileSync(appconfig, intact, { mode: 0o600 });
+  const broken = `{"apps":{"102034":{"token":"${sentinel}"`;
+  const invalidJson = await captureStreams(() => configure({
+    param: "/collab/org/probe/msg/aws",
+    configJson: broken,
+    appconfig,
+    healthUrl: "http://127.0.0.1:8180/health",
+  }, { awsSdk: mockAwsSdk().awsSdk }));
+  assert.equal(invalidJson.error?.message, "--config-json is not JSON");
+  assert.equal(hidden(invalidJson.output + (invalidJson.error?.message ?? ""), sentinel), true);
+  assert.equal(hidden(invalidJson.output + (invalidJson.error?.message ?? ""), broken), true);
+  assert.equal(readFileSync(appconfig, "utf8") === intact, true);
+
+  const badItem = `{"apps":{"102034":{"token":"${sentinel}","baseUrl":"http://nope.example"}}}`;
+  const invalidItem = await captureStreams(() => configure({
+    param: "/collab/org/probe/msg/aws",
+    configJson: badItem,
+    appconfig,
+    healthUrl: "http://127.0.0.1:8180/health",
+  }, { awsSdk: mockAwsSdk().awsSdk }));
+  assert.match(invalidItem.error?.message ?? "", /project 102034 baseUrl is invalid/);
+  assert.equal(hidden(invalidItem.output + (invalidItem.error?.message ?? ""), sentinel), true);
+  assert.equal(hidden(invalidItem.output + (invalidItem.error?.message ?? ""), badItem), true);
+  assert.equal(readFileSync(appconfig, "utf8") === intact, true);
+
+  const garbage = `{"modules":{"apps":{"102034":{"token":"${fileSentinel}"}}}} not-json`;
+  writeFileSync(appconfig, garbage, { mode: 0o600 });
+  const invalidFile = await captureStreams(() => configure({
+    param: "/collab/org/probe/msg/aws",
+    roleArn: ROLE_ARN,
+    configJson: JSON.stringify({ storage: { bucket: "collab-msg-x" } }),
+    appconfig,
+    healthUrl: "http://127.0.0.1:8180/health",
+  }, {
+    awsSdk: mockAwsSdk().awsSdk,
+    reloadPm2: async () => { throw new Error("reload should not run"); },
+  }));
+  assert.equal(invalidFile.error?.message, "appconfig.json is not JSON");
+  assert.equal(hidden(invalidFile.output + (invalidFile.error?.message ?? ""), fileSentinel), true);
+  assert.equal(hidden(invalidFile.output + (invalidFile.error?.message ?? ""), "modules.apps"), true);
+  assert.equal(readFileSync(appconfig, "utf8") === garbage, true);
+});
+
+test("entrypoint exits before sdk or file when config json is invalid", () => {
+  const sentinel = "SENTINEL-ENTRY";
+  const dir = mkdtempSync(join(tmpdir(), "msg-configure-"));
+  const appconfig = join(dir, "appconfig.json");
+  writeFileSync(appconfig, "{}\n");
+  const script = join(dirname(fileURLToPath(import.meta.url)), "msg-configure.mjs");
+  const result = spawnSync(process.execPath, [
+    script,
+    "--param", "/collab/org/probe/msg/aws",
+    "--config-json", `{"apps":{"102034":{"token":"${sentinel}"`,
+    "--appconfig", appconfig,
+  ], { encoding: "utf8" });
+  assert.equal(result.status === 0, false);
+  assert.equal(readFileSync(appconfig, "utf8") === "{}\n", true);
+  const blob = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+  assert.equal(blob.includes("--config-json is not JSON"), true);
+  assert.equal(hidden(blob, sentinel), true);
 });
 
 test("parseSecretParameter still accepts an old secret without collabtoken (T7)", () => {
