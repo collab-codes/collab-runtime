@@ -194,15 +194,185 @@ test("parseSecretParameter rejects a payload that is not the key pair", () => {
 test("parsePublicConfig rejects a secret smuggled in as config", () => {
   assert.throws(
     () => parsePublicConfig('{"instanceId":"i-1","aws":{"accessKeyId":"AKIA"}}'),
-    /must have key "storage".*unknown key: aws/,
+    (error) => {
+      assert.match(error.message, /must have key "storage"/);
+      assert.equal(error.message.includes("unknown key:"), false);
+      assert.equal(error.message.includes("aws"), false);
+      assert.equal(error.message.includes("AKIA"), false);
+      return true;
+    },
   );
 });
 
 test("parsePublicConfig rejects flattened storage keys (cm40 P1)", () => {
   assert.throws(
     () => parsePublicConfig('{"bucket":"collab-msg-x","dynamoRegion":"us-east-1"}'),
-    /must have key "storage".*unknown key: bucket, dynamoRegion/,
+    (error) => {
+      assert.match(error.message, /must have key "storage"/);
+      assert.equal(error.message.includes("unknown key:"), false);
+      assert.equal(error.message.includes("bucket"), false);
+      assert.equal(error.message.includes("dynamoRegion"), false);
+      return true;
+    },
   );
+});
+
+const TWO_APPS = {
+  "102034": { token: "tok-app-a", baseUrl: "https://app.example/" },
+  "102035": { token: "tok-app-b", baseUrl: "https://other.example:8443" },
+};
+
+test("parsePublicConfig accepts two apps from a string or an object", () => {
+  const expected = {
+    "102034": { token: "tok-app-a", baseUrl: "https://app.example" },
+    "102035": { token: "tok-app-b", baseUrl: "https://other.example:8443" },
+  };
+  const fromString = parsePublicConfig(JSON.stringify({ storage: { bucket: "collab-msg-x" }, apps: TWO_APPS }));
+  assert.equal(fromString.storage.bucket, "collab-msg-x");
+  assert.deepEqual(fromString.apps, expected);
+  const source = { instanceId: "i-host", apps: TWO_APPS };
+  const fromObject = parsePublicConfig(source);
+  assert.equal(fromObject.instanceId, "i-host");
+  assert.deepEqual(fromObject.apps, expected);
+  assert.equal(source.apps["102034"].baseUrl, "https://app.example/");
+});
+
+test("parsePublicConfig keeps apps absent and accepts an explicit empty map", () => {
+  const omitted = parsePublicConfig({ storage: { bucket: "collab-msg-x" } });
+  assert.equal(Object.prototype.hasOwnProperty.call(omitted, "apps"), false);
+  assert.deepEqual(parsePublicConfig({ apps: {} }).apps, {});
+});
+
+test("parsePublicConfig rejects invalid app ids without echoing the key", () => {
+  const sentinel = "SENTINEL-APP-ID";
+  for (const id of ["01", "0", "-1", "1.2", "1e2", "9007199254740993", "__proto__", "constructor", "prototype", " 12", sentinel]) {
+    assert.throws(
+      () => parsePublicConfig({ apps: { [id]: { token: "tok-app-a", baseUrl: "https://app.example" }, "102034": { token: "tok-app-a", baseUrl: "https://app.example" } } }),
+      (error) => {
+        assert.match(error.message, /invalid project id/);
+        assert.equal(error.message.includes(id), false);
+        assert.equal(error.message.includes("tok-app-a"), false);
+        return true;
+      },
+    );
+  }
+  assert.throws(
+    () => parsePublicConfig({ apps: null }),
+    /config\.apps must be an object/,
+  );
+  assert.throws(
+    () => parsePublicConfig({ apps: [] }),
+    /config\.apps must be an object/,
+  );
+});
+
+test("parsePublicConfig rejects invalid tokens and urls without echoing values", () => {
+  const cases = [
+    ["", "token is invalid"],
+    [" SENTINEL-TOKEN", "token is invalid"],
+    ["SENTINEL-TOKEN ", "token is invalid"],
+    ["SENTINEL\nTOKEN", "token is invalid"],
+    ["SENTINEL\rTOKEN", "token is invalid"],
+    ["SENTINEL\u2028TOKEN", "token is invalid"],
+    ["SENTINEL\u2029TOKEN", "token is invalid"],
+  ];
+  for (const [token, rule] of cases) {
+    assert.throws(
+      () => parsePublicConfig({ apps: { "102034": { token, baseUrl: "https://app.example" } } }),
+      (error) => {
+        assert.match(error.message, new RegExp(`project 102034 ${rule}`));
+        assert.equal(error.message.includes("SENTINEL"), false);
+        return true;
+      },
+    );
+  }
+  const urlSentinel = "https://user:SENTINEL-URL@app.example/secret?x=1#h";
+  for (const baseUrl of [
+    "http://app.example",
+    "https://user:pass@app.example",
+    "https://app.example/path",
+    "https://app.example?x=1",
+    "https://app.example#h",
+    " https://app.example",
+    "https://app.example ",
+    urlSentinel,
+  ]) {
+    assert.throws(
+      () => parsePublicConfig({ apps: { "102034": { token: "tok-app-a", baseUrl } } }),
+      (error) => {
+        assert.match(error.message, /project 102034 baseUrl is invalid/);
+        assert.equal(error.message.includes(baseUrl), false);
+        assert.equal(error.message.includes("SENTINEL-URL"), false);
+        assert.equal(error.message.includes("tok-app-a"), false);
+        return true;
+      },
+    );
+  }
+});
+
+test("parsePublicConfig rejects an unknown app field and broken JSON without the payload", () => {
+  const sentinel = "SENTINEL-TOKEN-PARAM";
+  assert.throws(
+    () => parsePublicConfig({
+      apps: {
+        "102034": { token: "tok-app-a", baseUrl: "https://app.example", tokenParam: sentinel },
+        "102035": { token: "bad\n", baseUrl: "http://nope.example" },
+      },
+    }),
+    (error) => {
+      assert.match(error.message, /project 102034 fields must be exactly token and baseUrl/);
+      assert.match(error.message, /project 102035 token is invalid/);
+      assert.match(error.message, /project 102035 baseUrl is invalid/);
+      assert.equal(error.message.includes(sentinel), false);
+      assert.equal(error.message.includes("tokenParam"), false);
+      assert.equal(error.message.includes("tok-app-a"), false);
+      return true;
+    },
+  );
+  assert.throws(
+    () => parsePublicConfig(`{"apps":{"102034":{"token":"${sentinel}"`),
+    (error) => {
+      assert.equal(error.message, "--config-json is not JSON");
+      assert.equal(error.message.includes(sentinel), false);
+      return true;
+    },
+  );
+});
+
+test("configure rejects invalid apps before sdk, file, or reload", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "msg-configure-"));
+  const appconfig = join(dir, "appconfig.json");
+  const before = `${JSON.stringify({ sentinel: "keep-bytes" })}\n`;
+  writeFileSync(appconfig, before);
+  let sdkTouched = false;
+  let reloaded = false;
+  let fetched = false;
+  const sentinel = "SENTINEL-BEFORE-EFFECT";
+  await assert.rejects(
+    () => configure({
+      param: "/collab/org/probe/msg/aws",
+      roleArn: "",
+      configJson: JSON.stringify({
+        storage: { bucket: "collab-msg-x" },
+        apps: { "102034": { token: `bad\n${sentinel}`, baseUrl: "https://app.example" } },
+      }),
+      appconfig,
+      healthUrl: "http://127.0.0.1:9/health",
+    }, {
+      awsSdk: new Proxy({}, { get() { sdkTouched = true; return undefined; } }),
+      reloadPm2: async () => { reloaded = true; },
+      fetch: async () => { fetched = true; return { text: async () => "{}" }; },
+    }),
+    (error) => {
+      assert.match(error.message, /project 102034 token is invalid/);
+      assert.equal(error.message.includes(sentinel), false);
+      return true;
+    },
+  );
+  assert.equal(sdkTouched, false);
+  assert.equal(reloaded, false);
+  assert.equal(fetched, false);
+  assert.equal(readFileSync(appconfig, "utf8"), before);
 });
 
 test("storageOkFromHealth reads cm01 storage.ok and surfaces the error code", () => {

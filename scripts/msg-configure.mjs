@@ -75,6 +75,74 @@ export function parseSecretParameter(raw) {
   return out;
 }
 
+const APP_LINE_SEPARATOR = /[\r\n\u2028\u2029]/;
+
+function canonicalProjectId(projectId) {
+  if (typeof projectId !== "string" || !/^[1-9][0-9]*$/.test(projectId)) return false;
+  const numeric = Number(projectId);
+  return Number.isSafeInteger(numeric) && numeric > 0 && String(numeric) === projectId;
+}
+
+function httpsOrigin(value) {
+  if (typeof value !== "string" || value.length === 0 || value !== value.trim()) return null;
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:") return null;
+  if (url.username || url.password) return null;
+  if (url.search || url.hash) return null;
+  if (url.pathname !== "/") return null;
+  return url.origin;
+}
+
+function parseAppsMap(apps) {
+  if (!apps || typeof apps !== "object" || Array.isArray(apps)) {
+    throw new Error("config.apps must be an object");
+  }
+  const problems = [];
+  let invalidId = false;
+  const entries = [];
+  for (const key of Object.keys(apps)) {
+    if (!canonicalProjectId(key)) {
+      invalidId = true;
+      continue;
+    }
+    const item = apps[key];
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      problems.push(`config.apps project ${key} must be an object`);
+      continue;
+    }
+    const fields = Object.keys(item);
+    const exact = fields.length === 2
+      && Object.prototype.hasOwnProperty.call(item, "token")
+      && Object.prototype.hasOwnProperty.call(item, "baseUrl");
+    if (!exact) {
+      problems.push(`config.apps project ${key} fields must be exactly token and baseUrl`);
+      continue;
+    }
+    let itemOk = true;
+    const token = item.token;
+    if (typeof token !== "string" || token.length === 0 || token !== token.trim() || APP_LINE_SEPARATOR.test(token)) {
+      problems.push(`config.apps project ${key} token is invalid`);
+      itemOk = false;
+    }
+    const origin = httpsOrigin(item.baseUrl);
+    if (!origin) {
+      problems.push(`config.apps project ${key} baseUrl is invalid`);
+      itemOk = false;
+    }
+    if (itemOk) entries.push([key, { token, baseUrl: origin }]);
+  }
+  if (invalidId) problems.unshift("config.apps has an invalid project id");
+  if (problems.length > 0) throw new Error(problems.join("; "));
+  const next = {};
+  for (const [key, value] of entries) next[key] = value;
+  return next;
+}
+
 export function parsePublicConfig(raw) {
   let parsed;
   try {
@@ -85,10 +153,10 @@ export function parsePublicConfig(raw) {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("--config-json must be a JSON object");
   }
-  const allowed = new Set(["storage", "instanceId"]);
+  const allowed = new Set(["storage", "instanceId", "apps"]);
   const unknown = Object.keys(parsed).filter((key) => !allowed.has(key));
   if (unknown.length > 0) {
-    throw new Error(`--config-json must have key "storage" (unknown key: ${unknown.join(", ")})`);
+    throw new Error('--config-json must have key "storage" (unknown key)');
   }
   const next = {};
   if (parsed.storage != null) {
@@ -102,6 +170,9 @@ export function parsePublicConfig(raw) {
       throw new Error("config.instanceId must be a string");
     }
     next.instanceId = parsed.instanceId;
+  }
+  if (Object.prototype.hasOwnProperty.call(parsed, "apps")) {
+    next.apps = parseAppsMap(parsed.apps);
   }
   return next;
 }
