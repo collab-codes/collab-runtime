@@ -29,6 +29,14 @@ sudo ./install.sh --profile=medium   # default
 sudo ./install.sh --profile=enterprise
 ```
 
+On a VM that already has PM2, refresh boot from the canonical configs without reinstalling:
+
+```bash
+sudo bash /data/collab-runtime/scripts/08-install-pm2.sh --startup-only
+```
+
+Custom data root or deploy user, preflight, backup, checks, and the separate restart window are in [docs/pm2-fixed-startup.md](docs/pm2-fixed-startup.md).
+
 ## After installation
 
 A `collab` command is available for ongoing server maintenance:

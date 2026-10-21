@@ -302,3 +302,219 @@ test("08 rejects an unknown flag before writing drop-ins", () => {
   assert.match(error.stderr ?? "", /unknown argument/);
   assert.equal(readFileSync(ctx.calls, "utf8"), "");
 });
+
+function writeStubBody(dir, name, body) {
+  writeStub(dir, name, body);
+}
+
+function extractBashFunction(source, name) {
+  const marker = `${name}() {`;
+  const start = source.indexOf(marker);
+  assert.ok(start >= 0, name);
+  let depth = 0;
+  let quote = "";
+  for (let i = start + marker.length - 1; i < source.length; i++) {
+    const c = source[i];
+    if (quote) {
+      if (c === quote && source[i - 1] !== "\\") quote = "";
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      quote = c;
+      continue;
+    }
+    if (c === "{") depth += 1;
+    else if (c === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, i + 1);
+    }
+  }
+  throw new Error(`unclosed ${name}`);
+}
+
+test("normal install starts up the deploy user, keeps logrotate, and does not boot from resurrect", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rt112-s3-normal-"));
+  const ctx = stepEnv(dir);
+  const bin = join(dir, "bin");
+  writeStubBody(
+    bin,
+    "timeout",
+    `#!/bin/bash
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --*) shift ;;
+    *[!0-9]*) break ;;
+    *) shift; break ;;
+  esac
+done
+exec "$@"
+`,
+  );
+  writeStubBody(
+    bin,
+    "pm2",
+    `#!/bin/bash
+printf '%s\\n' "$0 $*" >> ${JSON.stringify(ctx.calls)}
+if [[ "$1" == "--version" ]]; then
+  echo 0.test
+  exit 0
+fi
+if [[ "$1" == "startup" ]]; then
+  user=""
+  home=""
+  args=("$@")
+  for ((i = 0; i < \${#args[@]}; i++)); do
+    if [[ "\${args[$i]}" == "-u" ]]; then user="\${args[$((i + 1))]}"; fi
+    if [[ "\${args[$i]}" == "--hp" ]]; then home="\${args[$((i + 1))]}"; fi
+  done
+  cat > "\${COLLAB_SYSTEMD_ETC}/pm2-\${user}.service" <<EOF
+[Service]
+Type=forking
+User=\${user}
+Environment=PM2_HOME=\${home}/.pm2
+PIDFile=\${home}/.pm2/pm2.pid
+ExecStart=${ctx.pm2Bin} resurrect
+ExecReload=${ctx.pm2Bin} reload all
+ExecStop=${ctx.pm2Bin} kill
+EOF
+fi
+exit 0
+`,
+  );
+  let error = null;
+  try {
+    runStep(ctx, []);
+  } catch (caught) {
+    error = caught;
+  }
+  const calls = readFileSync(ctx.calls, "utf8");
+  assert.match(calls, new RegExp(`pm2 startup systemd -u ${ctx.user} --hp ${ctx.home}`));
+  assert.match(calls, /pm2 install pm2-logrotate/);
+  assert.match(calls, /pm2 set pm2-logrotate:max_size 100M/);
+  assert.match(calls, /pm2 save/);
+  assert.doesNotMatch(calls, /resurrect/);
+  assert.doesNotMatch(calls, /\bnpm\b/);
+  const unitPath = join(ctx.etc, `pm2-${ctx.user}.service`);
+  const unit = readFileSync(unitPath, "utf8");
+  assert.match(unit, new RegExp(`^User=${ctx.user}$`, "m"));
+  assert.match(unit, /ExecStart=.*resurrect/);
+  const fixed = readFileSync(join(ctx.etc, `pm2-${ctx.user}.service.d`, "fixed-configs.conf"), "utf8");
+  const execLines = fixed.split("\n").filter((line) => line.startsWith("ExecStart="));
+  assert.equal(execLines[0], "ExecStart=");
+  assert.match(execLines[1], /pm2-start-fixed\.sh/);
+  assert.doesNotMatch(fixed, /resurrect/);
+  // assert_one_pm2_unit scans the host with GNU find -printf. On macOS that
+  // command exits 1 after logrotate, with no unit-count line. A Linux host
+  // reports the real unit count instead. Either way the calls above already ran.
+  if (error) {
+    const stderr = `${error.stderr ?? ""}`;
+    assert.ok(
+      stderr === "" || /expected exactly one pm2 systemd unit/.test(stderr),
+      stderr,
+    );
+  }
+});
+
+function migrateHarness(dir, { online }) {
+  const bin = join(dir, "bin");
+  const etc = join(dir, "etc", "systemd", "system");
+  const lib = join(dir, "lib", "systemd", "system");
+  const rootPm2 = join(dir, "root-pm2");
+  const home = join(dir, "home");
+  const msg = join(dir, "msg");
+  const calls = join(dir, "calls.log");
+  const logs = join(dir, "logs");
+  for (const path of [bin, etc, lib, rootPm2, home, join(msg, "node"), logs]) {
+    mkdirSync(path, { recursive: true });
+  }
+  writeFileSync(calls, "");
+  writeFileSync(join(etc, "pm2-root.service"), "[Service]\nExecStart=/usr/bin/pm2 resurrect\n");
+  writeFileSync(join(rootPm2, "dump.pm2"), "dump-fixture\n");
+  writeFileSync(join(msg, "node", "appconfig.json"), "{}\n");
+  const me = userInfo().username;
+  writeStub(
+    bin,
+    "sudo",
+    `#!/bin/bash
+if [[ "$1" == "-u" ]]; then
+  shift 2
+  if [[ "$1" == "-H" ]]; then shift; fi
+  exec "$@"
+fi
+exit 1
+`,
+  );
+  writeStub(
+    bin,
+    "systemctl",
+    `#!/bin/bash
+printf '%s\\n' "systemctl $*" >> ${JSON.stringify(calls)}
+exit 0
+`,
+  );
+  writeStub(
+    bin,
+    "pm2",
+    `#!/bin/bash
+printf '%s\\n' "pm2 $*" >> ${JSON.stringify(calls)}
+if [[ "$1" == "jlist" ]]; then
+  printf '%s\\n' '[{"name":"msg"},{"name":"pm2-logrotate"}]'
+  exit 0
+fi
+if [[ "$1" == "describe" && "${online ? "1" : ""}" == "1" ]]; then
+  echo "status online"
+fi
+exit 0
+`,
+  );
+  const migrated = extractBashFunction(step08, "migrate_pm2_root_if_needed")
+    .replaceAll("/etc/systemd/system", etc)
+    .replaceAll("/lib/systemd/system", lib)
+    .replaceAll("/root/.pm2", rootPm2)
+    .replaceAll("/data/msg.collab.codes", msg);
+  const script = `#!/bin/bash
+set -euo pipefail
+export PATH=${JSON.stringify(bin)}:$PATH
+export LOG_DIR=${JSON.stringify(logs)}
+export DEPLOY_USER=${JSON.stringify(me)}
+export DEPLOY_HOME=${JSON.stringify(home)}
+source ${JSON.stringify(join(root, "core/utils.sh"))}
+source ${JSON.stringify(join(root, "core/logger.sh"))}
+${extractBashFunction(step08, "pm2_app_names_from_jlist")}
+${extractBashFunction(step08, "pm2_root_app_names")}
+${extractBashFunction(step08, "wait_pm2_app_online")}
+${migrated}
+migrate_pm2_root_if_needed
+`;
+  const scriptPath = join(dir, "migrate.sh");
+  writeFileSync(scriptPath, script);
+  return { scriptPath, calls, etc, home, msg, rootPm2, user: me };
+}
+
+test("root migration still resurrects onto the deploy user and rolls back without becoming boot", () => {
+  const onlineDir = mkdtempSync(join(tmpdir(), "rt112-s3-migrate-"));
+  const online = migrateHarness(onlineDir, { online: true });
+  execFileSync("bash", [online.scriptPath], { encoding: "utf8", timeout: 20000 });
+  const onlineCalls = readFileSync(online.calls, "utf8");
+  assert.match(onlineCalls, /pm2 save\n[\s\S]*pm2 stop all\n[\s\S]*pm2 resurrect\n/);
+  assert.match(onlineCalls, /pm2 delete all/);
+  assert.doesNotMatch(onlineCalls, /pm2-start-fixed/);
+  assert.equal(readFileSync(join(online.home, ".pm2", "dump.pm2"), "utf8"), "dump-fixture\n");
+  assert.equal(statSync(join(online.msg, "node", "appconfig.json")).mode & 0o777, 0o600);
+  assert.throws(() => statSync(join(online.etc, "pm2-root.service")));
+
+  const rollbackDir = mkdtempSync(join(tmpdir(), "rt112-s3-rollback-"));
+  const rollback = migrateHarness(rollbackDir, { online: false });
+  let error = null;
+  try {
+    execFileSync("bash", [rollback.scriptPath], { encoding: "utf8", timeout: 45000 });
+  } catch (caught) {
+    error = caught;
+  }
+  assert.ok(error);
+  assert.notEqual(error.status, 0);
+  assert.match(`${error.stdout ?? ""}\n${error.stderr ?? ""}`, /Restoring the root daemon from its dump/);
+  assert.match(readFileSync(rollback.calls, "utf8"), /pm2 resurrect[\s\S]*pm2 resurrect/);
+  assert.equal(readFileSync(join(rollback.etc, "pm2-root.service"), "utf8").includes("resurrect"), true);
+  assert.doesNotMatch(readFileSync(rollback.calls, "utf8"), /pm2-start-fixed/);
+});
