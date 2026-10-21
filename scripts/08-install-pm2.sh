@@ -312,23 +312,19 @@ quote_exec_arg() {
   printf '"%s"' "$value"
 }
 
-install_pm2_fixed_helper() {
-  local lib_dir="/usr/local/lib/collab"
-  local src="${SCRIPT_DIR}/pm2-start-fixed.sh"
-  local dest
-  if [[ -n "${COLLAB_LIB_DIR:-}" ]]; then
-    lib_dir="$COLLAB_LIB_DIR"
-  fi
+# Root-owned copy. The unit user can execute or read it; deploy cannot rewrite it.
+install_rooted_copy() {
+  local src="$1"
+  local dest="$2"
+  local mode="$3"
+  local tmp
   if [[ ! -f "$src" ]]; then
-    log_error "pm2 fixed helper is missing: ${src}"
+    log_error "pm2 lifecycle file is missing: ${src}"
     exit 1
   fi
-  dest="${lib_dir}/pm2-start-fixed.sh"
-  mkdir -p "$lib_dir"
-  local tmp
-  tmp="$(mktemp "${lib_dir}/pm2-start-fixed.sh.XXXXXX")"
+  tmp="$(mktemp "${dest}.XXXXXX")"
   cp "$src" "$tmp"
-  chmod 0755 "$tmp"
+  chmod "$mode" "$tmp"
   if [[ "$(id -u)" -eq 0 ]]; then
     chown root: "$tmp"
   fi
@@ -336,27 +332,46 @@ install_pm2_fixed_helper() {
   log_info "installed ${dest}"
 }
 
-# Clears the startup ExecStart (resurrect) and starts the two canonical configs.
-# Does not set Type, PIDFile, User, ExecStop, or ExecReload.
+install_pm2_fixed_helper() {
+  local lib_dir="/usr/local/lib/collab"
+  if [[ -n "${COLLAB_LIB_DIR:-}" ]]; then
+    lib_dir="$COLLAB_LIB_DIR"
+  fi
+  if ! command -v node >/dev/null 2>&1 || ! command -v flock >/dev/null 2>&1; then
+    log_error "node and flock must already be installed; refusing to fetch them"
+    exit 1
+  fi
+  mkdir -p "$lib_dir"
+  install_rooted_copy "${SCRIPT_DIR}/pm2-start-fixed.sh" "${lib_dir}/pm2-start-fixed.sh" 0755
+  install_rooted_copy "${SCRIPT_DIR}/pm2-lifecycle.mjs" "${lib_dir}/pm2-lifecycle.mjs" 0644
+}
+
+# Clears startup ExecStart (resurrect) and ExecStop (pm2 kill).
+# Does not set Type, PIDFile, User, or ExecReload.
 write_pm2_fixed_configs_dropin() {
   local pm2_bin="$1"
   local unit="pm2-${DEPLOY_USER}.service"
   local dropin_dir="/etc/systemd/system/${unit}.d"
   local lib_dir="/usr/local/lib/collab"
-  local helper apps messages body exec_line
+  local helper lifecycle node_bin apps messages body exec_line exec_stop
   if [[ -n "${COLLAB_SYSTEMD_ETC:-}" ]]; then
     dropin_dir="${COLLAB_SYSTEMD_ETC}/${unit}.d"
   fi
   if [[ -n "${COLLAB_LIB_DIR:-}" ]]; then
     lib_dir="$COLLAB_LIB_DIR"
   fi
+  node_bin="$(command -v node)"
   helper="${lib_dir}/pm2-start-fixed.sh"
+  lifecycle="${lib_dir}/pm2-lifecycle.mjs"
   apps="${COLLAB_DATA_ROOT}/mls-base/pm2.config.js"
   messages="${COLLAB_DATA_ROOT}/msg.collab.codes/pm2.config.js"
   exec_line="ExecStart=$(quote_exec_arg "$helper") $(quote_exec_arg "$pm2_bin") $(quote_exec_arg "$apps") $(quote_exec_arg "$messages")"
+  exec_stop="ExecStop=$(quote_exec_arg "$node_bin") $(quote_exec_arg "$lifecycle") stop $(quote_exec_arg "$pm2_bin")"
   body="[Service]
 ExecStart=
 ${exec_line}
+ExecStop=
+${exec_stop}
 TimeoutStopSec=900s"
   write_atomic_file "${dropin_dir}/fixed-configs.conf" 0644 "$body"
   log_info "systemd drop-in ${dropin_dir}/fixed-configs.conf"

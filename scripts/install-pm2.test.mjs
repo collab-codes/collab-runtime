@@ -153,6 +153,7 @@ function stepEnv(dir, extra = {}) {
   writeStub(bin, "pm2", `#!/bin/bash\n${record}\nexit 99\n`);
   writeStub(bin, "npm", `#!/bin/bash\n${record}\nexit 99\n`);
   writeStub(bin, "pm2-real", `#!/bin/bash\n${record}\nexit 99\n`);
+  writeStub(bin, "flock", `#!/bin/bash\n${record}\nexit 0\n`);
   writeStub(
     bin,
     "systemctl",
@@ -240,36 +241,50 @@ test("--startup-only writes one ExecStart, timeout 900, custom data root, and ke
   const dataRoot = join(dir, "custom data");
   const ctx = stepEnv(dir, { dataRoot });
   writeUnit(ctx);
+  const unitPath = join(ctx.etc, `pm2-${ctx.user}.service`);
+  const unitBefore = readFileSync(unitPath, "utf8");
   const dropin = join(ctx.etc, `pm2-${ctx.user}.service.d`);
   mkdirSync(dropin, { recursive: true });
   writeFileSync(join(dropin, "keep-me.conf"), "LeaveThis\n");
   runStep(ctx, ["--startup-only"]);
   const first = readFileSync(join(dropin, "fixed-configs.conf"), "utf8");
+  const helper = join(ctx.collabLib, "pm2-start-fixed.sh");
+  const lifecycle = join(ctx.collabLib, "pm2-lifecycle.mjs");
+  const helperBefore = readFileSync(helper);
+  const lifecycleBefore = readFileSync(lifecycle);
   runStep(ctx, ["--startup-only"]);
   const fixed = readFileSync(join(dropin, "fixed-configs.conf"), "utf8");
   assert.equal(fixed, first);
+  assert.deepEqual(readFileSync(helper), helperBefore);
+  assert.deepEqual(readFileSync(lifecycle), lifecycleBefore);
   const mount = readFileSync(join(dropin, "data-mount.conf"), "utf8");
-  const helper = join(ctx.collabLib, "pm2-start-fixed.sh");
   const apps = `${dataRoot}/mls-base/pm2.config.js`;
   const messages = `${dataRoot}/msg.collab.codes/pm2.config.js`;
+  const nodeBin = execFileSync("bash", ["-c", "command -v node"], { encoding: "utf8", env: ctx.env }).trim();
   const execLines = fixed.split("\n").filter((line) => line.startsWith("ExecStart="));
+  const stopLines = fixed.split("\n").filter((line) => line.startsWith("ExecStop="));
   assert.deepEqual(execLines, [
     "ExecStart=",
     `ExecStart="${helper}" "${ctx.pm2Bin}" "${apps}" "${messages}"`,
   ]);
+  assert.deepEqual(stopLines, [
+    "ExecStop=",
+    `ExecStop="${nodeBin}" "${lifecycle}" stop "${ctx.pm2Bin}"`,
+  ]);
   assert.equal(fixed.match(/TimeoutStopSec=900s/g)?.length, 1);
-  assert.doesNotMatch(fixed, /Type=|PIDFile=|ExecStop=|ExecReload=|oneshot/);
+  assert.doesNotMatch(fixed, /Type=|PIDFile=|ExecReload=|oneshot/);
   const escapedRoot = dataRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   assert.match(mount, new RegExp(`^\\[Unit\\]\\nRequiresMountsFor=${escapedRoot}\\n$`));
   assert.equal(readFileSync(join(dropin, "keep-me.conf"), "utf8"), "LeaveThis\n");
   assert.equal(statSync(helper).mode & 0o777, 0o755);
+  assert.equal(statSync(lifecycle).mode & 0o777, 0o644);
+  assert.equal(readFileSync(helper, "utf8"), readFileSync(join(root, "scripts/pm2-start-fixed.sh"), "utf8"));
+  assert.equal(readFileSync(lifecycle, "utf8"), readFileSync(join(root, "scripts/pm2-lifecycle.mjs"), "utf8"));
   const calls = readFileSync(ctx.calls, "utf8");
   assert.match(calls, /systemctl daemon-reload/);
   assert.match(calls, /systemd-analyze verify/);
   assert.doesNotMatch(calls, /\/(pm2|npm|pm2-real) /);
-  const unit = readFileSync(join(ctx.etc, `pm2-${ctx.user}.service`), "utf8");
-  assert.match(unit, /ExecStop=/);
-  assert.match(unit, /ExecStart=.*resurrect/);
+  assert.equal(readFileSync(unitPath, "utf8"), unitBefore);
 });
 
 test("--startup-only fails when the deploy unit is missing and writes nothing", () => {
@@ -402,6 +417,8 @@ exit 0
   const execLines = fixed.split("\n").filter((line) => line.startsWith("ExecStart="));
   assert.equal(execLines[0], "ExecStart=");
   assert.match(execLines[1], /pm2-start-fixed\.sh/);
+  assert.match(fixed, /ExecStop=\nExecStop=.*pm2-lifecycle\.mjs" stop /);
+  assert.equal(readFileSync(join(ctx.collabLib, "pm2-lifecycle.mjs"), "utf8"), readFileSync(join(root, "scripts/pm2-lifecycle.mjs"), "utf8"));
   assert.doesNotMatch(fixed, /resurrect/);
   // assert_one_pm2_unit scans the host with GNU find -printf. On macOS that
   // command exits 1 after logrotate, with no unit-count line. A Linux host

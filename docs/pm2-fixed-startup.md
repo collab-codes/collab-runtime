@@ -78,7 +78,7 @@ systemctl show pm2-ubuntu.service -p User -p Environment -p ExecStart -p ExecSto
 systemd-analyze verify pm2-ubuntu.service
 ```
 
-Expect one helper `ExecStart`, `TimeoutStopUSec=15min`, the deploy user, and that user's `PM2_HOME`. `ExecStop` stays the generated `pm2 kill`.
+Expect one helper `ExecStart`, one `pm2-lifecycle.mjs stop` `ExecStop`, `TimeoutStopUSec=15min`, the deploy user, and that user's `PM2_HOME`. See "Stop and restart" below.
 
 ## Rollback
 
@@ -106,3 +106,59 @@ systemctl is-active pm2-ubuntu.service
 ```
 
 After a restart, read names, instance counts, and status from the two config files and from process state. Compare HTTP `/health` only in that reserved proof. A clean restart with no traffic does not measure aggregate drain, a power cut, or the next cold boot.
+
+## Stop and restart (lifecycle helper)
+
+`--startup-only` and the normal step 08 both call `apply_pm2_fixed_startup`. That copies `pm2-start-fixed.sh` (0755) and `pm2-lifecycle.mjs` (0644) to `/usr/local/lib/collab`, root-owned, and writes the mount drop-in plus `fixed-configs.conf`. It then runs `systemctl daemon-reload` and `systemd-analyze verify`. It does not stop, restart, kill, save, install npm packages, or migrate a dump.
+
+`node` and `flock` must already be on `PATH`. The installer checks both and does not download them. `ExecStop` records the absolute `node` from that check. The stop command runs as the unit user.
+
+The base unit keeps `Type`, `PIDFile`, `User`, `PM2_HOME`, and `ExecReload`. The drop-in clears `ExecStart` and `ExecStop`, then sets:
+
+```text
+ExecStart=
+ExecStart="/usr/local/lib/collab/pm2-start-fixed.sh" "<pm2-binary-from-the-unit>" "<data>/mls-base/pm2.config.js" "<data>/msg.collab.codes/pm2.config.js"
+ExecStop=
+ExecStop="<node>" "/usr/local/lib/collab/pm2-lifecycle.mjs" stop "<same-pm2-binary>"
+TimeoutStopSec=900s
+```
+
+The PM2 binary is the one on the unit's `ExecStart`, not a `pm2` from another home. `RequiresMountsFor` stays on `data-mount.conf`. `pm2 startup` may rewrite the base unit; the drop-in still applies.
+
+The helper's own budget is 840s monotonic, including the lock and the wait. It is inside `TimeoutStopSec=900s`. A timeout or a non-zero exit is not a clean stop. 900s does not promise that several serial drains finish, and it does not change the collab-messages `kill_timeout`.
+
+`PM2_HOME/collab-lifecycle.lock` (0600) serializes this unit's start and stop entrypoints. It does not block every external PM2 CLI. `PM2_HOME/collab-stop.json` (0600) stores boot id, phase (`stopping` or `stopped`), and process identities. It does not store env, config, or tokens.
+
+## Failed unit
+
+Do not `start` or `restart` while a previous generation is still alive. Install does not do that. `systemctl stop` is the synchronous stop. If the unit is already `failed` and processes remain, leave them until `ExecStop` reports they are gone. A receipt left in `stopping`, or a receipt removed by hand, does not authorize the next start. The guard refuses a live daemon, a leftover process, or an unconfirmed stop.
+
+## Verify
+
+Use property names. Do not print `Environment` or the receipt body.
+
+```bash
+systemctl show pm2-ubuntu.service -p Id -p User -p ExecStart -p ExecStop -p TimeoutStopUSec -p PIDFile -p ActiveState -p SubState
+systemd-analyze verify pm2-ubuntu.service
+```
+
+Expect the helper on `ExecStart`, `pm2-lifecycle.mjs stop` on `ExecStop` with the unit's PM2 binary, and `TimeoutStopUSec=15min`.
+
+## Backup and rollback
+
+Back up only the files this install changes. Restore those files only. Do not copy `dump.pm2` back, and do not restart.
+
+```bash
+unit=pm2-ubuntu.service
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "/var/backups/pm2-startup-$stamp"
+cp -a "/usr/local/lib/collab/pm2-start-fixed.sh" "/usr/local/lib/collab/pm2-lifecycle.mjs" "/var/backups/pm2-startup-$stamp/" 2>/dev/null || true
+cp -a "/etc/systemd/system/${unit}.d/fixed-configs.conf" "/etc/systemd/system/${unit}.d/data-mount.conf" "/var/backups/pm2-startup-$stamp/" 2>/dev/null || true
+```
+
+```bash
+cp -a "/var/backups/pm2-startup-$stamp/pm2-start-fixed.sh" "/var/backups/pm2-startup-$stamp/pm2-lifecycle.mjs" /usr/local/lib/collab/
+cp -a "/var/backups/pm2-startup-$stamp/fixed-configs.conf" "/var/backups/pm2-startup-$stamp/data-mount.conf" "/etc/systemd/system/${unit}.d/"
+systemctl daemon-reload
+systemd-analyze verify "$unit"
+```
