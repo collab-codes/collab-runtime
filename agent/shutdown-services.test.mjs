@@ -5,15 +5,15 @@ import { stopServices } from "./shutdown-services.mjs";
 const REQUEST = "11111111-1111-4111-8111-111111111111";
 
 function show(state) {
-  if (state === "missing") return "not-found\ninactive\ndead\n0\n0\n";
-  if (state === "down") return "loaded\ninactive\ndead\n0\n0\n";
-  if (state === "exited") return "loaded\nactive\nexited\n0\n0\n";
-  if (state === "up") return "loaded\nactive\nrunning\n4242\n3\n";
+  if (state === "missing") return "MainPID=0\nTasksCurrent=[not set]\nLoadState=not-found\nActiveState=inactive\nSubState=dead\n";
+  if (state === "down") return "MainPID=0\nTasksCurrent=0\nLoadState=loaded\nActiveState=inactive\nSubState=dead\n";
+  if (state === "exited") return "MainPID=0\nTasksCurrent=0\nLoadState=loaded\nActiveState=active\nSubState=exited\n";
+  if (state === "up") return "MainPID=4242\nTasksCurrent=3\nLoadState=loaded\nActiveState=active\nSubState=running\n";
   return state;
 }
 
 function proc(name, pid, status = "online", startTime = pid) {
-  return { name, pid, pm2_env: { status, startTime } };
+  return { name, pid, pm2_env: { status, pm_uptime: startTime } };
 }
 
 function harness(overrides = {}) {

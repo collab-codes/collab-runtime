@@ -337,8 +337,8 @@ test("when the failsafe cannot be armed the worker halts without the long drain"
 test("service observation persists before the stop and does not call the host", async () => {
   const fx = await fixture();
   const events = [];
-  const show = "loaded\nactive\nrunning\n4242\n1\n";
-  const quiet = "loaded\ninactive\ndead\n0\n0\n";
+  const show = "MainPID=4242\nTasksCurrent=1\nLoadState=loaded\nActiveState=active\nSubState=running\n";
+  const quiet = "MainPID=0\nTasksCurrent=0\nLoadState=loaded\nActiveState=inactive\nSubState=dead\n";
   let nginxShows = 0;
   try {
     await admitted(fx);
@@ -357,7 +357,7 @@ test("service observation persists before the stop and does not call the host", 
           nginxShows += 1;
           return { code: 0, stdout: nginxShows === 1 ? show : quiet };
         }
-        if (argv[1] === "show") return { code: 0, stdout: "not-found\n\n\n\n\n" };
+        if (argv[1] === "show") return { code: 0, stdout: "MainPID=0\nTasksCurrent=[not set]\nLoadState=not-found\nActiveState=inactive\nSubState=dead\n" };
         return { code: 0, stdout: "" };
       },
     });

@@ -209,7 +209,6 @@ async function showUnit(deps, origin, unit) {
     "-p", "SubState",
     "-p", "MainPID",
     "-p", "TasksCurrent",
-    "--value",
   ]);
   if (ran.kind !== "ok" || ran.code !== 0) return { result: "unconfirmed" };
   const parsed = parseShow(ran.stdout);
@@ -218,14 +217,20 @@ async function showUnit(deps, origin, unit) {
   return { result: "running" };
 }
 
+// `systemctl show -p` prints KEY=VALUE in systemd's own order, not in the
+// order of the -p flags, so the value is read by key.
 function parseShow(stdout) {
-  const lines = String(stdout ?? "").split("\n");
+  const props = {};
+  for (const line of String(stdout ?? "").split("\n")) {
+    const at = line.indexOf("=");
+    if (at > 0) props[line.slice(0, at)] = line.slice(at + 1);
+  }
   return {
-    LoadState: lines[0] ?? "",
-    ActiveState: lines[1] ?? "",
-    SubState: lines[2] ?? "",
-    MainPID: lines[3] ?? "",
-    TasksCurrent: lines[4] ?? "",
+    LoadState: props.LoadState ?? "",
+    ActiveState: props.ActiveState ?? "",
+    SubState: props.SubState ?? "",
+    MainPID: props.MainPID ?? "",
+    TasksCurrent: props.TasksCurrent ?? "",
   };
 }
 
@@ -293,7 +298,8 @@ async function readPm2(deps, origin) {
     const name = row?.name;
     const pid = Number(row?.pid);
     const status = typeof row?.pm2_env?.status === "string" ? row.pm2_env.status : "";
-    const startTime = Number(row?.pm2_env?.startTime);
+    // pm2 jlist has no startTime; pm_uptime is when this pid was started (ms).
+    const startTime = Number(row?.pm2_env?.pm_uptime);
     if (typeof name !== "string" || !NAME_RE.test(name)) return { ok: false, processes: [] };
     if (!Number.isInteger(pid) || pid < 0) return { ok: false, processes: [] };
     if (!Number.isInteger(startTime) || startTime < 0) return { ok: false, processes: [] };
