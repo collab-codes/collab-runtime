@@ -6,6 +6,7 @@ import {
   environMatchesHome,
   guardPm2,
   observeTarget,
+  pidsFromJlist,
   procIdentity,
   startTimeFromStat,
   stopPm2,
@@ -437,4 +438,16 @@ test("stop does not wait for its own lock holder (flock and node -e children of 
   // The lock holder 501/502 stays alive for the whole stop; only the service (10, 11) leaves.
   assert.equal(await stopPm2(base(box.io, { helperPid: HELPER, controlPids: [HELPER] })), 0);
   assert.equal(box.receipt().confirmed, true);
+});
+
+test("a stopped app listed with pid 0 is not a live process and not an inconsistent inventory", () => {
+  const rows = [
+    { name: "app", pid: 0, pm2_env: { status: "stopped" } },
+    { name: "msg", pid: 4242, pm2_env: { status: "online" } },
+  ];
+  assert.deepEqual(pidsFromJlist(rows), [4242]);
+  assert.deepEqual(pidsFromJlist([{ pid: 0 }, { pid: 0 }]), []);
+  for (const bad of [{ pid: -1 }, { pid: 1.5 }, { pid: "x" }, null]) {
+    assert.throws(() => pidsFromJlist([bad]), /inventory|jlist/);
+  }
 });

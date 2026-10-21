@@ -923,13 +923,7 @@ export function createHostIo() {
       if (!Array.isArray(rows)) {
         throw new ObsError("inconsistent", "jlist");
       }
-      return rows.map((row) => {
-        const pid = Number(row && row.pid);
-        if (!Number.isInteger(pid) || pid <= 0) {
-          throw new ObsError("inconsistent", "jlist");
-        }
-        return pid;
-      });
+      return pidsFromJlist(rows);
     },
     spawnKill(pm2Bin, pm2Home) {
       const child = spawn(pm2Bin, ["kill"], {
@@ -974,6 +968,26 @@ function hostContext(io) {
  * @param {number} pid
  * @returns {number[]}
  */
+/**
+ * Live pids of a `pm2 jlist`. A stopped app stays listed with pid 0 and has no
+ * process: it is skipped. Any other non-positive or non-integer pid is inconsistent.
+ * @param {unknown[]} rows
+ * @returns {number[]}
+ */
+export function pidsFromJlist(rows) {
+  const pids = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object") throw new ObsError("inconsistent", "jlist");
+    const pid = Number(row.pid);
+    if (pid === 0) continue;
+    if (!Number.isInteger(pid) || pid < 0) {
+      throw new ObsError("inconsistent", "jlist");
+    }
+    pids.push(pid);
+  }
+  return pids;
+}
+
 export function controlChain(io, pid) {
   const chain = [];
   let current = pid;
