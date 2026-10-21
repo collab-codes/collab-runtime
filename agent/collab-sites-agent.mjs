@@ -6,8 +6,10 @@ import https from "node:https";
 import os from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { readShutdownState, shutdownReportSnapshot } from "./shutdown-state.mjs";
 
-export const AGENT_VERSION = "0.3.0";
+export const AGENT_VERSION = "0.3.1";
+const BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id";
 export const DEFAULT_ENV_PATH = "/etc/collab/sites-agent.env";
 export const DEFAULT_BIND = "127.0.0.1:5151";
 export const DEFAULT_ALLOWED_ORIGIN = "sites.collab.codes";
@@ -320,8 +322,8 @@ export function collectFacts(config) {
   };
 }
 
-export function buildStatusPayload(config, facts) {
-  return {
+export function buildStatusPayload(config, facts, shutdown) {
+  const payload = {
     hostname: facts.hostname ?? "",
     region: config.region,
     dataRoot: config.dataRoot,
@@ -339,31 +341,72 @@ export function buildStatusPayload(config, facts) {
     },
     pm2: facts.pm2 ?? { dump: "absent", expected: [], processes: [] },
   };
+  if (shutdown) payload.shutdown = shutdownFields(shutdown);
+  return payload;
 }
 
-export function buildHeartbeatBody(config, facts) {
+export function buildHeartbeatBody(config, facts, shutdown) {
   return {
     projectId: config.projectId,
     instanceId: config.instanceId,
     token: config.token,
-    status: facts.runtimeStatus,
+    status: shutdown ? "shutdown_ready" : facts.runtimeStatus,
     runtimeVersion: facts.runtimeVersion,
     agentVersion: config.agentVersion,
-    payload: buildStatusPayload(config, facts),
+    payload: buildStatusPayload(config, facts, shutdown),
   };
 }
 
-export function buildStatusBody(config, facts) {
+export function buildStatusBody(config, facts, shutdown) {
   return {
     serverId: config.serverId,
     projectId: config.projectId,
     instanceId: config.instanceId,
     status: facts.runtimeStatus,
-    payload: buildStatusPayload(config, facts),
+    payload: buildStatusPayload(config, facts, shutdown),
   };
 }
 
-export function routeStatusRequest({ path, headers, config, facts }) {
+function shutdownFields(shutdown) {
+  return {
+    requestId: shutdown.requestId,
+    stopped: shutdown.stopped.slice(),
+    notStopped: shutdown.notStopped.slice(),
+    startedAt: shutdown.startedAt,
+    finishedAt: shutdown.finishedAt,
+  };
+}
+
+export function currentBootId(deps = {}) {
+  if (typeof deps.bootId === "string") return deps.bootId;
+  if (typeof deps.readBootId === "function") return deps.readBootId();
+  try {
+    return readFileSync(BOOT_ID_PATH, "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
+// Absent, invalid, another boot, or an active cycle without a frozen report
+// all project to no payload.shutdown. Invalid is only a fixed diagnostic.
+export async function frozenShutdownReport(deps = {}) {
+  const read = deps.readShutdownState ?? readShutdownState;
+  let state;
+  try {
+    state = await read({ ...deps, bootId: currentBootId(deps) });
+  } catch (err) {
+    console.error(`shutdown state unreadable: ${err?.message ?? "unknown"}`);
+    return null;
+  }
+  if (!state || state.status === "absent" || state.status === "other_boot") return null;
+  if (state.status === "invalid") {
+    console.error(`shutdown state invalid: ${state.reason ?? "malformed"}`);
+    return null;
+  }
+  return shutdownReportSnapshot(state);
+}
+
+export function routeStatusRequest({ path, headers, config, facts, shutdown }) {
   if (!requestAllowed(headers ?? {}, config.allowedOrigin)) {
     return { status: 403, body: JSON.stringify({ error: "origin not allowed" }) };
   }
@@ -371,7 +414,7 @@ export function routeStatusRequest({ path, headers, config, facts }) {
     case "/health":
       return { status: 200, body: JSON.stringify({ status: "ok" }) };
     case "/status":
-      return { status: 200, body: JSON.stringify(buildStatusBody(config, facts)) };
+      return { status: 200, body: JSON.stringify(buildStatusBody(config, facts, shutdown)) };
     default:
       return { status: 404, body: JSON.stringify({ error: "not found" }) };
   }
@@ -457,7 +500,8 @@ async function defaultPostJson(url, { headers, body, timeoutMs }) {
 export async function sendHeartbeat(config, deps = {}) {
   const url = `${config.sitesUrl}/api/v1/servers/${config.serverId}/heartbeat`;
   const facts = (deps.collectFacts ?? collectFacts)(config);
-  const payload = JSON.stringify(buildHeartbeatBody(config, facts));
+  const shutdown = await frozenShutdownReport(deps);
+  const payload = JSON.stringify(buildHeartbeatBody(config, facts, shutdown));
   const postJson = deps.postJson ?? defaultPostJson;
   try {
     const result = await postJson(url, {
@@ -487,13 +531,15 @@ function parseBind(bind) {
 }
 
 export function startStatusServer(config, deps = {}) {
-  const server = http.createServer((req, res) => {
+  const server = http.createServer(async (req, res) => {
     const facts = (deps.collectFacts ?? collectFacts)(config);
+    const shutdown = await frozenShutdownReport(deps);
     const result = routeStatusRequest({
       path: req.url ?? "/",
       headers: req.headers,
       config,
       facts,
+      shutdown,
     });
     res.writeHead(result.status, {
       "Content-Type": "application/json",

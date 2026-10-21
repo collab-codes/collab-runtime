@@ -1,14 +1,18 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import {
   AGENT_VERSION,
   argValue,
   buildHeartbeatBody,
   buildStatusBody,
+  buildStatusPayload,
   configFromValues,
+  frozenShutdownReport,
   loadConfig,
   meminfoMbFrom,
   parseEnvFile,
@@ -18,6 +22,7 @@ import {
   routeStatusRequest,
   run,
   runtimeStatusFrom,
+  sendHeartbeat,
 } from "./collab-sites-agent.mjs";
 
 const FIXTURE_ENV = `
@@ -281,6 +286,7 @@ test("--once sends exactly one heartbeat with the injected post", async () => {
   const calls = [];
   await run(["--env", path, "--once"], {
     collectFacts: () => FACTS,
+    readShutdownState: async () => ({ status: "absent" }),
     postJson: async (url, opts) => {
       calls.push({ url, opts });
       return { statusCode: 200, body: "{}" };
@@ -305,7 +311,7 @@ test("argValue reads --env <path>", () => {
 });
 
 test("default agent version is the Node rewrite", () => {
-  assert.equal(AGENT_VERSION, "0.3.0");
+  assert.equal(AGENT_VERSION, "0.3.1");
 });
 
 /**
@@ -318,4 +324,164 @@ test("default agent version is the Node rewrite", () => {
 test("pm2Jlist nao invoca o pm2 quando o daemon nao existe (nao cria daemon no boot)", () => {
   const home = mkdtempSync(join(tmpdir(), "pm2home-"));
   assert.equal(pm2Jlist(home), null);
+});
+
+const REPORT = {
+  requestId: "11111111-1111-4111-8111-111111111111",
+  stopped: ["nginx", "msg"],
+  notStopped: ["postgresql@14-main.service"],
+  startedAt: "2026-10-21T23:00:00.000Z",
+  finishedAt: "2026-10-21T23:10:00.000Z",
+};
+
+function activeState(report) {
+  return {
+    status: "active",
+    record: {
+      requestId: REPORT.requestId,
+      phase: report ? "services_stopped" : "stopping",
+      seq: 4,
+      report: report ?? null,
+    },
+  };
+}
+
+test("frozen report is the only shutdown projection and stays idempotent", async () => {
+  const config = await configFromValues(parseEnvFile(FIXTURE_ENV));
+  const absent = buildHeartbeatBody(config, FACTS, await frozenShutdownReport({
+    readShutdownState: async () => ({ status: "absent" }),
+  }));
+  assert.equal(absent.status, "ready");
+  assert.equal(absent.payload.shutdown, undefined);
+  assert.equal(Object.hasOwn(absent.payload, "shutdown"), false);
+
+  const active = buildHeartbeatBody(config, FACTS, await frozenShutdownReport({
+    bootId: "boot-a",
+    readShutdownState: async () => activeState(null),
+  }));
+  assert.equal(active.status, "ready");
+  assert.equal(active.payload.shutdown, undefined);
+
+  const finalReport = await frozenShutdownReport({
+    bootId: "boot-a",
+    readShutdownState: async () => activeState(REPORT),
+  });
+  const first = buildHeartbeatBody(config, FACTS, finalReport);
+  const second = buildHeartbeatBody(config, FACTS, finalReport);
+  assert.equal(first.status, "shutdown_ready");
+  assert.deepEqual(first, second);
+  assert.deepEqual(Object.keys(first.payload.shutdown), [
+    "requestId",
+    "stopped",
+    "notStopped",
+    "startedAt",
+    "finishedAt",
+  ]);
+  assert.deepEqual(first.payload.shutdown, REPORT);
+  assert.equal(JSON.stringify(first.payload.shutdown).includes("tok_fixture"), false);
+  assert.equal(JSON.stringify(first.payload.shutdown).includes("seq"), false);
+
+  const previous = await frozenShutdownReport({
+    bootId: "boot-b",
+    readShutdownState: async () => ({ status: "other_boot", record: activeState(REPORT).record }),
+  });
+  assert.equal(previous, null);
+  const lateHealth = buildHeartbeatBody(config, FACTS, previous);
+  assert.equal(lateHealth.status, "ready");
+  assert.equal(lateHealth.payload.shutdown, undefined);
+
+  const kept = buildHeartbeatBody(config, FACTS, finalReport);
+  assert.deepEqual(kept.payload.shutdown, first.payload.shutdown);
+  assert.equal(kept.status, "shutdown_ready");
+});
+
+test("invalid shutdown state is a diagnostic and never a clean stop report", async () => {
+  const lines = [];
+  const orig = console.error;
+  console.error = (line) => lines.push(String(line));
+  try {
+    const report = await frozenShutdownReport({
+      readShutdownState: async () => ({ status: "invalid", reason: "malformed" }),
+    });
+    assert.equal(report, null);
+  } finally {
+    console.error = orig;
+  }
+  assert.deepEqual(lines, ["shutdown state invalid: malformed"]);
+  assert.equal(lines.join("").includes("tok_fixture"), false);
+  const config = await configFromValues(parseEnvFile(FIXTURE_ENV));
+  const body = buildStatusPayload(config, FACTS, null);
+  assert.equal(body.shutdown, undefined);
+});
+
+test("concurrent heartbeats keep one immutable report and a late health beat does not replace it", async () => {
+  const config = await configFromValues(parseEnvFile(FIXTURE_ENV));
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  let calls = 0;
+  const sent = [];
+  const readShutdownState = async () => {
+    calls += 1;
+    if (calls === 1) {
+      await gate;
+      return activeState(REPORT);
+    }
+    return { status: "absent" };
+  };
+  const postJson = async (_url, opts) => {
+    sent.push(JSON.parse(opts.body));
+    return { statusCode: 200, body: "{}" };
+  };
+  const pending = Promise.all([
+    sendHeartbeat(config, { collectFacts: () => FACTS, readShutdownState, postJson, bootId: "boot-a" }),
+    sendHeartbeat(config, { collectFacts: () => FACTS, readShutdownState, postJson, bootId: "boot-a" }),
+  ]);
+  release();
+  await pending;
+  assert.equal(sent.length, 2);
+  const withReport = sent.filter((body) => body.payload.shutdown);
+  const without = sent.filter((body) => !body.payload.shutdown);
+  assert.equal(withReport.length, 1);
+  assert.equal(without.length, 1);
+  assert.equal(withReport[0].status, "shutdown_ready");
+  assert.deepEqual(withReport[0].payload.shutdown, REPORT);
+  assert.equal(without[0].status, "ready");
+  assert.equal(withReport[0].token, "tok_fixture");
+  assert.equal(Object.hasOwn(withReport[0].payload.shutdown, "token"), false);
+  const again = await frozenShutdownReport({
+    bootId: "boot-a",
+    readShutdownState: async () => activeState(REPORT),
+  });
+  assert.deepEqual(buildHeartbeatBody(config, FACTS, again).payload.shutdown, REPORT);
+});
+
+test("status route has no shutdown command and publishes the frozen report only", async () => {
+  const config = await configFromValues(parseEnvFile(FIXTURE_ENV));
+  const allowed = { origin: "https://sites.collab.codes" };
+  const plain = routeStatusRequest({ path: "/status", headers: allowed, config, facts: FACTS });
+  assert.equal(JSON.parse(plain.body).payload.shutdown, undefined);
+  const posted = routeStatusRequest({ path: "/shutdown", headers: allowed, config, facts: FACTS });
+  assert.equal(posted.status, 404);
+  const ready = routeStatusRequest({
+    path: "/status",
+    headers: allowed,
+    config,
+    facts: FACTS,
+    shutdown: REPORT,
+  });
+  const parsed = JSON.parse(ready.body);
+  assert.equal(parsed.status, "ready");
+  assert.deepEqual(parsed.payload.shutdown, REPORT);
+});
+
+test("importing the agent does not open the status listener", async () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const child = spawn(process.execPath, ["--input-type=module", "-e", "await import('./collab-sites-agent.mjs')"], {
+    cwd: here,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const code = await new Promise((resolve) => child.on("close", resolve));
+  assert.equal(code, 0);
 });
