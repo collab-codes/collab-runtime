@@ -2,7 +2,7 @@
 // Stop and guard for one PM2_HOME. Observation is separate from kill/start.
 // A missing socket, a stopped receipt, or CLI exit 0 is not proof the processes ended.
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, openSync, writeSync, fsyncSync, closeSync, renameSync, chmodSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, openSync, writeSync, fsyncSync, closeSync, renameSync, chmodSync, readFileSync, readdirSync, statSync, lstatSync, realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
 
@@ -10,6 +10,7 @@ import path from "node:path";
 export const STOP_DEADLINE_MS = 840_000;
 const DEFAULT_POLL_MS = 200;
 const RECEIPT_NAME = "collab-stop.json";
+const LOCK_NAME = "collab-lifecycle.lock";
 
 /**
  * @typedef {object} ProcIdentity
@@ -518,6 +519,186 @@ function aliveIdentity(io, id, options) {
 }
 
 /**
+ * PM2_HOME must be a directory owned by the unit user. The lock file is only
+ * collab-lifecycle.lock; a symlink, socket, or pidfile is refused.
+ * @param {string} pm2Home
+ * @param {number} uid
+ * @returns {{ pm2Home: string, lockPath: string }}
+ */
+export function validatePm2Home(pm2Home, uid) {
+  if (typeof pm2Home !== "string" || pm2Home.length === 0 || pm2Home.includes("\0")) {
+    throw new ObsError("inconsistent", "PM2_HOME missing");
+  }
+  if (!Number.isInteger(uid) || uid < 0) {
+    throw new ObsError("permission", "uid");
+  }
+  let listed;
+  try {
+    listed = lstatSync(pm2Home);
+  } catch (error) {
+    throw asObsError(error);
+  }
+  if (!listed.isDirectory()) {
+    throw new ObsError("inconsistent", "PM2_HOME");
+  }
+  if (listed.uid !== uid) {
+    throw new ObsError("permission", "PM2_HOME owner");
+  }
+  const homeReal = realpathSync(pm2Home);
+  const lockPath = path.join(homeReal, LOCK_NAME);
+  const homePrefix = homeReal.endsWith(path.sep) ? homeReal : `${homeReal}${path.sep}`;
+  if (!lockPath.startsWith(homePrefix)) {
+    throw new ObsError("inconsistent", "lock path");
+  }
+  let lockStat = null;
+  try {
+    lockStat = lstatSync(lockPath);
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") {
+      throw asObsError(error);
+    }
+  }
+  if (lockStat) {
+    if (lockStat.isSymbolicLink() || !lockStat.isFile()) {
+      throw new ObsError("inconsistent", "lock path");
+    }
+    if (lockStat.uid !== uid) {
+      throw new ObsError("permission", "lock owner");
+    }
+    const lockReal = realpathSync(lockPath);
+    if (!lockReal.startsWith(homePrefix)) {
+      throw new ObsError("inconsistent", "lock path");
+    }
+  }
+  return { pm2Home: homeReal, lockPath };
+}
+
+/**
+ * Create the lock file as the unit user. Does not chown and does not replace
+ * an existing inode (a live socket must never be unlinked).
+ * @param {string} lockPath
+ * @param {number} uid
+ */
+export function ensureLockFile(lockPath, uid) {
+  let current = null;
+  try {
+    current = lstatSync(lockPath);
+  } catch (error) {
+    if (!error || error.code !== "ENOENT") {
+      throw asObsError(error);
+    }
+  }
+  if (!current) {
+    let fd;
+    try {
+      fd = openSync(lockPath, "wx", 0o600);
+    } catch (error) {
+      if (!error || error.code !== "EEXIST") {
+        throw asObsError(error);
+      }
+    }
+    if (fd !== undefined) {
+      closeSync(fd);
+    }
+    current = lstatSync(lockPath);
+  }
+  if (current.isSymbolicLink() || !current.isFile() || current.uid !== uid) {
+    throw new ObsError("permission", "lock owner");
+  }
+  if ((current.mode & 0o077) !== 0) {
+    chmodSync(lockPath, 0o600);
+  }
+}
+
+/**
+ * Hold an exclusive flock for the remaining global budget. `acquire` resolves
+ * to null when the wait expires. The callback receives the leftover budget.
+ * @param {object} options
+ * @param {(remainMs: number) => Promise<number>} fn
+ * @returns {Promise<number>}
+ */
+export async function withLifecycleLock(options, fn) {
+  const io = options.io;
+  const started = io.now();
+  const budget = options.deadlineMs ?? STOP_DEADLINE_MS;
+  let home;
+  try {
+    home = validatePm2Home(options.pm2Home, options.uid);
+    ensureLockFile(home.lockPath, options.uid);
+  } catch (error) {
+    logLine(io, `error=${asObsError(error).kind}`);
+    return 1;
+  }
+  const waitMs = budget - (io.now() - started);
+  if (waitMs <= 0) {
+    logLine(io, "error=timeout");
+    return 1;
+  }
+  const release = await options.acquire(home.lockPath, waitMs);
+  if (!release) {
+    logLine(io, "error=timeout");
+    return 1;
+  }
+  try {
+    const remain = budget - (io.now() - started);
+    if (remain <= 0) {
+      logLine(io, "error=timeout");
+      return 1;
+    }
+    return await fn(remain);
+  } finally {
+    await release();
+  }
+}
+
+/**
+ * Block until `flock` holds `lockPath`, then resolve a release function.
+ * Resolves to null on timeout or when flock is missing. Never deletes the file.
+ * @param {string} lockPath
+ * @param {number} waitMs
+ * @returns {Promise<null|(() => Promise<void>)>}
+ */
+export function acquireFlock(lockPath, waitMs) {
+  const seconds = Math.floor(waitMs / 1000);
+  if (seconds <= 0) {
+    return Promise.resolve(null);
+  }
+  const child = spawn("flock", [
+    "-w",
+    String(seconds),
+    "--",
+    lockPath,
+    process.execPath,
+    "-e",
+    "const fs=require('node:fs'); fs.writeSync(1,'ok\\n'); process.stdin.resume(); process.stdin.on('end',()=>process.exit(0));",
+  ], { stdio: ["pipe", "pipe", "ignore"] });
+  return new Promise((resolve) => {
+    let buf = "";
+    let settled = false;
+    const finish = (value) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve(value);
+    };
+    child.stdout.on("data", (chunk) => {
+      buf += chunk;
+      if (buf.includes("ok\n")) {
+        finish(async () => {
+          child.stdin.end();
+          await new Promise((done) => {
+            child.once("exit", () => done());
+          });
+        });
+      }
+    });
+    child.once("error", () => finish(null));
+    child.once("exit", () => finish(null));
+  });
+}
+
+/**
  * Refuse start until the previous generation is gone. Does not call PM2.
  * @param {object} options
  * @returns {Promise<number>}
@@ -727,26 +908,66 @@ function hostContext(io) {
   };
 }
 
+function lockContext() {
+  if (typeof process.getuid === "function" && process.getuid() === 0) {
+    throw new ObsError("permission", "refusing root");
+  }
+  const pm2Home = process.env.PM2_HOME || "";
+  if (!pm2Home) {
+    throw new ObsError("inconsistent", "PM2_HOME missing");
+  }
+  return { pm2Home, uid: process.getuid() };
+}
+
 async function main() {
-  const [cmd, pm2Bin] = process.argv.slice(2);
+  const args = process.argv.slice(2);
+  const cmd = args[0];
+  const held = args.includes("--held");
+  const pm2Bin = args[1] && !args[1].startsWith("--") ? args[1] : "";
   const io = createHostIo();
   try {
+    if (cmd === "validate-home") {
+      const ctx = lockContext();
+      const home = validatePm2Home(ctx.pm2Home, ctx.uid);
+      ensureLockFile(home.lockPath, ctx.uid);
+      process.exitCode = 0;
+      return;
+    }
     if (cmd === "stop") {
       if (!pm2Bin) {
         logLine(io, "usage stop <pm2-bin>");
         process.exitCode = 64;
         return;
       }
-      const code = await stopPm2({ ...hostContext(io), pm2Bin });
+      const ctx = lockContext();
+      const code = await withLifecycleLock({
+        io,
+        pm2Home: ctx.pm2Home,
+        uid: ctx.uid,
+        deadlineMs: STOP_DEADLINE_MS,
+        acquire: acquireFlock,
+      }, async (remain) => stopPm2({ ...hostContext(io), pm2Bin, deadlineMs: remain }));
       process.exitCode = code;
       return;
     }
     if (cmd === "guard") {
-      const code = await guardPm2(hostContext(io));
+      const run = async () => guardPm2(hostContext(io));
+      if (held) {
+        process.exitCode = await run();
+        return;
+      }
+      const ctx = lockContext();
+      const code = await withLifecycleLock({
+        io,
+        pm2Home: ctx.pm2Home,
+        uid: ctx.uid,
+        deadlineMs: STOP_DEADLINE_MS,
+        acquire: acquireFlock,
+      }, run);
       process.exitCode = code;
       return;
     }
-    logLine(io, "usage stop <pm2-bin> | guard");
+    logLine(io, "usage stop <pm2-bin> | guard | validate-home");
     process.exitCode = 64;
   } catch (error) {
     logLine(io, `error=${asObsError(error).kind}`);
