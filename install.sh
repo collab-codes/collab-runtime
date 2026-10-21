@@ -356,6 +356,42 @@ else
   collab_sites_event "error" "runtime.cli_failed" "collab CLI source not found" "failed" "{\"path\":\"$(json_escape "$CLI_SRC")\"}"
 fi
 
+# Copies the sites agent together with the ordered-shutdown modules by calling
+# scripts/install-shutdown.sh. Does not start collab-shutdown. The caller
+# restarts collab-sites-agent only after this returns 0.
+install_ordered_shutdown_set() {
+  local prefix="${COLLAB_SHUTDOWN_PREFIX:-}"
+  prefix="${prefix%/}"
+  local installer="${INSTALL_DIR}/scripts/install-shutdown.sh"
+  local agent_dir="${prefix}/usr/local/lib/collab-sites-agent"
+  local lifecycle="${prefix}/usr/local/lib/collab/pm2-lifecycle.mjs"
+  local unit="${prefix}/etc/systemd/system/collab-shutdown.service"
+  local name
+  if [[ ! -f "$installer" ]]; then
+    echo "[ERR]  ordered shutdown installer missing: ${installer}" >&2
+    return 1
+  fi
+  if ! bash "$installer" --maintenance-only; then
+    echo "[ERR]  ordered shutdown installer failed" >&2
+    return 1
+  fi
+  for name in collab-sites-agent.mjs shutdown-state.mjs shutdown-worker.mjs shutdown-services.mjs; do
+    if [[ ! -f "${agent_dir}/${name}" ]]; then
+      echo "[ERR]  shutdown module missing after install: ${agent_dir}/${name}" >&2
+      return 1
+    fi
+  done
+  if [[ ! -f "$lifecycle" || ! -f "$unit" ]]; then
+    echo "[ERR]  shutdown library or unit missing after install" >&2
+    return 1
+  fi
+  if grep -q '^\[Install\]' "$unit" || grep -q 'WantedBy=' "$unit"; then
+    echo "[ERR]  collab-shutdown.service must not start on boot" >&2
+    return 1
+  fi
+  return 0
+}
+
 # ── Step 8.5: Install collab-sites heartbeat agent ────────────────────────────
 # Node source is copied as-is. No cargo, no prebuilt binary. If this step fails
 # the installer exits 1 after the summary — otherwise the VM stays
@@ -412,11 +448,11 @@ elif ! command -v node >/dev/null 2>&1; then
 elif [[ ! -f "$AGENT_SRC" ]]; then
   fail_agent "agent source missing: ${AGENT_SRC}"
 else
-  mkdir -p "$AGENT_LIB_DIR"
-  if ! cp "$AGENT_SRC" "$AGENT_DEST"; then
-    fail_agent "could not copy agent to ${AGENT_DEST}"
+  # The point installer owns the whole set. Copying only collab-sites-agent.mjs
+  # here would leave the agent and the shutdown modules on different revisions.
+  if ! install_ordered_shutdown_set; then
+    fail_agent "ordered shutdown set incomplete; collab-sites-agent was not restarted"
   else
-    chmod 644 "$AGENT_DEST"
     # Drop the old Rust binary so a previous install cannot keep answering.
     rm -f /usr/local/bin/collab-sites-agent
     if grep -q '^COLLAB_SITES_AGENT_VERSION=' "$AGENT_ENV"; then
