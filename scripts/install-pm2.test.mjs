@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,11 +30,11 @@ test("08 writes a systemd drop-in so pm2 waits for the configured data root", ()
   assert.match(step08, /dropin_dir="\/etc\/systemd\/system\/\$\{unit\}\.d"/);
   assert.match(step08, /data-mount\.conf/);
   assert.match(step08, /RequiresMountsFor=\$\{COLLAB_DATA_ROOT\}/);
-  assert.match(step08, /cat > "\$\{dropin_dir\}\/data-mount\.conf"/);
+  assert.match(step08, /mv -f "\$tmp" "\$\{dropin_dir\}\/data-mount\.conf"/);
   assert.doesNotMatch(step08, /RequiresMountsFor=\/data/);
   const startupAt = step08.indexOf('pm2 startup systemd -u "$DEPLOY_USER" --hp "$DEPLOY_HOME"');
   const dropinAt = step08.indexOf("write_pm2_data_mount_dropin");
-  const callAt = step08.lastIndexOf("write_pm2_data_mount_dropin");
+  const callAt = step08.lastIndexOf("apply_pm2_fixed_startup");
   assert.ok(startupAt > 0 && dropinAt > 0 && callAt > startupAt, "drop-in is written after pm2 startup so a unit rewrite cannot drop it");
 });
 
@@ -130,4 +130,175 @@ test("resolve_deploy_user falls back to non-root SUDO_USER when /data is missing
     printf '%s' "\$DEPLOY_USER"
   `);
   assert.equal(out, me);
+});
+
+const step08Path = join(root, "scripts/08-install-pm2.sh");
+
+function writeStub(dir, name, body) {
+  const path = join(dir, name);
+  writeFileSync(path, body);
+  chmodSync(path, 0o755);
+}
+
+function stepEnv(dir, extra = {}) {
+  const bin = join(dir, "bin");
+  const etc = join(dir, "etc");
+  const lib = join(dir, "lib");
+  const collabLib = join(dir, "collab-lib");
+  const logs = join(dir, "logs");
+  const calls = join(dir, "calls.log");
+  for (const path of [bin, etc, lib, collabLib, logs]) mkdirSync(path, { recursive: true });
+  writeFileSync(calls, "");
+  const record = `printf '%s\\n' "$0 $*" >> ${JSON.stringify(calls)}`;
+  writeStub(bin, "pm2", `#!/bin/bash\n${record}\nexit 99\n`);
+  writeStub(bin, "npm", `#!/bin/bash\n${record}\nexit 99\n`);
+  writeStub(bin, "pm2-real", `#!/bin/bash\n${record}\nexit 99\n`);
+  writeStub(
+    bin,
+    "systemctl",
+    `#!/bin/bash
+${record}
+if [[ "$1" == "daemon-reload" && "\${RT112_FAIL_SYSTEMCTL:-}" == "1" ]]; then
+  echo "systemctl daemon-reload failed" >&2
+  exit 1
+fi
+if [[ "$1" != "daemon-reload" ]]; then
+  echo "unexpected systemctl $*" >&2
+  exit 1
+fi
+exit 0
+`,
+  );
+  writeStub(
+    bin,
+    "systemd-analyze",
+    `#!/bin/bash
+${record}
+if [[ "$1" != "verify" ]]; then
+  echo "unexpected systemd-analyze $*" >&2
+  exit 1
+fi
+exit 0
+`,
+  );
+  const me = userInfo();
+  return {
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+      LOG_DIR: logs,
+      COLLAB_SYSTEMD_ETC: etc,
+      COLLAB_SYSTEMD_LIB: lib,
+      COLLAB_LIB_DIR: collabLib,
+      COLLAB_DATA_ROOT: extra.dataRoot ?? join(dir, "data"),
+      COLLAB_DEPLOY_USER: me.username,
+      RT112_FAIL_SYSTEMCTL: extra.failSystemctl ? "1" : "",
+    },
+    etc,
+    collabLib,
+    calls,
+    pm2Bin: join(bin, "pm2-real"),
+    home: me.homedir,
+    user: me.username,
+  };
+}
+
+function writeUnit(ctx) {
+  writeFileSync(
+    join(ctx.etc, `pm2-${ctx.user}.service`),
+    `[Service]
+Type=forking
+User=${ctx.user}
+Environment=PM2_HOME=${ctx.home}/.pm2
+PIDFile=${ctx.home}/.pm2/pm2.pid
+ExecStart=${ctx.pm2Bin} resurrect
+ExecReload=${ctx.pm2Bin} reload all
+ExecStop=${ctx.pm2Bin} kill
+`,
+  );
+}
+
+function runStep(ctx, args) {
+  return execFileSync("bash", [step08Path, ...args], {
+    encoding: "utf8",
+    env: ctx.env,
+    timeout: 20000,
+  });
+}
+
+function failStep(ctx, args) {
+  try {
+    runStep(ctx, args);
+  } catch (error) {
+    return error;
+  }
+  throw new Error("expected step 08 to fail");
+}
+
+test("--startup-only writes one ExecStart, timeout 900, custom data root, and keeps the mount drop-in", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rt112-s2-"));
+  const dataRoot = join(dir, "custom data");
+  const ctx = stepEnv(dir, { dataRoot });
+  writeUnit(ctx);
+  const dropin = join(ctx.etc, `pm2-${ctx.user}.service.d`);
+  mkdirSync(dropin, { recursive: true });
+  writeFileSync(join(dropin, "keep-me.conf"), "LeaveThis\n");
+  runStep(ctx, ["--startup-only"]);
+  const first = readFileSync(join(dropin, "fixed-configs.conf"), "utf8");
+  runStep(ctx, ["--startup-only"]);
+  const fixed = readFileSync(join(dropin, "fixed-configs.conf"), "utf8");
+  assert.equal(fixed, first);
+  const mount = readFileSync(join(dropin, "data-mount.conf"), "utf8");
+  const helper = join(ctx.collabLib, "pm2-start-fixed.sh");
+  const apps = `${dataRoot}/mls-base/pm2.config.js`;
+  const messages = `${dataRoot}/msg.collab.codes/pm2.config.js`;
+  const execLines = fixed.split("\n").filter((line) => line.startsWith("ExecStart="));
+  assert.deepEqual(execLines, [
+    "ExecStart=",
+    `ExecStart="${helper}" "${ctx.pm2Bin}" "${apps}" "${messages}"`,
+  ]);
+  assert.equal(fixed.match(/TimeoutStopSec=900s/g)?.length, 1);
+  assert.doesNotMatch(fixed, /Type=|PIDFile=|ExecStop=|ExecReload=|oneshot/);
+  const escapedRoot = dataRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  assert.match(mount, new RegExp(`^\\[Unit\\]\\nRequiresMountsFor=${escapedRoot}\\n$`));
+  assert.equal(readFileSync(join(dropin, "keep-me.conf"), "utf8"), "LeaveThis\n");
+  assert.equal(statSync(helper).mode & 0o777, 0o755);
+  const calls = readFileSync(ctx.calls, "utf8");
+  assert.match(calls, /systemctl daemon-reload/);
+  assert.match(calls, /systemd-analyze verify/);
+  assert.doesNotMatch(calls, /\/(pm2|npm|pm2-real) /);
+  const unit = readFileSync(join(ctx.etc, `pm2-${ctx.user}.service`), "utf8");
+  assert.match(unit, /ExecStop=/);
+  assert.match(unit, /ExecStart=.*resurrect/);
+});
+
+test("--startup-only fails when the deploy unit is missing and writes nothing", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rt112-s2-missing-"));
+  const ctx = stepEnv(dir);
+  const error = failStep(ctx, ["--startup-only"]);
+  assert.notEqual(error.status, 0);
+  assert.match(error.stderr ?? "", /unit for .* is missing/);
+  assert.equal(readFileSync(ctx.calls, "utf8"), "");
+});
+
+test("--startup-only reports systemctl failure and does not log success", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rt112-s2-systemctl-"));
+  const ctx = stepEnv(dir, { failSystemctl: true });
+  writeUnit(ctx);
+  const error = failStep(ctx, ["--startup-only"]);
+  assert.notEqual(error.status, 0);
+  assert.match(error.stderr ?? "", /daemon-reload failed/);
+  assert.doesNotMatch(`${error.stdout ?? ""}`, /\[ OK \]/);
+  const calls = readFileSync(ctx.calls, "utf8");
+  assert.doesNotMatch(calls, /systemd-analyze/);
+  assert.doesNotMatch(calls, /\/(pm2|npm|pm2-real) /);
+});
+
+test("08 rejects an unknown flag before writing drop-ins", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rt112-s2-flag-"));
+  const ctx = stepEnv(dir);
+  const error = failStep(ctx, ["--resurrect"]);
+  assert.equal(error.status, 64);
+  assert.match(error.stderr ?? "", /unknown argument/);
+  assert.equal(readFileSync(ctx.calls, "utf8"), "");
 });

@@ -11,23 +11,48 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 source "${REPO_ROOT}/core/logger.sh"
 source "${REPO_ROOT}/core/utils.sh"
 
+# Unknown flags fail before any install, migration, or unit edit.
+STARTUP_ONLY=0
+if [[ $# -gt 1 ]]; then
+  log_error "unknown argument: $*"
+  exit 64
+fi
+case "${1:-}" in
+  "") ;;
+  --startup-only) STARTUP_ONLY=1 ;;
+  *)
+    log_error "unknown argument: $1"
+    exit 64
+    ;;
+esac
+
 log_section "Step 08 — Install PM2"
 
-if ! command_exists npm; then
-  log_error "npm not found. Step 06 (Node.js) must succeed first."
-  exit 1
+if [[ "$STARTUP_ONLY" -eq 1 ]]; then
+  if ! command_exists pm2; then
+    log_error "pm2 not found. --startup-only does not install PM2."
+    exit 1
+  fi
+else
+  if ! command_exists npm; then
+    log_error "npm not found. Step 06 (Node.js) must succeed first."
+    exit 1
+  fi
 fi
 
 resolve_deploy_user
 log_info "PM2 process user: ${DEPLOY_USER} (home ${DEPLOY_HOME})"
 
 # ── Install PM2 ────────────────────────────────────────────────────────────────
-if command_exists pm2; then
-  log_info "PM2 already installed: $(pm2 --version 2>/dev/null)"
-else
-  log_info "Installing PM2 globally…"
-  run_with_timeout "$NET_CMD_TIMEOUT_SECS" npm install -g pm2
-  log_ok "PM2 installed: $(pm2 --version 2>/dev/null)"
+# --startup-only never reaches npm install or `pm2 --version`.
+if [[ "$STARTUP_ONLY" -eq 0 ]]; then
+  if command_exists pm2; then
+    log_info "PM2 already installed: $(pm2 --version 2>/dev/null)"
+  else
+    log_info "Installing PM2 globally…"
+    run_with_timeout "$NET_CMD_TIMEOUT_SECS" npm install -g pm2
+    log_ok "PM2 installed: $(pm2 --version 2>/dev/null)"
+  fi
 fi
 
 # ── systemd units ──────────────────────────────────────────────────────────────
@@ -179,20 +204,200 @@ assert_one_pm2_unit() {
   log_ok "pm2 systemd unit: ${units}"
 }
 
+# Publish a complete file or leave the previous one untouched.
+write_atomic_file() {
+  local dest="$1"
+  local mode="$2"
+  local content="$3"
+  local dir tmp
+  dir="$(dirname "$dest")"
+  mkdir -p "$dir"
+  tmp="$(mktemp "${dir}/.tmp.XXXXXX")"
+  if ! printf '%s\n' "$content" > "$tmp"; then
+    rm -f "$tmp"
+    log_error "failed to write ${dest}"
+    exit 1
+  fi
+  chmod "$mode" "$tmp"
+  mv -f "$tmp" "$dest"
+}
+
 # Drop-in, not the unit: `pm2 startup` rewrites the unit and would drop any
-# edit. RequiresMountsFor the configured data root so resurrect does not race
+# edit. RequiresMountsFor the configured data root so boot does not race
 # the EBS mount. fstab keeps nofail so a missing volume still boots.
+# COLLAB_SYSTEMD_ETC is a test seam; production stays on /etc.
 write_pm2_data_mount_dropin() {
   local unit="pm2-${DEPLOY_USER}.service"
   local dropin_dir="/etc/systemd/system/${unit}.d"
+  if [[ -n "${COLLAB_SYSTEMD_ETC:-}" ]]; then
+    dropin_dir="${COLLAB_SYSTEMD_ETC}/${unit}.d"
+  fi
   mkdir -p "$dropin_dir"
-  cat > "${dropin_dir}/data-mount.conf" <<EOF
+  local tmp
+  tmp="$(mktemp "${dropin_dir}/data-mount.conf.XXXXXX")"
+  cat > "$tmp" <<EOF
 [Unit]
 RequiresMountsFor=${COLLAB_DATA_ROOT}
 EOF
-  systemctl daemon-reload >/dev/null 2>&1 || true
+  mv -f "$tmp" "${dropin_dir}/data-mount.conf"
   log_info "systemd drop-in ${dropin_dir}/data-mount.conf RequiresMountsFor=${COLLAB_DATA_ROOT}"
 }
+
+pm2_deploy_unit_path() {
+  local unit="pm2-${DEPLOY_USER}.service"
+  local etc="${COLLAB_SYSTEMD_ETC:-/etc/systemd/system}"
+  local lib="${COLLAB_SYSTEMD_LIB:-/lib/systemd/system}"
+  if [[ -f "${etc}/${unit}" ]]; then
+    printf '%s' "${etc}/${unit}"
+    return 0
+  fi
+  if [[ -f "${lib}/${unit}" ]]; then
+    printf '%s' "${lib}/${unit}"
+    return 0
+  fi
+  return 1
+}
+
+# User and PM2_HOME in the generated unit must be the deploy user's daemon.
+assert_unit_matches_deploy_daemon() {
+  local unit_path="$1"
+  local user_line="" line="" ok=0
+  user_line="$(grep -E '^User=' "$unit_path" | head -n 1 || true)"
+  if [[ "$user_line" != "User=${DEPLOY_USER}" ]]; then
+    log_error "pm2 unit User does not match deploy user ${DEPLOY_USER}: ${unit_path}"
+    exit 1
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      "Environment=PM2_HOME=${DEPLOY_HOME}/.pm2"|\
+      "Environment=\"PM2_HOME=${DEPLOY_HOME}/.pm2\""|\
+      "Environment=PM2_HOME=\"${DEPLOY_HOME}/.pm2\"")
+        ok=1
+        ;;
+    esac
+  done < "$unit_path"
+  if [[ "$ok" -ne 1 ]]; then
+    log_error "pm2 unit PM2_HOME does not match ${DEPLOY_HOME}/.pm2: ${unit_path}"
+    exit 1
+  fi
+}
+
+# Binary recorded by pm2 startup on this unit. Not `pm2` from a different home.
+pm2_bin_from_unit() {
+  local unit_path="$1"
+  local line="" rest="" token=""
+  line="$(grep -E '^ExecStart=.+' "$unit_path" | head -n 1 || true)"
+  if [[ -z "$line" ]]; then
+    return 1
+  fi
+  rest="${line#ExecStart=}"
+  rest="${rest#"${rest%%[![:space:]]*}"}"
+  if [[ "$rest" == \"* ]]; then
+    token="${rest:1}"
+    token="${token%%\"*}"
+  else
+    token="${rest%%[[:space:]]*}"
+  fi
+  if [[ "$token" == /* && -x "$token" && "$token" != *pm2-start-fixed.sh ]]; then
+    printf '%s' "$token"
+    return 0
+  fi
+  return 1
+}
+
+quote_exec_arg() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
+
+install_pm2_fixed_helper() {
+  local lib_dir="/usr/local/lib/collab"
+  local src="${SCRIPT_DIR}/pm2-start-fixed.sh"
+  local dest
+  if [[ -n "${COLLAB_LIB_DIR:-}" ]]; then
+    lib_dir="$COLLAB_LIB_DIR"
+  fi
+  if [[ ! -f "$src" ]]; then
+    log_error "pm2 fixed helper is missing: ${src}"
+    exit 1
+  fi
+  dest="${lib_dir}/pm2-start-fixed.sh"
+  mkdir -p "$lib_dir"
+  local tmp
+  tmp="$(mktemp "${lib_dir}/pm2-start-fixed.sh.XXXXXX")"
+  cp "$src" "$tmp"
+  chmod 0755 "$tmp"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    chown root: "$tmp"
+  fi
+  mv -f "$tmp" "$dest"
+  log_info "installed ${dest}"
+}
+
+# Clears the startup ExecStart (resurrect) and starts the two canonical configs.
+# Does not set Type, PIDFile, User, ExecStop, or ExecReload.
+write_pm2_fixed_configs_dropin() {
+  local pm2_bin="$1"
+  local unit="pm2-${DEPLOY_USER}.service"
+  local dropin_dir="/etc/systemd/system/${unit}.d"
+  local lib_dir="/usr/local/lib/collab"
+  local helper apps messages body exec_line
+  if [[ -n "${COLLAB_SYSTEMD_ETC:-}" ]]; then
+    dropin_dir="${COLLAB_SYSTEMD_ETC}/${unit}.d"
+  fi
+  if [[ -n "${COLLAB_LIB_DIR:-}" ]]; then
+    lib_dir="$COLLAB_LIB_DIR"
+  fi
+  helper="${lib_dir}/pm2-start-fixed.sh"
+  apps="${COLLAB_DATA_ROOT}/mls-base/pm2.config.js"
+  messages="${COLLAB_DATA_ROOT}/msg.collab.codes/pm2.config.js"
+  exec_line="ExecStart=$(quote_exec_arg "$helper") $(quote_exec_arg "$pm2_bin") $(quote_exec_arg "$apps") $(quote_exec_arg "$messages")"
+  body="[Service]
+ExecStart=
+${exec_line}
+TimeoutStopSec=900s"
+  write_atomic_file "${dropin_dir}/fixed-configs.conf" 0644 "$body"
+  log_info "systemd drop-in ${dropin_dir}/fixed-configs.conf"
+}
+
+reload_and_validate_pm2_unit() {
+  local unit="pm2-${DEPLOY_USER}.service"
+  if ! systemctl daemon-reload; then
+    log_error "systemctl daemon-reload failed"
+    exit 1
+  fi
+  if ! systemd-analyze verify "$unit"; then
+    log_error "systemd-analyze verify failed for ${unit}"
+    exit 1
+  fi
+}
+
+apply_pm2_fixed_startup() {
+  local unit_path="" pm2_bin=""
+  if ! unit_path="$(pm2_deploy_unit_path)"; then
+    log_error "pm2 systemd unit for ${DEPLOY_USER} is missing"
+    exit 1
+  fi
+  assert_unit_matches_deploy_daemon "$unit_path"
+  if ! pm2_bin="$(pm2_bin_from_unit "$unit_path")"; then
+    log_error "effective pm2 binary is missing from ${unit_path}"
+    exit 1
+  fi
+  install_pm2_fixed_helper
+  write_pm2_data_mount_dropin
+  write_pm2_fixed_configs_dropin "$pm2_bin"
+  reload_and_validate_pm2_unit
+}
+
+# Existing unit only: helper, both drop-ins, daemon-reload, verify.
+# No npm install, pm2 startup, root migration, kill/save/reload/restart, or logrotate.
+if [[ "$STARTUP_ONLY" -eq 1 ]]; then
+  apply_pm2_fixed_startup
+  log_ok "PM2 fixed startup drop-ins applied for ${DEPLOY_USER}"
+  exit 0
+fi
 
 # ── Register PM2 as a systemd service for the deploy user ─────────────────────
 # 'pm2 startup' writes the unit; it must run as root with -u/--hp of the
@@ -202,7 +407,7 @@ mkdir -p "${DEPLOY_HOME}/.pm2"
 chown "${DEPLOY_USER}:" "${DEPLOY_HOME}/.pm2" 2>/dev/null || true
 env PATH="$PATH:/usr/bin" pm2 startup systemd -u "$DEPLOY_USER" --hp "$DEPLOY_HOME" || \
   log_warn "pm2 startup returned non-zero (may already be configured)"
-write_pm2_data_mount_dropin
+apply_pm2_fixed_startup
 
 if ! migrate_pm2_root_if_needed; then
   exit 1
