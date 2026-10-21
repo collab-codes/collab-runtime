@@ -395,6 +395,52 @@ function receiptFrom(bootId, phase, confirmed, seen) {
  * @param {object} options
  * @returns {Promise<number>}
  */
+/**
+ * Pids in the unit cgroup that descend from rootPid: the helper's own lock holder (flock, node -e) and the
+ * pm2 kill it spawned. They are control, not service processes left behind.
+ * @param {object} io
+ * @param {string} unitCgroup
+ * @param {number} rootPid
+ * @returns {number[]}
+ */
+export function ownDescendants(io, unitCgroup, rootPid) {
+  if (!Number.isInteger(rootPid) || rootPid <= 1 || typeof io.listCgroupPids !== "function") {
+    return [];
+  }
+  let pids;
+  try {
+    pids = io.listCgroupPids(unitCgroup);
+  } catch {
+    return [];
+  }
+  const parentOf = (pid) => {
+    try {
+      const statText = String(io.readFile(`/proc/${pid}/stat`));
+      const close = statText.lastIndexOf(")");
+      const parent = Number(statText.slice(close + 1).trim().split(/\s+/)[1]);
+      return Number.isInteger(parent) ? parent : 0;
+    } catch {
+      return 0;
+    }
+  };
+  const out = [];
+  for (const pid of Array.isArray(pids) ? pids : []) {
+    let current = pid;
+    for (let hop = 0; hop < 32 && current > 1; hop += 1) {
+      const parent = parentOf(current);
+      if (parent === rootPid) {
+        out.push(pid);
+        break;
+      }
+      if (parent === current || parent <= 1) {
+        break;
+      }
+      current = parent;
+    }
+  }
+  return out;
+}
+
 /** Pids excluded from the service inventory: the control chain when known, else the helper itself. */
 function controlPidsOf(options) {
   const list = Array.isArray(options.controlPids) && options.controlPids.length > 0 ? options.controlPids : [options.helperPid];
@@ -429,6 +475,12 @@ export async function stopPm2(options) {
     /** @type {ReturnType<typeof observeTarget>|null} */
     let obs = null;
     try {
+      const descendants = ownDescendants(io, options.unitCgroup, options.helperPid);
+      for (const pid of descendants) {
+        if (!exclude.includes(pid)) {
+          exclude.push(pid);
+        }
+      }
       obs = observeTarget({ ...options, excludePids: exclude.filter((pid) => Number.isInteger(pid) && pid > 0) }, jlistAllowed);
     } catch (error) {
       const wrapped = asObsError(error);
@@ -715,7 +767,7 @@ export async function guardPm2(options) {
   let obs;
   try {
     receipt = readReceipt(io, options.pm2Home);
-    obs = observeTarget({ ...options, excludePids: controlPidsOf(options) }, false);
+    obs = observeTarget({ ...options, excludePids: [...controlPidsOf(options), ...ownDescendants(io, options.unitCgroup, options.helperPid)] }, false);
   } catch (error) {
     const wrapped = asObsError(error);
     logLine(io, `guard refused error=${wrapped.kind}`);

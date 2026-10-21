@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   controlChain,
+  ownDescendants,
   environMatchesHome,
   guardPm2,
   observeTarget,
@@ -403,4 +404,37 @@ test("guard excludes its own control chain (helper bash, flock, bash -c) but not
   box.procs.set(200, { stat: statWithParent(200, 1, 4000), status: status(1000), environ: environ() });
   box.cgroup.add(200);
   assert.equal(await guardPm2(base(box.io, { helperPid: 103, controlPids: chain })), 1);
+});
+
+test("stop does not wait for its own lock holder (flock and node -e children of the helper)", async () => {
+  // Measured on Lima 21/10: the stop counted its own flock/node -e lock holder as service and always timed out.
+  const withParent = (pid, ppid, startTime) =>
+    `${pid} (node) S ${ppid} 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 ${startTime}\n`;
+  const box = world();
+  const HELPER = 500;
+  box.cgroup.delete(1); // world() puts the default helper (pid 1) in the cgroup; here the helper is 500
+  box.procs.set(HELPER, { stat: withParent(HELPER, 1, 100), status: status(1000), environ: environ() });
+  for (const [pid, ppid] of [[501, HELPER], [502, 501]]) {
+    box.procs.set(pid, { stat: withParent(pid, ppid, 200 + pid), status: status(1000), environ: environ() });
+    box.cgroup.add(pid);
+  }
+  box.cgroup.add(HELPER);
+  assert.deepEqual(ownDescendants(box.io, UNIT, HELPER).sort(), [501, 502]);
+  let sleeps = 0;
+  const inner = box.io.sleep.bind(box.io);
+  box.io.sleep = async (ms) => {
+    sleeps += 1;
+    if (sleeps === 1) {
+      box.finish(0);
+      box.procs.delete(10);
+      box.procs.delete(11);
+      box.files.delete(`${PM2_HOME}/pm2.pid`);
+      box.cgroup.delete(10);
+      box.cgroup.delete(11);
+    }
+    await inner(ms);
+  };
+  // The lock holder 501/502 stays alive for the whole stop; only the service (10, 11) leaves.
+  assert.equal(await stopPm2(base(box.io, { helperPid: HELPER, controlPids: [HELPER] })), 0);
+  assert.equal(box.receipt().confirmed, true);
 });
