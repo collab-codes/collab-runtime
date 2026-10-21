@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { admitShutdown, readShutdownState } from "./shutdown-state.mjs";
-import { failsafePlan, prepare, run } from "./shutdown-worker.mjs";
+import { discoverPm2, execWith, failsafePlan, prepare, productionDeps, readFailsafeWith, run } from "./shutdown-worker.mjs";
 
 const BOOT = "boot-a";
 const OTHER = "boot-b";
@@ -393,4 +393,84 @@ test("start --no-block exit 0 alone is not acceptance: the unit must be seen act
   assert.equal(notRunning.ok, false);
   assert.equal(notRunning.reason, "unit_not_running");
   assert.equal((await startUnitWith(runner([], 1).run, noSleep)).reason, "start_refused");
+});
+
+const FIXED_EXEC = "{ path=/usr/local/lib/collab/pm2-start-fixed.sh ; argv[]=/usr/local/lib/collab/pm2-start-fixed.sh /usr/lib/node_modules/pm2/bin/pm2 /data/mls-base/pm2.config.js ; }";
+
+function systemdFake(units) {
+  const calls = [];
+  const run = async (argv) => {
+    calls.push(argv.slice());
+    if (argv[1] === "list-units") {
+      return { code: 0, stdout: Object.keys(units).map((unit) => `${unit} loaded active running PM2\n`).join("") };
+    }
+    if (argv[1] === "show" && argv[2].endsWith(".timer")) return { code: 0, stdout: "inactive\n" };
+    if (argv[1] === "show") {
+      const unit = units[argv[2]];
+      if (!unit) return { code: 1, stdout: "" };
+      return { code: 0, stdout: `ExecStart=${unit.exec}\nUser=${unit.user ?? ""}\nEnvironment=${unit.env ?? ""}\n` };
+    }
+    return { code: 1, stdout: "" };
+  };
+  return { run, calls };
+}
+
+test("production deps read the boot id, the env path and the business pm2 from systemd", async () => {
+  const logs = [];
+  const { run } = systemdFake({
+    "pm2-root.service": { exec: "{ path=/usr/lib/node_modules/pm2/bin/pm2 ; argv[]=pm2 resurrect ; }" },
+    "pm2-ana.service": { exec: FIXED_EXEC, user: "ana", env: "PATH=/usr/bin PM2_HOME=/home/ana.guest/.pm2" },
+  });
+  const deps = await productionDeps({ run, readBootId: () => "boot-real", log: (line) => logs.push(line) });
+  assert.equal(deps.bootId, "boot-real");
+  assert.equal(deps.envPath, "/etc/collab/sites-agent.env");
+  assert.deepEqual(deps.pm2, { user: "ana", home: "/home/ana.guest/.pm2" });
+  for (const key of ["now", "mono", "exec", "sleep", "log", "readFailsafe"]) assert.equal(typeof deps[key], "function", key);
+  const a = deps.mono();
+  assert.ok(Number.isInteger(a) && a > 0);
+  const echoed = await deps.exec(["/bin/echo", "hi"], { timeoutMs: 5_000 });
+  assert.equal(echoed.code, 0);
+  assert.equal(echoed.stdout, "hi\n");
+  assert.equal(await deps.readFailsafe({ unit: "collab-shutdown-failsafe-x", atMs: 5 }), null);
+  assert.ok(logs.some((line) => line.includes("unit=pm2-ana.service")));
+});
+
+test("zero, two or an incomplete pm2 unit leave the target unknown and say why", async () => {
+  const cases = [
+    [{}, "pm2_unit_absent"],
+    [{
+      "pm2-a.service": { exec: FIXED_EXEC, user: "a", env: "PM2_HOME=/home/a/.pm2" },
+      "pm2-b.service": { exec: FIXED_EXEC, user: "b", env: "PM2_HOME=/home/b/.pm2" },
+    }, "pm2_unit_ambiguous"],
+    [{ "pm2-a.service": { exec: FIXED_EXEC, user: "a", env: "PATH=/usr/bin" } }, "pm2_unit_incomplete"],
+  ];
+  for (const [units, reason] of cases) {
+    assert.equal((await discoverPm2(systemdFake(units).run)).reason, reason);
+    const logs = [];
+    const deps = await productionDeps({ run: systemdFake(units).run, readBootId: () => "b", log: (line) => logs.push(line) });
+    assert.deepEqual(deps.pm2, {});
+    assert.ok(logs.some((line) => line.includes(`result=${reason}`)), reason);
+  }
+});
+
+test("a restarted worker sees the timer it armed instead of arming a second one", async () => {
+  const run = async () => ({ code: 0, stdout: "active\n" });
+  assert.deepEqual(await readFailsafeWith(run, { unit: "collab-shutdown-failsafe-x", atMs: 77 }), { atMs: 77 });
+});
+
+test("the exec adapter honors timeoutMs in the options object and the abort signal", async () => {
+  const exec = execWith(spawn);
+  const ok = await exec(["/bin/echo", "hi"], { timeoutMs: 5_000 });
+  assert.equal(ok.code, 0);
+  assert.equal(ok.stdout, "hi\n");
+  const started = Date.now();
+  const slow = await exec(["/bin/sleep", "5"], { timeoutMs: 200 });
+  assert.equal(slow.code, null);
+  assert.equal(slow.timeout, true);
+  assert.ok(Date.now() - started < 3_000);
+  const controller = new AbortController();
+  const pending = exec(["/bin/sleep", "5"], { timeoutMs: 10_000, signal: controller.signal });
+  setTimeout(() => controller.abort(), 100);
+  const aborted = await pending;
+  assert.equal(aborted.aborted, true);
 });

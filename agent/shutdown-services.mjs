@@ -27,8 +27,8 @@ const USER_RE = /^[A-Za-z0-9_.-]{1,32}$/;
  * @param {() => number} deps.now
  * @param {() => number} deps.mono
  * @param {AbortSignal} [deps.signal]
- * @param {string} deps.pm2User
- * @param {string} deps.pm2Home
+ * @param {string} [deps.pm2User] unknown or invalid: pm2 inventory is unconfirmed
+ * @param {string} [deps.pm2Home]
  * @param {string} [deps.bootId]
  * @param {(line: string) => void} [deps.log]
  * @param {(intent: object) => Promise<void>} deps.persist
@@ -118,8 +118,12 @@ function assertDeps(deps) {
   if (!Number.isFinite(deps.selfDeadlineAt)) throw new TypeError("selfDeadlineAt");
   if (typeof deps.now !== "function" || typeof deps.mono !== "function") throw new TypeError("clock");
   if (typeof deps.persist !== "function" || typeof deps.exec !== "function") throw new TypeError("io");
-  if (!USER_RE.test(deps.pm2User)) throw new TypeError("pm2User");
-  if (!PM2_HOME_RE.test(deps.pm2Home)) throw new TypeError("pm2Home");
+}
+
+// An unknown pm2 target is an unconfirmed inventory, not an exception: the
+// report still freezes, the heartbeat still goes and the halt still happens.
+function pm2TargetKnown(deps) {
+  return USER_RE.test(deps.pm2User ?? "") && PM2_HOME_RE.test(deps.pm2Home ?? "");
 }
 
 function remainingMs(deps, origin) {
@@ -274,6 +278,7 @@ async function observePostgresql(deps, origin, log, allowStop) {
 }
 
 async function readPm2(deps, origin) {
+  if (!pm2TargetKnown(deps)) return { ok: false, processes: [] };
   const ran = await runObserve(deps, origin, pm2Argv(deps, "jlist"));
   if (ran.kind !== "ok" || ran.code !== 0) return { ok: false, processes: [] };
   let parsed;

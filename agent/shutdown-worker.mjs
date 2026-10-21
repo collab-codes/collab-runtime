@@ -6,8 +6,10 @@ import https from "node:https";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
 import {
+  DEFAULT_ENV_PATH,
   HEARTBEAT_ORIGIN,
   buildHeartbeatBody,
+  currentBootId,
   loadConfig,
   sendHeartbeat,
 } from "./collab-sites-agent.mjs";
@@ -418,6 +420,111 @@ function runArgv(argv, timeoutMs) {
   });
 }
 
+/**
+ * Adapter for the services module: `exec(argv, { timeoutMs, signal })`.
+ * Kills the child on timeout or abort and never rejects.
+ */
+export function execWith(spawnFn) {
+  return (argv, { timeoutMs, signal } = {}) => new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve({ code: null, stdout: "", aborted: true });
+      return;
+    }
+    const child = spawnFn(argv[0], argv.slice(1), { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let done = false;
+    let timer = null;
+    const onAbort = () => {
+      child.kill("SIGKILL");
+      finish({ code: null, stdout, aborted: true });
+    };
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(result);
+    };
+    timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish({ code: null, stdout, timeout: true });
+    }, Math.max(1, Number(timeoutMs) || 10_000));
+    signal?.addEventListener("abort", onAbort, { once: true });
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.on("error", () => finish({ code: null, stdout }));
+    child.on("close", (code) => finish({ code, stdout }));
+  });
+}
+
+function showProps(stdout) {
+  const props = {};
+  for (const line of String(stdout ?? "").split("\n")) {
+    const at = line.indexOf("=");
+    if (at > 0) props[line.slice(0, at)] = line.slice(at + 1);
+  }
+  return props;
+}
+
+/**
+ * The business pm2 is the one systemd boots through pm2-start-fixed.sh (rt112).
+ * User and PM2_HOME come from the unit; the home cannot be derived from the user.
+ * Zero or several such units is `reason`, never a guess.
+ */
+export async function discoverPm2(run) {
+  const listed = await run(
+    ["systemctl", "list-units", "--type=service", "--all", "--no-legend", "--plain", "pm2-*.service"],
+    10_000,
+  );
+  if (listed.code !== 0) return { reason: "pm2_units_unreadable" };
+  const units = String(listed.stdout ?? "")
+    .split("\n")
+    .map((line) => line.trim().split(/\s+/)[0])
+    .filter((unit) => /^pm2-[A-Za-z0-9_.@-]+\.service$/.test(unit));
+  const matches = [];
+  for (const unit of units) {
+    const shown = await run(["systemctl", "show", unit, "-p", "ExecStart", "-p", "User", "-p", "Environment"], 10_000);
+    if (shown.code !== 0) return { reason: "pm2_unit_unreadable", unit };
+    const props = showProps(shown.stdout);
+    if (!String(props.ExecStart ?? "").includes("pm2-start-fixed.sh")) continue;
+    const homeEntry = String(props.Environment ?? "").split(/\s+/).find((item) => item.startsWith("PM2_HOME="));
+    matches.push({ unit, user: props.User ?? "", home: homeEntry ? homeEntry.slice("PM2_HOME=".length) : "" });
+  }
+  if (matches.length === 0) return { reason: "pm2_unit_absent" };
+  if (matches.length > 1) return { reason: "pm2_unit_ambiguous" };
+  const [match] = matches;
+  if (!match.user || !match.home) return { reason: "pm2_unit_incomplete", unit: match.unit };
+  return { unit: match.unit, user: match.user, home: match.home };
+}
+
+/** A restarted worker keeps the timer it armed: same unit name, same request, same atMs. */
+export async function readFailsafeWith(run, plan) {
+  const shown = await run(["systemctl", "show", `${plan.unit}.timer`, "-p", "ActiveState", "--value"], 5_000);
+  if (shown.code === 0 && String(shown.stdout ?? "").trim() === "active") return { atMs: plan.atMs };
+  return null;
+}
+
+/** Host dependencies of the installed CLI. Tests inject `io`; the CLI passes nothing. */
+export async function productionDeps(io = {}) {
+  const run = io.run ?? runArgv;
+  const log = io.log ?? ((line) => process.stderr.write(`${line}\n`));
+  const pm2 = await discoverPm2(run);
+  if (pm2.reason) log(`stage=pm2-target result=${pm2.reason}${pm2.unit ? ` unit=${pm2.unit}` : ""}`);
+  else log(`stage=pm2-target unit=${pm2.unit} user=${pm2.user} home=${pm2.home}`);
+  return {
+    bootId: currentBootId(io),
+    envPath: DEFAULT_ENV_PATH,
+    now: () => Date.now(),
+    mono: () => Number(process.hrtime.bigint() / 1000000n),
+    exec: execWith(io.spawn ?? spawn),
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    log,
+    pm2: pm2.reason ? {} : { user: pm2.user, home: pm2.home },
+    readFailsafe: (plan) => readFailsafeWith(run, plan),
+  };
+}
+
 function isCliEntry() {
   const entry = process.argv[1];
   if (!entry) return false;
@@ -426,12 +533,11 @@ function isCliEntry() {
 
 if (isCliEntry()) {
   const [command, ...argv] = process.argv.slice(2);
-  const action = command === "prepare" ? prepare(argv) : command === "run" ? run() : null;
-  if (!action) {
+  if (command !== "prepare" && command !== "run") {
     console.error("usage: shutdown-worker.mjs <prepare|run>");
     process.exit(2);
   }
-  action.then((result) => {
+  productionDeps().then((deps) => (command === "prepare" ? prepare(argv, deps) : run(deps))).then((result) => {
     process.stdout.write(`${JSON.stringify(result)}\n`);
     const halted = result.result === "halt_requested" && result.poweroffCode === 0;
     const ok = result.result === "accepted" || result.result === "existing" || result.result === "stale_boot" || result.result === "absent" || halted;

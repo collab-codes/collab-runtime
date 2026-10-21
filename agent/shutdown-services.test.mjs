@@ -302,3 +302,15 @@ test("a bad unit name from list-units is unconfirmed and not stopped", async () 
   assert.ok(report.notStopped.includes("postgresql"));
   assert.equal(h.calls.some((argv) => argv[1] === "stop" && String(argv[2] || "").includes("bad")), false);
 });
+
+test("an unknown pm2 target is an unconfirmed inventory, not an exception", async () => {
+  for (const target of [{ pm2User: undefined, pm2Home: undefined }, { pm2User: "collab", pm2Home: "" }]) {
+    const h = harness(target);
+    const report = await stopServices(h.deps);
+    assert.equal(report.servicesStopped, false);
+    assert.ok(report.notStopped.includes("pm2"));
+    assert.equal(h.calls.some((argv) => argv.includes("jlist") || argv.includes("pm2")), false);
+    const redisStop = h.calls.some((argv) => argv[1] === "stop" && argv[2] === "redis-server.service");
+    assert.equal(redisStop, false, "redis is only observed while apps are unconfirmed");
+  }
+});
