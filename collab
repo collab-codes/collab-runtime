@@ -10,6 +10,7 @@
 #   collab update --check
 #   collab update --apply
 #   collab update
+#   sudo collab vm shutdown --request-id <uuid> --deadline <ISO-8601 UTC>
 set -euo pipefail
 
 COLLAB_LOG_DIR="/var/log/collab"
@@ -489,6 +490,88 @@ cmd_msg() {
   esac
 }
 
+# ── Subcommand: vm ─────────────────────────────────────────────────────────────
+# Admission only. The installed worker returns after the unit is confirmed;
+# this lock is not held while services drain.
+SHUTDOWN_WORKER="/usr/local/lib/collab-sites-agent/shutdown-worker.mjs"
+SHUTDOWN_ADMIT_LOCK="/run/collab-shutdown-admit.lock"
+
+vm_shutdown_args_ok() {
+  local seen_id=0
+  local seen_deadline=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --request-id)
+        if [[ "$seen_id" -eq 1 || -z "${2:-}" || "$2" == --* ]]; then
+          return 1
+        fi
+        seen_id=1
+        shift 2
+        ;;
+      --deadline)
+        if [[ "$seen_deadline" -eq 1 || -z "${2:-}" || "$2" == --* ]]; then
+          return 1
+        fi
+        seen_deadline=1
+        shift 2
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  done
+  [[ "$seen_id" -eq 1 && "$seen_deadline" -eq 1 ]]
+}
+
+cmd_vm() {
+  local mode="${1:-}"
+  case "$mode" in
+    shutdown)
+      shift
+      if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+        echo "[ERR]  'collab vm shutdown' must be run as root. Use: sudo collab vm shutdown --request-id <uuid> --deadline <ISO-8601 UTC>" >&2
+        exit 1
+      fi
+      if [[ ! -f "$SHUTDOWN_WORKER" ]]; then
+        echo "[ERR]  Installed shutdown worker not found: ${SHUTDOWN_WORKER}" >&2
+        echo "[ERR]  Run scripts/install-shutdown.sh --maintenance-only. This command does not fall back to a checkout or a caller-supplied script." >&2
+        exit 1
+      fi
+      if ! vm_shutdown_args_ok "$@"; then
+        echo "[ERR]  Usage: collab vm shutdown --request-id <uuid> --deadline <ISO-8601 UTC>" >&2
+        exit 2
+      fi
+      if ! command -v flock >/dev/null 2>&1; then
+        echo "[ERR]  flock is required to admit a shutdown request" >&2
+        exit 1
+      fi
+      if [[ ! -d /run ]]; then
+        echo "[ERR]  /run is not available for the admission lock" >&2
+        exit 1
+      fi
+      exec 9>"$SHUTDOWN_ADMIT_LOCK"
+      chmod 600 "$SHUTDOWN_ADMIT_LOCK" || true
+      flock -x 9
+      exec node "$SHUTDOWN_WORKER" prepare "$@"
+      ;;
+    "")
+      echo ""
+      echo -e "${C_BOLD}collab vm${C_RESET} — requires a subcommand:"
+      echo ""
+      echo "  collab vm shutdown --request-id <uuid> --deadline <ISO-8601 UTC>"
+      echo "      Admit one shutdown request as root and start collab-shutdown.service."
+      echo "      The installed worker is /usr/local/lib/collab-sites-agent/shutdown-worker.mjs."
+      echo ""
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: ${mode}" >&2
+      echo "Usage: collab vm shutdown --request-id <uuid> --deadline <ISO-8601 UTC>" >&2
+      exit 1
+      ;;
+  esac
+}
+
 # ── Usage / help ───────────────────────────────────────────────────────────────
 cmd_help() {
   echo ""
@@ -507,6 +590,7 @@ cmd_help() {
   echo "  msg configure        Write appconfig.json from Parameter Store (requires sudo)"
   echo "  msg vapid init|show  Create or show the org VAPID public key"
   echo "  msg status          Show collab-messages version and pm2 state"
+  echo "  vm shutdown         Admit an ordered shutdown as root (installed worker only)"
   echo "  help                Show this help message"
   echo ""
   echo "Examples:"
@@ -516,6 +600,7 @@ cmd_help() {
   echo "  collab logs --detail"
   echo "  collab update --check"
   echo "  sudo collab update --apply"
+  echo "  sudo collab vm shutdown --request-id <uuid> --deadline 2026-10-22T03:00:00.000Z"
   echo ""
 }
 
@@ -530,6 +615,7 @@ case "$COMMAND" in
   doctor)   cmd_doctor   "$@" ;;
   update)  cmd_update "$@" ;;
   msg)      cmd_msg      "$@" ;;
+  vm)       cmd_vm       "$@" ;;
   help|--help|-h) cmd_help ;;
   *)
     echo "Unknown command: ${COMMAND}" >&2

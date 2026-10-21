@@ -372,3 +372,25 @@ test("service observation persists before the stop and does not call the host", 
     await fx.cleanup();
   }
 });
+
+test("start --no-block exit 0 alone is not acceptance: the unit must be seen activating or active", async () => {
+  const { startUnitWith } = await import("./shutdown-worker.mjs");
+  const runner = (states, startCode = 0) => {
+    const calls = [];
+    const run = async (argv) => {
+      calls.push(argv.join(" "));
+      if (argv[1] === "start") return { code: startCode, stdout: "" };
+      return { code: 0, stdout: `${states.shift() ?? "inactive"}\n` };
+    };
+    return { run, calls };
+  };
+  const noSleep = async () => {};
+  const ok = runner(["inactive", "activating"]);
+  assert.equal((await startUnitWith(ok.run, noSleep)).ok, true);
+  assert.equal((await startUnitWith(runner(["failed"]).run, noSleep)).ok, false);
+  const never = runner([]);
+  const notRunning = await startUnitWith(never.run, noSleep, 3, 0);
+  assert.equal(notRunning.ok, false);
+  assert.equal(notRunning.reason, "unit_not_running");
+  assert.equal((await startUnitWith(runner([], 1).run, noSleep)).reason, "start_refused");
+});

@@ -325,10 +325,26 @@ function isRoot(deps) {
 }
 
 export function defaultStartUnit() {
-  return runArgv(["systemctl", "start", "--no-block", SHUTDOWN_UNIT], 10_000).then((result) => ({
-    ok: result.code === 0,
-    code: result.code,
-  }));
+  return startUnitWith(runArgv, (ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+}
+
+/**
+ * `systemctl start --no-block` exit 0 only means the job was queued; it can still be refused or fail.
+ * Accepted only once the unit is seen activating or active within a short window.
+ * @param {(argv: string[], timeoutMs: number) => Promise<{code: number|null, stdout?: string}>} run
+ * @param {(ms: number) => Promise<void>} sleep
+ */
+export async function startUnitWith(run, sleep, attempts = 10, intervalMs = 500) {
+  const queued = await run(["systemctl", "start", "--no-block", SHUTDOWN_UNIT], 10_000);
+  if (queued.code !== 0) return { ok: false, code: queued.code, reason: "start_refused" };
+  for (let i = 0; i < attempts; i += 1) {
+    const shown = await run(["systemctl", "show", SHUTDOWN_UNIT, "-p", "ActiveState", "--value"], 5_000);
+    const state = String(shown.stdout ?? "").trim();
+    if (shown.code === 0 && (state === "activating" || state === "active")) return { ok: true, code: 0, state };
+    if (shown.code === 0 && state === "failed") return { ok: false, code: 0, state, reason: "unit_failed" };
+    await sleep(intervalMs);
+  }
+  return { ok: false, code: 0, reason: "unit_not_running" };
 }
 
 export function defaultArmFailsafe(plan) {
