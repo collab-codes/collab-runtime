@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  controlChain,
   environMatchesHome,
   guardPm2,
   observeTarget,
@@ -379,4 +380,27 @@ test("daemon without rpc is an error and does not spawn a cli", async () => {
   assert.equal(box.jlistCalls.length, 0);
   assert.equal(box.receipt().confirmed, false);
   assert.equal(box.logs.join("\n").includes(SECRET), false);
+});
+
+test("guard excludes its own control chain (helper bash, flock, bash -c) but not other unit processes", async () => {
+  // Measured on Lima 21/10: inside the unit, the guard saw its parent helper bash and refused every start.
+  const statWithParent = (pid, ppid, startTime) =>
+    `${pid} (bash) S ${ppid} 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 ${startTime}\n`;
+  const box = world();
+  box.files.delete(`${PM2_HOME}/pm2.pid`);
+  box.rpc = false;
+  box.cgroup.clear();
+  for (const [pid, ppid, start] of [[100, 1, 3000], [101, 100, 3001], [102, 101, 3002], [103, 102, 3003]]) {
+    box.procs.set(pid, { stat: statWithParent(pid, ppid, start), status: status(1000), environ: environ() });
+    box.cgroup.add(pid);
+  }
+  assert.deepEqual(controlChain(box.io, 103), [103, 102, 101, 100]);
+  const chain = controlChain(box.io, 103);
+  assert.equal(await guardPm2(base(box.io, { helperPid: 103, controlPids: chain })), 0);
+  // Only the guard itself excluded (the old behavior): the helper chain looks like a leftover and blocks.
+  assert.equal(await guardPm2(base(box.io, { helperPid: 103, controlPids: [103] })), 1);
+  // A real leftover outside the chain still blocks the start.
+  box.procs.set(200, { stat: statWithParent(200, 1, 4000), status: status(1000), environ: environ() });
+  box.cgroup.add(200);
+  assert.equal(await guardPm2(base(box.io, { helperPid: 103, controlPids: chain })), 1);
 });

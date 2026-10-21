@@ -395,13 +395,19 @@ function receiptFrom(bootId, phase, confirmed, seen) {
  * @param {object} options
  * @returns {Promise<number>}
  */
+/** Pids excluded from the service inventory: the control chain when known, else the helper itself. */
+function controlPidsOf(options) {
+  const list = Array.isArray(options.controlPids) && options.controlPids.length > 0 ? options.controlPids : [options.helperPid];
+  return list.filter((pid) => Number.isInteger(pid) && pid > 0);
+}
+
 export async function stopPm2(options) {
   const io = options.io;
   const deadlineMs = options.deadlineMs ?? STOP_DEADLINE_MS;
   const pollMs = options.pollMs ?? DEFAULT_POLL_MS;
   const started = io.now();
   const deadline = started + deadlineMs;
-  const exclude = [options.helperPid];
+  const exclude = controlPidsOf(options);
   /** @type {Map<string, ProcIdentity>} */
   const seen = new Map();
   /** @type {{ pid: number, finished: Promise<number> }|null} */
@@ -709,7 +715,7 @@ export async function guardPm2(options) {
   let obs;
   try {
     receipt = readReceipt(io, options.pm2Home);
-    obs = observeTarget({ ...options, excludePids: [options.helperPid].filter((pid) => Number.isInteger(pid) && pid > 0) }, false);
+    obs = observeTarget({ ...options, excludePids: controlPidsOf(options) }, false);
   } catch (error) {
     const wrapped = asObsError(error);
     logLine(io, `guard refused error=${wrapped.kind}`);
@@ -905,7 +911,37 @@ function hostContext(io) {
     uid: process.getuid(),
     unitCgroup: ownUnitCgroup(io),
     helperPid: process.pid,
+    controlPids: controlChain(io, process.pid),
   };
+}
+
+/**
+ * The helper and the commands that launched it inside the unit: this process and its ancestors
+ * (start: helper bash, flock, bash -c). They are control, not service processes left behind.
+ * @param {object} io
+ * @param {number} pid
+ * @returns {number[]}
+ */
+export function controlChain(io, pid) {
+  const chain = [];
+  let current = pid;
+  for (let hop = 0; hop < 32 && Number.isInteger(current) && current > 1; hop += 1) {
+    chain.push(current);
+    let statText;
+    try {
+      statText = String(io.readFile(`/proc/${current}/stat`));
+    } catch {
+      break;
+    }
+    const close = statText.lastIndexOf(")");
+    const fields = close >= 0 ? statText.slice(close + 1).trim().split(/\s+/) : [];
+    const parent = Number(fields[1]);
+    if (!Number.isInteger(parent) || parent === current) {
+      break;
+    }
+    current = parent;
+  }
+  return chain;
 }
 
 function lockContext() {
