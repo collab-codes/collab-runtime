@@ -83,8 +83,10 @@ test("10 and 12 use resolve_deploy_user instead of SUDO_USER:-root", () => {
   assert.doesNotMatch(step12, /DEPLOY_USER="\$\{SUDO_USER:-root\}"/);
 });
 
-test("collab msg status talks to the deploy user's pm2", () => {
-  assert.match(cli, /run_as_deploy pm2 ls/);
+test("collab msg status reads the deploy user's pm2 through the passive reader", () => {
+  // rt123 s7: `pm2 ls` could spawn a daemon; the status reads the existing rpc.sock only.
+  assert.match(cli, /pm2-readonly\.mjs/);
+  assert.doesNotMatch(cli, /run_as_deploy pm2 ls/);
   assert.match(cli, /multiple pm2 systemd units/);
 });
 
