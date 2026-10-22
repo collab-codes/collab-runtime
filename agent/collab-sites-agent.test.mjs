@@ -16,8 +16,12 @@ import {
   loadConfig,
   meminfoMbFrom,
   parseEnvFile,
+  parsePm2Processes,
   pm2FactsFrom,
   pm2Jlist,
+  pm2UnitFromShow,
+  readBootFacts,
+  readPm2Unit,
   requestAllowed,
   routeStatusRequest,
   run,
@@ -181,40 +185,48 @@ test("heartbeat body keeps every field the sites server already consumes", async
 
 const INFRA_UP = { nginx: "active", postgresql: "active", redis: "active" };
 
-test("runtimeStatus is ready when there is no dump (VM without an app)", () => {
-  const pm2 = pm2FactsFrom(null, "[]");
+function withUnit(pm2, activeState, extra = {}) {
+  return { ...pm2, unit: { activeState, ...extra } };
+}
+
+test("runtimeStatus is ready when the unit is active and the VM has no apps", () => {
+  const pm2 = withUnit(pm2FactsFrom(null, "[]"), "active");
   assert.equal(pm2.dump, "absent");
+  assert.equal(pm2.live, "ok");
   assert.deepEqual(pm2.expected, []);
   assert.equal(runtimeStatusFrom(INFRA_UP, pm2), "ready");
 });
 
-test("runtimeStatus stays ready when the dump only has pm2-logrotate", () => {
-  const pm2 = pm2FactsFrom(JSON.stringify([{ name: "pm2-logrotate" }]), "[]");
+test("runtimeStatus stays ready when the only live module is pm2-logrotate", () => {
+  const pm2 = withUnit(pm2FactsFrom(JSON.stringify([{ name: "pm2-logrotate" }]), "[]"), "active");
   assert.equal(pm2.dump, "present");
   assert.deepEqual(pm2.expected, []);
   assert.equal(runtimeStatusFrom(INFRA_UP, pm2), "ready");
 });
 
-test("runtimeStatus is degraded when the dump expects apps and none are online", () => {
-  const pm2 = pm2FactsFrom(JSON.stringify([{ name: "app" }]), "[]");
-  assert.equal(pm2.dump, "present");
-  assert.deepEqual(pm2.expected, ["app"]);
-  assert.deepEqual(pm2.processes, [{ name: "app", status: "missing" }]);
-  assert.equal(runtimeStatusFrom(INFRA_UP, pm2), "degraded");
+test("a missing dump does not hide a failed, activating or inactive unit", () => {
+  for (const activeState of ["failed", "activating", "inactive", "unknown"]) {
+    const pm2 = withUnit(pm2FactsFrom(null, "[]"), activeState);
+    assert.equal(runtimeStatusFrom(INFRA_UP, pm2), "degraded");
+  }
 });
 
-test("runtimeStatus is degraded when an expected app is errored", () => {
-  const pm2 = pm2FactsFrom(
-    JSON.stringify([{ name: "app" }]),
-    JSON.stringify([{ name: "app", pm2_env: { status: "errored" } }]),
+test("runtimeStatus is degraded when a live process is not online even if the dump is gone", () => {
+  const pm2 = withUnit(
+    pm2FactsFrom(null, JSON.stringify([{ name: "app", pm2_env: { status: "errored" } }])),
+    "active",
   );
+  assert.equal(pm2.dump, "absent");
   assert.equal(runtimeStatusFrom(INFRA_UP, pm2), "degraded");
 });
 
-test("runtimeStatus is ready when dump apps are online", () => {
-  const pm2 = pm2FactsFrom(
-    JSON.stringify([{ name: "app" }, { name: "pm2-logrotate" }]),
-    JSON.stringify([{ name: "app", pm2_env: { status: "online" } }]),
+test("runtimeStatus is ready when the unit is active and live processes are online", () => {
+  const pm2 = withUnit(
+    pm2FactsFrom(
+      JSON.stringify([{ name: "app" }, { name: "pm2-logrotate" }]),
+      JSON.stringify([{ name: "app", pm2_env: { status: "online" } }]),
+    ),
+    "active",
   );
   assert.deepEqual(pm2.expected, ["app"]);
   assert.equal(runtimeStatusFrom(INFRA_UP, pm2), "ready");
@@ -321,9 +333,98 @@ test("default agent version is the Node rewrite", () => {
  * app e dominio em 502 (medido na 102056 em 23/09/2026). A guarda e' nao tocar no `pm2` enquanto o
  * daemon nao existir.
  */
-test("pm2Jlist nao invoca o pm2 quando o daemon nao existe (nao cria daemon no boot)", () => {
+test("pm2Jlist nao invoca o pm2 quando o daemon nao existe (nao cria daemon no boot)", async () => {
   const home = mkdtempSync(join(tmpdir(), "pm2home-"));
-  assert.equal(pm2Jlist(home), null);
+  let calls = 0;
+  assert.equal(await pm2Jlist(home, "ubuntu", { listPm2: async () => { calls += 1; return []; }, pm2Bin: "/usr/bin/pm2" }), null);
+  assert.equal(calls, 0);
+});
+
+test("pm2Jlist reads through the passive adapter and never spawns pm2", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pm2home-"));
+  writeFileSync(join(home, "rpc.sock"), "");
+  const seen = [];
+  const raw = await pm2Jlist(home, "ubuntu", {
+    pm2Bin: "/usr/local/bin/pm2",
+    listPm2: async (opts) => {
+      seen.push(opts);
+      return [{ name: "app", pid: 1, pm2_env: { status: "online", SECRET: "nope" } }];
+    },
+  });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].pm2Bin, "/usr/local/bin/pm2");
+  assert.equal(seen[0].pm2Home, home);
+  assert.equal(JSON.stringify(parsePm2Processes(raw)).includes("SECRET"), false);
+  assert.equal(await pm2Jlist(home, "root", { listPm2: async () => { throw new Error("spawn"); } }), null);
+  assert.equal(await pm2Jlist(home, "", { listPm2: async () => { throw new Error("spawn"); } }), null);
+});
+
+test("stale socket and a disappearing daemon stay unavailable without a pm2 spawn", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pm2home-"));
+  writeFileSync(join(home, "rpc.sock"), "");
+  let calls = 0;
+  const gone = async () => {
+    calls += 1;
+    throw new Error("socket disappeared");
+  };
+  assert.equal(await pm2Jlist(home, "ubuntu", { pm2Bin: "/usr/bin/pm2", listPm2: gone }), null);
+  assert.equal(calls, 1);
+  const pm2 = pm2FactsFrom(null, null);
+  pm2.unit = pm2UnitFromShow("pm2-ubuntu.service", "Id=pm2-ubuntu.service\nActiveState=active\nSubState=running\nResult=success\nNRestarts=0\n");
+  assert.equal(pm2.live, "unavailable");
+  assert.equal(runtimeStatusFrom(INFRA_UP, pm2), "degraded");
+});
+
+test("unit show failure is unknown and does not invent restarts or a user from an app name", () => {
+  const calls = [];
+  const unknown = readPm2Unit("", (cmd, args) => {
+    calls.push([cmd, args]);
+    return "ActiveState=active";
+  });
+  assert.equal(unknown.activeState, "unknown");
+  assert.equal(unknown.nRestarts, null);
+  assert.equal(calls.length, 0);
+  const failed = pm2UnitFromShow("pm2-ubuntu.service", null);
+  assert.equal(failed.activeState, "unknown");
+  assert.equal(failed.nRestarts, null);
+  assert.equal(failed.name, "pm2-ubuntu.service");
+});
+
+test("boot facts are omitted when proc files are missing and never use a zero", () => {
+  assert.equal(readBootFacts(() => { throw new Error("enoent"); }), null);
+  assert.equal(readBootFacts((path) => (path.endsWith("boot_id") ? "boot-1\n" : "not-a-number")), null);
+  assert.deepEqual(
+    readBootFacts((path) => (path.endsWith("boot_id") ? "boot-1\n" : "12.5 9.0\n")),
+    { id: "boot-1", uptimeSeconds: 12.5 },
+  );
+});
+
+test("payload keeps the old shape and adds boot and unit without private fields", async () => {
+  const config = await configFromValues(parseEnvFile(FIXTURE_ENV));
+  const facts = {
+    ...FACTS,
+    boot: { id: "boot-1", uptimeSeconds: 3 },
+    pm2: {
+      ...FACTS.pm2,
+      live: "ok",
+      liveProcesses: [{ name: "app", status: "online" }],
+      unit: { name: "pm2-ubuntu.service", activeState: "active", subState: "running", result: "success", nRestarts: 0 },
+    },
+  };
+  const body = buildHeartbeatBody(config, facts);
+  assert.equal(body.status, "ready");
+  assert.deepEqual(body.payload.boot, { id: "boot-1", uptimeSeconds: 3 });
+  assert.deepEqual(body.payload.pm2.unit, facts.pm2.unit);
+  assert.equal(body.payload.pm2.live, undefined);
+  assert.equal(JSON.stringify(body).includes("SECRET"), false);
+  const shutdown = buildHeartbeatBody(config, facts, {
+    requestId: REPORT.requestId,
+    stopped: [],
+    notStopped: [],
+    startedAt: REPORT.startedAt,
+    finishedAt: REPORT.finishedAt,
+  });
+  assert.equal(shutdown.status, "shutdown_ready");
 });
 
 const REPORT = {

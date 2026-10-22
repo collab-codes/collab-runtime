@@ -7,6 +7,7 @@ import os from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readShutdownState, shutdownReportSnapshot } from "./shutdown-state.mjs";
+import { listPm2 } from "../scripts/pm2-readonly.mjs";
 
 export const AGENT_VERSION = "0.3.1";
 const BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id";
@@ -134,10 +135,6 @@ export function commandOutput(command, args, opts = {}) {
   }
 }
 
-function systemdStatus(service) {
-  return commandOutput("systemctl", ["is-active", service]) ?? "unknown";
-}
-
 function fileOwner(path) {
   return commandOutput("stat", ["-c", "%U", path]) ?? commandOutput("stat", ["-f", "%Su", path]) ?? "";
 }
@@ -218,14 +215,28 @@ function liveStatusFor(live, name) {
   return bad ? bad.status : "online";
 }
 
+function classifyLive(liveRaw) {
+  if (liveRaw == null) return { ok: false, processes: [] };
+  let parsed;
+  try {
+    parsed = JSON.parse(liveRaw);
+  } catch {
+    return { ok: false, processes: [] };
+  }
+  if (!Array.isArray(parsed)) return { ok: false, processes: [] };
+  return { ok: true, processes: parsePm2Processes(liveRaw) };
+}
+
 export function pm2FactsFrom(dumpRaw, liveRaw) {
   const dumpPresent = dumpRaw !== null;
   const expected = uniqueNames(parsePm2Processes(dumpRaw ?? ""));
-  const live = parsePm2Processes(liveRaw ?? "");
+  const live = classifyLive(liveRaw);
   return {
     dump: dumpPresent ? "present" : "absent",
     expected,
-    processes: expected.map((name) => ({ name, status: liveStatusFor(live, name) })),
+    processes: expected.map((name) => ({ name, status: liveStatusFor(live.processes, name) })),
+    live: live.ok ? "ok" : "unavailable",
+    liveProcesses: live.processes,
   };
 }
 
@@ -233,15 +244,89 @@ export function runtimeStatusFrom(services, pm2) {
   const infra =
     services?.nginx === "active" && services?.postgresql === "active" && services?.redis === "active";
   if (!infra) return "degraded";
-  if (pm2?.dump !== "present") return "ready";
-  const expected = Array.isArray(pm2.expected) ? pm2.expected : [];
-  if (expected.length === 0) return "ready";
-  const processes = Array.isArray(pm2.processes) ? pm2.processes : [];
-  const ok = expected.every((name) => {
-    const process = processes.find((entry) => entry.name === name);
-    return process != null && process.status === "online";
-  });
+  if (pm2?.unit?.activeState !== "active") return "degraded";
+  if (pm2?.live !== "ok") return "degraded";
+  const rows = Array.isArray(pm2.liveProcesses) ? pm2.liveProcesses : [];
+  const ok = rows.every((process) => process != null && process.status === "online");
   return ok ? "ready" : "degraded";
+}
+
+const UNKNOWN_UNIT = Object.freeze({
+  name: "",
+  activeState: "unknown",
+  subState: "unknown",
+  result: "unknown",
+  nRestarts: null,
+});
+
+export function pm2UnitFromShow(unitName, raw) {
+  if (raw == null || raw === "") {
+    return { ...UNKNOWN_UNIT, name: unitName || "" };
+  }
+  const fields = {};
+  for (const line of String(raw).split("\n")) {
+    const eq = line.indexOf("=");
+    if (eq < 0) continue;
+    fields[line.slice(0, eq)] = line.slice(eq + 1);
+  }
+  let nRestarts = null;
+  if (Object.hasOwn(fields, "NRestarts")) {
+    const parsed = Number(fields.NRestarts);
+    nRestarts = Number.isFinite(parsed) ? parsed : null;
+  }
+  return {
+    name: fields.Id || unitName || "",
+    activeState: fields.ActiveState || "unknown",
+    subState: fields.SubState || "unknown",
+    result: fields.Result || "unknown",
+    nRestarts,
+  };
+}
+
+export function readPm2Unit(deployUser, command = commandOutput) {
+  if (!deployUser || deployUser === "root") return { ...UNKNOWN_UNIT };
+  const name = `pm2-${deployUser}.service`;
+  const raw = command("systemctl", [
+    "show",
+    name,
+    "-p",
+    "Id",
+    "-p",
+    "ActiveState",
+    "-p",
+    "SubState",
+    "-p",
+    "Result",
+    "-p",
+    "NRestarts",
+    "--no-pager",
+  ]);
+  return pm2UnitFromShow(name, raw);
+}
+
+export function readBootFacts(readFile = readFileSync) {
+  let id = "";
+  try {
+    id = String(readFile(BOOT_ID_PATH, "utf8") ?? "").trim();
+  } catch {
+    return null;
+  }
+  if (!id) return null;
+  let uptimeRaw = "";
+  try {
+    uptimeRaw = String(readFile("/proc/uptime", "utf8") ?? "").trim().split(/\s+/)[0] ?? "";
+  } catch {
+    return null;
+  }
+  const uptimeSeconds = Number(uptimeRaw);
+  if (!Number.isFinite(uptimeSeconds)) return null;
+  return { id, uptimeSeconds };
+}
+
+function resolvePm2Bin() {
+  if (existsSync("/usr/local/bin/pm2")) return "/usr/local/bin/pm2";
+  if (existsSync("/usr/bin/pm2")) return "/usr/bin/pm2";
+  return "";
 }
 
 function readPm2Dump(pm2Home) {
@@ -267,33 +352,39 @@ function readPm2Dump(pm2Home) {
  * VM ficou sem app nenhum e o dominio em 502: o `pm2-ubuntu.service` (User=ubuntu) nao consegue mais
  * subir ("Permission denied", 6 tentativas, "Start request repeated too quickly").
  */
-export function pm2Jlist(pm2Home, deployUser = "") {
+export async function pm2Jlist(pm2Home, deployUser = "", deps = {}) {
+  if (!pm2Home || !deployUser || deployUser === "root") return null;
   if (!existsSync(join(pm2Home, "rpc.sock"))) return null;
-  const env = {
-    ...process.env,
-    PM2_HOME: pm2Home,
-    PATH: `${process.env.PATH || ""}:/usr/bin:/usr/local/bin`,
-  };
-  const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
-  if (isRoot && deployUser && deployUser !== "root") {
-    // `-n`: nunca pedir senha. `PM2_HOME` vai explicito porque o `-H` troca o HOME do alvo.
-    return commandOutput("sudo", ["-n", "-u", deployUser, "-H", "env", `PM2_HOME=${pm2Home}`, "pm2", "jlist"], { env });
+  const pm2Bin = deps.pm2Bin ?? resolvePm2Bin();
+  if (!pm2Bin) return null;
+  const list = deps.listPm2 ?? listPm2;
+  try {
+    const rows = await list({ pm2Bin, pm2Home, transport: deps.transport, io: deps.io });
+    return JSON.stringify(rows);
+  } catch {
+    return null;
   }
-  return commandOutput("pm2", ["jlist"], { env });
 }
 
-export function collectPm2Facts(config) {
-  const deployUser = resolveDeployUser(config.dataRoot);
-  const pm2Home = join(userHome(deployUser), ".pm2");
-  return pm2FactsFrom(readPm2Dump(pm2Home), pm2Jlist(pm2Home, deployUser));
+export async function collectPm2Facts(config, deps = {}) {
+  const deployUser = (deps.resolveDeployUser ?? resolveDeployUser)(config.dataRoot);
+  const pm2Home = join((deps.userHome ?? userHome)(deployUser), ".pm2");
+  const command = deps.commandOutput ?? commandOutput;
+  const facts = pm2FactsFrom(
+    (deps.readPm2Dump ?? readPm2Dump)(pm2Home),
+    await pm2Jlist(pm2Home, deployUser, deps),
+  );
+  facts.unit = readPm2Unit(deployUser, command);
+  return facts;
 }
 
-export function collectFacts(config) {
-  const nginx = systemdStatus("nginx");
-  const postgresql = systemdStatus("postgresql");
-  const redis = systemdStatus("redis-server");
+export async function collectFacts(config, deps = {}) {
+  const command = deps.commandOutput ?? commandOutput;
+  const nginx = command("systemctl", ["is-active", "nginx"]) ?? "unknown";
+  const postgresql = command("systemctl", ["is-active", "postgresql"]) ?? "unknown";
+  const redis = command("systemctl", ["is-active", "redis-server"]) ?? "unknown";
   const services = { nginx, postgresql, redis };
-  const pm2 = collectPm2Facts(config);
+  const pm2 = await collectPm2Facts(config, deps);
   let loadavg = "";
   try {
     loadavg = readFileSync("/proc/loadavg", "utf8").trim();
@@ -306,20 +397,23 @@ export function collectFacts(config) {
   } catch {
     meminfo = "";
   }
-  return {
-    hostname: commandOutput("hostname", []) ?? "",
+  const facts = {
+    hostname: command("hostname", []) ?? "",
     loadavg,
-    disk: commandOutput("df", ["-h", config.dataRoot]) ?? "",
+    disk: command("df", ["-h", config.dataRoot]) ?? "",
     cpus: cpuCount(),
     memTotalMb: meminfoMbFrom(meminfo, "MemTotal"),
     memAvailableMb: meminfoMbFrom(meminfo, "MemAvailable"),
-    collabStatus: commandOutput("collab", ["status"]) ?? "collab status unavailable",
+    collabStatus: command("collab", ["status"]) ?? "collab status unavailable",
     services,
     pm2,
     runtimeStatus: runtimeStatusFrom(services, pm2),
     runtimeVersion:
-      commandOutput("git", ["-C", config.runtimeDir, "rev-parse", "--short", "HEAD"]) ?? "unknown",
+      command("git", ["-C", config.runtimeDir, "rev-parse", "--short", "HEAD"]) ?? "unknown",
   };
+  const boot = (deps.readBootFacts ?? readBootFacts)();
+  if (boot) facts.boot = boot;
+  return facts;
 }
 
 export function buildStatusPayload(config, facts, shutdown) {
@@ -339,8 +433,11 @@ export function buildStatusPayload(config, facts, shutdown) {
       postgresql: facts.services?.postgresql ?? "unknown",
       redis: facts.services?.redis ?? "unknown",
     },
-    pm2: facts.pm2 ?? { dump: "absent", expected: [], processes: [] },
+    pm2: publicPm2(facts.pm2),
   };
+  if (facts.boot && facts.boot.id && Number.isFinite(facts.boot.uptimeSeconds)) {
+    payload.boot = { id: facts.boot.id, uptimeSeconds: facts.boot.uptimeSeconds };
+  }
   if (shutdown) payload.shutdown = shutdownFields(shutdown);
   return payload;
 }
@@ -365,6 +462,25 @@ export function buildStatusBody(config, facts, shutdown) {
     status: facts.runtimeStatus,
     payload: buildStatusPayload(config, facts, shutdown),
   };
+}
+
+function publicPm2(pm2) {
+  const src = pm2 ?? { dump: "absent", expected: [], processes: [] };
+  const out = {
+    dump: src.dump ?? "absent",
+    expected: Array.isArray(src.expected) ? src.expected : [],
+    processes: Array.isArray(src.processes) ? src.processes : [],
+  };
+  if (src.unit) {
+    out.unit = {
+      name: src.unit.name ?? "",
+      activeState: src.unit.activeState ?? "unknown",
+      subState: src.unit.subState ?? "unknown",
+      result: src.unit.result ?? "unknown",
+      nRestarts: Number.isFinite(src.unit.nRestarts) ? src.unit.nRestarts : null,
+    };
+  }
+  return out;
 }
 
 function shutdownFields(shutdown) {
@@ -499,7 +615,7 @@ async function defaultPostJson(url, { headers, body, timeoutMs }) {
 
 export async function sendHeartbeat(config, deps = {}) {
   const url = `${config.sitesUrl}/api/v1/servers/${config.serverId}/heartbeat`;
-  const facts = (deps.collectFacts ?? collectFacts)(config);
+  const facts = await (deps.collectFacts ?? collectFacts)(config);
   const shutdown = await frozenShutdownReport(deps);
   const payload = JSON.stringify(buildHeartbeatBody(config, facts, shutdown));
   const postJson = deps.postJson ?? defaultPostJson;
@@ -532,7 +648,7 @@ function parseBind(bind) {
 
 export function startStatusServer(config, deps = {}) {
   const server = http.createServer(async (req, res) => {
-    const facts = (deps.collectFacts ?? collectFacts)(config);
+    const facts = await (deps.collectFacts ?? collectFacts)(config);
     const shutdown = await frozenShutdownReport(deps);
     const result = routeStatusRequest({
       path: req.url ?? "/",
