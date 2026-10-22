@@ -345,17 +345,17 @@ function scanSameHome(io, uid, home, pm2Home) {
     if (!Number.isInteger(pid) || pid <= 0) {
       return { complete: false, pids: [] };
     }
+    // stat and status are world-readable; environ of another uid is not (EACCES on /proc/1 as a deploy user).
+    // So the uid filter comes first and environ is read only for our own processes.
     let statText;
     let statusText;
-    let environ;
     try {
       statText = readOptional(io, `/proc/${pid}/stat`);
       if (statText === null) {
         continue;
       }
       statusText = readOptional(io, `/proc/${pid}/status`);
-      environ = readOptional(io, `/proc/${pid}/environ`);
-      if (statusText === null || environ === null) {
+      if (statusText === null) {
         continue;
       }
     } catch (error) {
@@ -374,9 +374,28 @@ function scanSameHome(io, uid, home, pm2Home) {
     } catch {
       return { complete: false, pids: [] };
     }
+    if (seenUid !== uid) {
+      continue;
+    }
+    let environ;
+    try {
+      environ = readOptional(io, `/proc/${pid}/environ`);
+      if (environ === null) {
+        continue;
+      }
+    } catch (error) {
+      if (error && error.code === "ENOENT") {
+        continue;
+      }
+      if (error && (error.code === "EACCES" || error.code === "EPERM")) {
+        // Our own uid and still unreadable: fail closed, as before.
+        throw asObsError(error);
+      }
+      return { complete: false, pids: [] };
+    }
     let sameHome = false;
     try {
-      sameHome = seenUid === uid && sameRealPm2Home(io, environ, pm2Home, home);
+      sameHome = sameRealPm2Home(io, environ, pm2Home, home);
     } catch {
       return { complete: false, pids: [] };
     }
@@ -434,7 +453,6 @@ function readLiveIdentity(io, pid, bootId, uid, home, pm2Home) {
       return null;
     }
     statusText = String(io.readFile(`/proc/${pid}/status`));
-    environ = String(io.readFile(`/proc/${pid}/environ`));
   } catch (error) {
     if (error && error.code === "ENOENT") {
       return null;
@@ -449,7 +467,19 @@ function readLiveIdentity(io, pid, bootId, uid, home, pm2Home) {
   } catch {
     throw new ObsError("inconsistent", "proc identity");
   }
-  if (seenUid !== uid || !sameRealPm2Home(io, environ, pm2Home, home)) {
+  // uid first: environ of another uid is unreadable, and the verdict is the same mismatch either way.
+  if (seenUid !== uid) {
+    throw new ObsError("inconsistent", "uid or home mismatch");
+  }
+  try {
+    environ = String(io.readFile(`/proc/${pid}/environ`));
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      return null;
+    }
+    throw asObsError(error);
+  }
+  if (!sameRealPm2Home(io, environ, pm2Home, home)) {
     throw new ObsError("inconsistent", "uid or home mismatch");
   }
   return procIdentity(bootId, pid, startTime);
