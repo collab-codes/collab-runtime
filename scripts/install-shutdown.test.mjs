@@ -152,6 +152,10 @@ test("maintenance install is idempotent and does not start a worker or touch env
     const unit = await readFile(path.join(stage.root, "etc/systemd/system/collab-shutdown.service"), "utf8");
     assert.match(unit, /RuntimeMaxSec=54min/);
     assert.doesNotMatch(unit, /\[Install\]|WantedBy=/);
+    const nginx = await readFile(path.join(stage.root, "etc/systemd/system/nginx.service.d/collab-graceful-stop.conf"), "utf8");
+    assert.match(nginx, /^ExecStop=$/m);
+    assert.match(nginx, /--retry QUIT\/30 /);
+    assert.match(nginx, /TimeoutStopSec=35/);
     const timers = (await readdir(path.join(stage.root, "etc/systemd/system"))).filter((name) => name.endsWith(".timer"));
     assert.deepEqual(timers, []);
 

@@ -38,6 +38,7 @@ PREFIX="${PREFIX%/}"
 AGENT_DIR="${PREFIX}/usr/local/lib/collab-sites-agent"
 LIB_DIR="${PREFIX}/usr/local/lib/collab"
 UNIT_PATH="${PREFIX}/etc/systemd/system/collab-shutdown.service"
+NGINX_DROPIN="${PREFIX}/etc/systemd/system/nginx.service.d/collab-graceful-stop.conf"
 WORKER_PATH="${AGENT_DIR}/shutdown-worker.mjs"
 LIFECYCLE_PATH="${LIB_DIR}/pm2-lifecycle.mjs"
 READONLY_PATH="${LIB_DIR}/pm2-readonly.mjs"
@@ -131,6 +132,20 @@ EOF
 chmod 644 "$UNIT_PATH"
 if [[ "$(id -u)" -eq 0 ]]; then
   chown 0:0 "$UNIT_PATH"
+fi
+
+# nginx stops first in the ordered shutdown. The stock unit gives in-flight
+# requests 5 s (QUIT/5, TimeoutStopSec=5); give them 30 s to finish.
+mkdir -p "$(dirname "$NGINX_DROPIN")"
+cat > "$NGINX_DROPIN" <<'EOF'
+[Service]
+ExecStop=
+ExecStop=-/sbin/start-stop-daemon --quiet --stop --retry QUIT/30 --pidfile /run/nginx.pid
+TimeoutStopSec=35
+EOF
+chmod 644 "$NGINX_DROPIN"
+if [[ "$(id -u)" -eq 0 ]]; then
+  chown 0:0 "$NGINX_DROPIN"
 fi
 
 "$SYSTEMCTL_BIN" daemon-reload

@@ -43,7 +43,7 @@ O relógio monotônico não ganha prazo com salto do relógio de parede. Retry n
 
 ## Parada e relatório
 
-Ordem: nginx, processos PM2 de negócio (todos os vivos, inclusive os de fora do dump, exceto `msg` e `msg-worker`), `msg-worker`, `msg`, reconfirmação, Redis e clusters `postgresql@*`. Se um app não confirma, Redis e PostgreSQL ficam só observados. `services_stopped` exige confirmação de todos. Falha de leitura entra em `notStopped`, não vira lista vazia.
+Ordem: nginx, processos PM2 de negócio (todos os vivos, inclusive os de fora do dump, exceto `msg` e `msg-worker`), `msg-worker`, `msg`, reconfirmação, Redis e clusters `postgresql@*`. O nginx para com `QUIT` e dá 30 s para as requisições em andamento terminarem (drop-in `nginx.service.d/collab-graceful-stop.conf`, `--retry QUIT/30`, `TimeoutStopSec=35`; a unidade do Ubuntu dava 5 s); o que passa disso, inclusive WebSocket aberto, é cortado. Se um app não confirma, Redis e PostgreSQL ficam só observados. `services_stopped` exige confirmação de todos. Falha de leitura entra em `notStopped`, não vira lista vazia.
 
 Fases internas, no estado local: `requested`, `stopping`, `services_stopped`, `deadline_exceeded`, `failed`. Não vão no tipo do heartbeat.
 
@@ -68,6 +68,7 @@ Conjunto que anda junto:
 - `/usr/local/lib/collab-sites-agent/shutdown-state.mjs`
 - `/usr/local/lib/collab-sites-agent/shutdown-worker.mjs`
 - `/usr/local/lib/collab-sites-agent/shutdown-services.mjs`
+- `/etc/systemd/system/nginx.service.d/collab-graceful-stop.conf`
 - `/usr/local/lib/collab/pm2-lifecycle.mjs`
 - `/etc/systemd/system/collab-shutdown.service`
 
