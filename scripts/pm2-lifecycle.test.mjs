@@ -10,6 +10,7 @@ import {
   procIdentity,
   startTimeFromStat,
   stopPm2,
+  verifyPostStop,
 } from "./pm2-lifecycle.mjs";
 
 const BOOT = "boot-a";
@@ -350,7 +351,7 @@ test("reused pid and a receipt from another boot are not the old process", async
   assert.equal(await guardPm2(base(unlinked.io)), 1);
 });
 
-test("reader uses the target cgroup, not the caller cgroup", () => {
+test("reader uses the target cgroup, not the caller cgroup", async () => {
   const box = world();
   const seen = [];
   box.io.listCgroupPids = (root) => {
@@ -361,7 +362,7 @@ test("reader uses the target cgroup, not the caller cgroup", () => {
     return [11];
   };
   box.files.delete(`${PM2_HOME}/pm2.pid`);
-  const obs = observeTarget({
+  const obs = await observeTarget({
     io: box.io,
     pm2Home: PM2_HOME,
     unitCgroup: UNIT,
@@ -438,6 +439,151 @@ test("stop does not wait for its own lock holder (flock and node -e children of 
   // The lock holder 501/502 stays alive for the whole stop; only the service (10, 11) leaves.
   assert.equal(await stopPm2(base(box.io, { helperPid: HELPER, controlPids: [HELPER] })), 0);
   assert.equal(box.receipt().confirmed, true);
+});
+
+function nodeStat(isSymlink, kind, uid = 1000) {
+  return {
+    uid,
+    isSymbolicLink: () => isSymlink,
+    isDirectory: () => kind === "dir",
+    isFile: () => kind === "file",
+    isSocket: () => kind === "socket",
+  };
+}
+
+test("live daemon without a pidfile and outside the cgroup refuses start", async () => {
+  const box = world();
+  box.files.delete(`${PM2_HOME}/pm2.pid`);
+  box.rpc = false;
+  box.cgroup.clear();
+  box.cgroup.add(1);
+  box.procs.set(77, {
+    stat: statLine(77, "PM2", 4242),
+    status: status(1000),
+    environ: environ(),
+  });
+  box.io.listProcPids = () => [1, 77];
+  assert.equal(await guardPm2(base(box.io, { helperPid: 1, controlPids: [1] })), 1);
+  assert.equal(box.killCalls, 0);
+  assert.equal(box.jlistCalls.length, 0);
+  assert.equal(box.logs.some((line) => line.includes("pid=77")), true);
+});
+
+test("reused pid, other home, and other uid are not the pm2 target", async () => {
+  const box = world();
+  box.files.delete(`${PM2_HOME}/pm2.pid`);
+  box.rpc = false;
+  box.cgroup.clear();
+  box.cgroup.add(1);
+  box.procs.set(11, {
+    stat: statLine(11, "node", 9999),
+    status: status(1000),
+    environ: environ("/elsewhere"),
+  });
+  box.procs.set(12, {
+    stat: statLine(12, "PM2", 50),
+    status: status(9),
+    environ: environ(),
+  });
+  box.procs.set(13, {
+    stat: statLine(13, "node", 2000),
+    status: status(1000),
+    environ: environ(),
+  });
+  box.io.listProcPids = () => [11, 12, 13];
+  box.io.realpath = (file) => (file === PM2_HOME || file === "/link/.pm2" ? "/real/pm2" : file);
+  box.procs.get(13).environ = `HOME=${HOME}\0PM2_HOME=/link/.pm2\0`;
+  box.procs.get(13).stat = statLine(13, "node", 7777);
+  const obs = await observeTarget(base(box.io, { helperPid: 1, controlPids: [1], excludePids: [1] }), false);
+  assert.deepEqual(obs.service.map((id) => id.pid), [13]);
+  assert.equal(obs.service[0].startTime, 7777);
+  assert.equal(obs.daemon, null);
+  box.procs.delete(13);
+  box.io.listProcPids = () => [11, 12];
+  assert.equal(await guardPm2(base(box.io, { helperPid: 1, controlPids: [1] })), 0);
+  assert.equal(box.killCalls, 0);
+});
+
+test("an incomplete proc scan is unconfirmed and does not look like absence", async () => {
+  const box = world();
+  box.files.delete(`${PM2_HOME}/pm2.pid`);
+  box.cgroup.clear();
+  box.cgroup.add(1);
+  box.io.listProcPids = () => {
+    throw new Error("short read");
+  };
+  assert.equal(await guardPm2(base(box.io, { helperPid: 1, controlPids: [1] })), 1);
+  assert.equal(box.killCalls, 0);
+  assert.equal(box.jlistCalls.length, 0);
+});
+
+test("start timeout does not call pm2 or record a graceful stop", async () => {
+  const box = world();
+  box.files.delete(`${PM2_HOME}/pm2.pid`);
+  box.rpc = false;
+  box.cgroup.clear();
+  box.cgroup.add(1);
+  box.io.listProcPids = () => [];
+  box.files.set(`${PM2_HOME}/collab-stop.json`, JSON.stringify({
+    bootId: BOOT,
+    phase: "stopping",
+    confirmed: false,
+    identities: [procIdentity(BOOT, 11, 2000)],
+  }));
+  const unlinked = [];
+  box.io.lstat = (file) => {
+    if (file === PM2_HOME) {
+      return nodeStat(false, "dir");
+    }
+    if (file === "/real/pm2/pm2.pid") {
+      return nodeStat(false, "file");
+    }
+    const error = new Error("gone");
+    error.code = "ENOENT";
+    throw error;
+  };
+  box.io.realpath = () => "/real/pm2";
+  box.io.unlink = (file) => {
+    unlinked.push(file);
+  };
+  assert.equal(await verifyPostStop(base(box.io, {
+    helperPid: 1,
+    controlPids: [1],
+    serviceResult: "timeout",
+    exitCode: "killed",
+    exitStatus: "TERM",
+  })), 0);
+  assert.equal(box.killCalls, 0);
+  assert.equal(box.jlistCalls.length, 0);
+  assert.equal(box.receipt().confirmed, false);
+  assert.equal(box.receipt().phase, "stopping");
+  assert.deepEqual(unlinked, ["/real/pm2/pm2.pid"]);
+});
+
+test("a symlink artifact is left in place", async () => {
+  const box = world();
+  box.files.delete(`${PM2_HOME}/pm2.pid`);
+  box.cgroup.clear();
+  box.cgroup.add(1);
+  box.io.listProcPids = () => [];
+  let unlinked = 0;
+  box.io.lstat = (file) => {
+    if (file === PM2_HOME) {
+      return nodeStat(false, "dir");
+    }
+    return nodeStat(true, "file");
+  };
+  box.io.realpath = () => "/real/pm2";
+  box.io.unlink = () => {
+    unlinked += 1;
+  };
+  assert.equal(await verifyPostStop(base(box.io, {
+    helperPid: 1,
+    controlPids: [1],
+    serviceResult: "success",
+  })), 1);
+  assert.equal(unlinked, 0);
+  assert.equal(box.killCalls, 0);
 });
 
 test("a stopped app listed with pid 0 is not a live process and not an inconsistent inventory", () => {

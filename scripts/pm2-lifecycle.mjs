@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // Stop and guard for one PM2_HOME. Observation is separate from kill/start.
 // A missing socket, a stopped receipt, or CLI exit 0 is not proof the processes ended.
-import { spawn, spawnSync } from "node:child_process";
-import { existsSync, openSync, writeSync, fsyncSync, closeSync, renameSync, chmodSync, readFileSync, readdirSync, statSync, lstatSync, realpathSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, openSync, writeSync, fsyncSync, closeSync, renameSync, chmodSync, readFileSync, readdirSync, statSync, lstatSync, realpathSync, unlinkSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
+import { listPm2 } from "./pm2-readonly.mjs";
 
 /** Global monotonic budget. Shorter than systemd TimeoutStopSec=900s. */
 export const STOP_DEADLINE_MS = 840_000;
@@ -147,7 +148,7 @@ function sameIdentity(a, b) {
 
 class ObsError extends Error {
   /**
-   * @param {"permission"|"inconsistent"} kind
+   * @param {"permission"|"inconsistent"|"unconfirmed"} kind
    * @param {string} message
    */
   constructor(kind, message) {
@@ -193,7 +194,7 @@ function readOptional(io, file) {
  * @param {number[]} [target.excludePids]
  * @param {boolean} includeJlist
  */
-export function observeTarget(target, includeJlist) {
+export async function observeTarget(target, includeJlist) {
   const { io, pm2Home, unitCgroup, uid, home } = target;
   if (!unitCgroup || unitCgroup === "/") {
     throw new ObsError("inconsistent", "unit cgroup missing");
@@ -212,8 +213,16 @@ export function observeTarget(target, includeJlist) {
 
   const daemonPid = readDaemonPid(io, pm2Home);
   let daemon = null;
+  /** @type {number[]|null} */
+  let scanned = null;
   if (daemonPid !== null) {
     daemon = readLiveIdentity(io, daemonPid, bootId, uid, home, pm2Home);
+  } else if (typeof io.listProcPids === "function") {
+    const scan = scanSameHome(io, uid, home, pm2Home);
+    if (!scan.complete) {
+      throw new ObsError("unconfirmed", "proc scan");
+    }
+    scanned = scan.pids;
   }
 
   let rpc = false;
@@ -244,11 +253,18 @@ export function observeTarget(target, includeJlist) {
   if (daemon) {
     wanted.add(daemon.pid);
   }
+  if (scanned) {
+    for (const pid of scanned) {
+      if (!exclude.has(pid)) {
+        wanted.add(pid);
+      }
+    }
+  }
 
   if (includeJlist && daemon && rpc) {
     let listed;
     try {
-      listed = io.jlist(pm2Home, target.pm2Bin);
+      listed = await listedPids(io, pm2Home, target.pm2Bin);
     } catch (error) {
       throw asObsError(error);
     }
@@ -306,6 +322,106 @@ function readDaemonPid(io, pm2Home) {
 }
 
 /**
+ * Same uid and the real PM2_HOME. A name match is not an identity.
+ * Incomplete (unreadable /proc, or a pid we cannot classify) is not an empty result.
+ * @returns {{ complete: boolean, pids: number[] }}
+ */
+function scanSameHome(io, uid, home, pm2Home) {
+  let pids;
+  try {
+    pids = io.listProcPids();
+  } catch (error) {
+    if (error && (error.code === "EACCES" || error.code === "EPERM")) {
+      throw asObsError(error);
+    }
+    return { complete: false, pids: [] };
+  }
+  if (!Array.isArray(pids)) {
+    return { complete: false, pids: [] };
+  }
+  /** @type {number[]} */
+  const matched = [];
+  for (const pid of pids) {
+    if (!Number.isInteger(pid) || pid <= 0) {
+      return { complete: false, pids: [] };
+    }
+    let statText;
+    let statusText;
+    let environ;
+    try {
+      statText = readOptional(io, `/proc/${pid}/stat`);
+      if (statText === null) {
+        continue;
+      }
+      statusText = readOptional(io, `/proc/${pid}/status`);
+      environ = readOptional(io, `/proc/${pid}/environ`);
+      if (statusText === null || environ === null) {
+        continue;
+      }
+    } catch (error) {
+      if (error && error.code === "ENOENT") {
+        continue;
+      }
+      if (error && (error.code === "EACCES" || error.code === "EPERM")) {
+        throw asObsError(error);
+      }
+      return { complete: false, pids: [] };
+    }
+    let seenUid;
+    try {
+      seenUid = uidFromStatus(statusText);
+      startTimeFromStat(statText);
+    } catch {
+      return { complete: false, pids: [] };
+    }
+    let sameHome = false;
+    try {
+      sameHome = seenUid === uid && sameRealPm2Home(io, environ, pm2Home, home);
+    } catch {
+      return { complete: false, pids: [] };
+    }
+    if (!sameHome) {
+      continue;
+    }
+    matched.push(pid);
+  }
+  return { complete: true, pids: matched };
+}
+
+/**
+ * @param {string} raw
+ * @param {string} pm2Home
+ * @param {string} home
+ * @returns {boolean}
+ */
+function sameRealPm2Home(io, raw, pm2Home, home) {
+  const seen = envValue(raw, "PM2_HOME");
+  if (seen === undefined || typeof io.realpath !== "function") {
+    return environMatchesHome(raw, pm2Home, home);
+  }
+  try {
+    return io.realpath(seen) === io.realpath(pm2Home);
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Injected `io.jlist` stays the test seam. Production lists through the passive adapter.
+ * @returns {Promise<number[]>}
+ */
+async function listedPids(io, pm2Home, pm2Bin) {
+  if (typeof io.jlist === "function") {
+    return io.jlist(pm2Home, pm2Bin);
+  }
+  const rows = await listPm2({ pm2Bin, pm2Home });
+  return pidsFromJlist(rows);
+}
+
+/**
  * @returns {ProcIdentity|null} null when the pid is gone or its start time changed under us
  */
 function readLiveIdentity(io, pid, bootId, uid, home, pm2Home) {
@@ -333,7 +449,7 @@ function readLiveIdentity(io, pid, bootId, uid, home, pm2Home) {
   } catch {
     throw new ObsError("inconsistent", "proc identity");
   }
-  if (seenUid !== uid || !environMatchesHome(environ, pm2Home, home)) {
+  if (seenUid !== uid || !sameRealPm2Home(io, environ, pm2Home, home)) {
     throw new ObsError("inconsistent", "uid or home mismatch");
   }
   return procIdentity(bootId, pid, startTime);
@@ -481,7 +597,7 @@ export async function stopPm2(options) {
           exclude.push(pid);
         }
       }
-      obs = observeTarget({ ...options, excludePids: exclude.filter((pid) => Number.isInteger(pid) && pid > 0) }, jlistAllowed);
+      obs = await observeTarget({ ...options, excludePids: exclude.filter((pid) => Number.isInteger(pid) && pid > 0) }, jlistAllowed);
     } catch (error) {
       const wrapped = asObsError(error);
       const boot = seen.size > 0 ? [...seen.values()][0].bootId : null;
@@ -767,7 +883,7 @@ export async function guardPm2(options) {
   let obs;
   try {
     receipt = readReceipt(io, options.pm2Home);
-    obs = observeTarget({ ...options, excludePids: [...controlPidsOf(options), ...ownDescendants(io, options.unitCgroup, options.helperPid)] }, false);
+    obs = await observeTarget({ ...options, excludePids: [...controlPidsOf(options), ...ownDescendants(io, options.unitCgroup, options.helperPid)] }, false);
   } catch (error) {
     const wrapped = asObsError(error);
     logLine(io, `guard refused error=${wrapped.kind}`);
@@ -808,6 +924,112 @@ export async function guardPm2(options) {
 
   logLine(io, "phase=stopped");
   return 0;
+}
+
+/**
+ * ExecStopPost. Kernel check only: no pm2 kill, jlist, or start.
+ * A start timeout is not a graceful drain. An unconfirmed receipt stays unconfirmed.
+ * @param {object} options
+ * @returns {Promise<number>}
+ */
+export async function verifyPostStop(options) {
+  const io = options.io;
+  const serviceResult = String(options.serviceResult || "");
+  const exitCode = String(options.exitCode || "");
+  const exitStatus = String(options.exitStatus || "");
+  logLine(io, `post-stop result=${serviceResult} exit=${exitCode}/${exitStatus}`);
+  const exclude = [...controlPidsOf(options), ...ownDescendants(io, options.unitCgroup, options.helperPid)];
+  let obs;
+  try {
+    obs = await observeTarget({ ...options, excludePids: exclude }, false);
+  } catch (error) {
+    logLine(io, `post-stop unconfirmed error=${asObsError(error).kind}`);
+    return 1;
+  }
+  const alive = obs.service.filter((id) => !exclude.includes(id.pid) && id.pid !== options.helperPid);
+  if (obs.daemon || alive.length > 0) {
+    const pid = obs.daemon ? obs.daemon.pid : alive[0].pid;
+    logLine(io, `post-stop remaining pid=${pid}`);
+    return 1;
+  }
+  if (typeof io.listProcPids !== "function") {
+    logLine(io, "post-stop unconfirmed");
+    return 1;
+  }
+  if (serviceResult === "timeout") {
+    logLine(io, "post-stop startup-timeout");
+  }
+  const removed = removeStalePm2Artifacts(io, options.pm2Home, options.uid);
+  if (removed === "refused") {
+    logLine(io, "post-stop artifacts left");
+    return 1;
+  }
+  logLine(io, removed === "removed" ? "post-stop artifacts cleared" : "post-stop clear");
+  return 0;
+}
+
+/**
+ * Drop a stale pidfile or socket only when the home owner and real path check out.
+ * Never follow a symlink. Doubt leaves the inode in place.
+ * @returns {"absent"|"removed"|"refused"}
+ */
+function removeStalePm2Artifacts(io, pm2Home, uid) {
+  if (typeof io.lstat !== "function" || typeof io.realpath !== "function" || typeof io.unlink !== "function") {
+    return "refused";
+  }
+  let homeStat;
+  let homeReal;
+  try {
+    homeStat = io.lstat(pm2Home);
+    if (!homeStat || homeStat.isSymbolicLink() || !homeStat.isDirectory() || homeStat.uid !== uid) {
+      return "refused";
+    }
+    homeReal = io.realpath(pm2Home);
+  } catch {
+    return "refused";
+  }
+  const prefix = homeReal.endsWith(path.sep) ? homeReal : `${homeReal}${path.sep}`;
+  /** @type {string[]} */
+  const drop = [];
+  for (const [name, kind] of [["pm2.pid", "file"], ["rpc.sock", "socket"]]) {
+    const file = path.join(homeReal, name);
+    if (!file.startsWith(prefix)) {
+      return "refused";
+    }
+    let st;
+    try {
+      st = io.lstat(file);
+    } catch (error) {
+      if (error && error.code === "ENOENT") {
+        continue;
+      }
+      return "refused";
+    }
+    if (st.isSymbolicLink()) {
+      return "refused";
+    }
+    if (kind === "file" && !st.isFile()) {
+      return "refused";
+    }
+    if (kind === "socket" && !st.isSocket()) {
+      return "refused";
+    }
+    if (st.uid !== uid) {
+      return "refused";
+    }
+    drop.push(file);
+  }
+  if (drop.length === 0) {
+    return "absent";
+  }
+  try {
+    for (const file of drop) {
+      io.unlink(file);
+    }
+  } catch {
+    return "refused";
+  }
+  return "removed";
 }
 
 function ownUnitCgroup(io) {
@@ -901,29 +1123,30 @@ export function createHostIo() {
       walk(root);
       return pids;
     },
-    jlist(pm2Home, pm2Bin) {
-      const bin = pm2Bin || "";
-      if (!bin) {
-        throw new ObsError("inconsistent", "jlist");
-      }
-      const result = spawnSync(bin, ["jlist"], {
-        env: { ...process.env, PM2_HOME: pm2Home },
-        encoding: "utf8",
-        timeout: 10_000,
-      });
-      if (result.error || result.status !== 0) {
-        throw new ObsError("inconsistent", "jlist");
-      }
-      let rows;
+    listProcPids() {
+      /** @type {number[]} */
+      const pids = [];
+      let names;
       try {
-        rows = JSON.parse(result.stdout);
-      } catch {
-        throw new ObsError("inconsistent", "jlist");
+        names = readdirSync("/proc");
+      } catch (error) {
+        throw asObsError(error);
       }
-      if (!Array.isArray(rows)) {
-        throw new ObsError("inconsistent", "jlist");
+      for (const name of names) {
+        if (/^[1-9]\d*$/.test(name)) {
+          pids.push(Number(name));
+        }
       }
-      return pidsFromJlist(rows);
+      return pids;
+    },
+    realpath(file) {
+      return realpathSync(file);
+    },
+    lstat(file) {
+      return lstatSync(file);
+    },
+    unlink(file) {
+      unlinkSync(file);
     },
     spawnKill(pm2Bin, pm2Home) {
       const child = spawn(pm2Bin, ["kill"], {
@@ -1052,6 +1275,16 @@ async function main() {
       process.exitCode = code;
       return;
     }
+    if (cmd === "post-stop") {
+      const code = await verifyPostStop({
+        ...hostContext(io),
+        serviceResult: process.env.SERVICE_RESULT || "",
+        exitCode: process.env.EXIT_CODE || "",
+        exitStatus: process.env.EXIT_STATUS || "",
+      });
+      process.exitCode = code;
+      return;
+    }
     if (cmd === "guard") {
       const run = async () => guardPm2(hostContext(io));
       if (held) {
@@ -1069,7 +1302,7 @@ async function main() {
       process.exitCode = code;
       return;
     }
-    logLine(io, "usage stop <pm2-bin> | guard | validate-home");
+    logLine(io, "usage stop <pm2-bin> | guard | post-stop | validate-home");
     process.exitCode = 64;
   } catch (error) {
     logLine(io, `error=${asObsError(error).kind}`);
