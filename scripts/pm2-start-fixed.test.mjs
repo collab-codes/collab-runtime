@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, mkdtempSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,10 +28,15 @@ function writePm2Stub(dir) {
   const stubPath = join(dir, "pm2");
   const logPath = join(dir, "calls.log");
   writeFileSync(stubPath, `#!/usr/bin/env node
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 const logPath = process.env.PM2_STUB_LOG;
 const args = process.argv.slice(2);
+const sleepMs = Number(process.env.PM2_STUB_SLEEP_MS || "0");
+if (sleepMs > 0) {
+  const end = Date.now() + sleepMs;
+  while (Date.now() < end) {}
+}
 const forbidden = args.some((arg) => /resurrect|dump|save|startup/u.test(arg));
 if (forbidden) {
   appendFileSync(logPath, JSON.stringify({ cmd: args, forbidden: true }) + "\\n");
@@ -39,6 +44,11 @@ if (forbidden) {
 }
 if (args.length === 1 && args[0] === "ping") {
   appendFileSync(logPath, JSON.stringify({ cmd: args }) + "\\n");
+  const home = process.env.PM2_HOME;
+  const pid = process.env.PM2_STUB_PID || "4242";
+  if (home && process.env.PM2_STUB_SKIP_PID !== "1") {
+    writeFileSync(home + "/pm2.pid", pid + "\\n");
+  }
   process.exit(0);
 }
 if (!(args.length === 3 && args[0] === "start" && args[2] === "--update-env")) {
@@ -76,6 +86,11 @@ appendFileSync(logPath, JSON.stringify({
     : null,
   apps,
 }) + "\\n");
+const home = process.env.PM2_HOME;
+const pid = process.env.PM2_STUB_PID || "4242";
+if (home && process.env.PM2_STUB_SKIP_PID !== "1") {
+  writeFileSync(home + "/pm2.pid", pid + "\\n");
+}
 `);
   chmodSync(stubPath, 0o755);
   writeFileSync(logPath, "");
@@ -147,7 +162,21 @@ if (cmd === "guard") {
 process.exit(64);
 `;
 
-function stage(dir, { helperPresent = true, helperMode = 0o644 } = {}) {
+function writeProc(dir, { inUnit = true, daemonService = "collab-pm2.service", daemonPid = "4242", bootId = "boot-test" } = {}) {
+  const proc = join(dir, "proc");
+  const selfCgroup = inUnit
+    ? "0::/system.slice/collab-pm2.service\n"
+    : "0::/user.slice/session-1.scope\n";
+  mkdirSync(join(proc, "self"), { recursive: true });
+  mkdirSync(join(proc, "sys/kernel/random"), { recursive: true });
+  mkdirSync(join(proc, daemonPid), { recursive: true });
+  writeFileSync(join(proc, "self/cgroup"), selfCgroup);
+  writeFileSync(join(proc, "sys/kernel/random/boot_id"), `${bootId}\n`);
+  writeFileSync(join(proc, daemonPid, "cgroup"), `0::/system.slice/${daemonService}\n`);
+  return proc;
+}
+
+function stage(dir, { helperPresent = true, helperMode = 0o644, inUnit = true, daemonService = "collab-pm2.service" } = {}) {
   const bin = join(dir, "bin");
   mkdirSync(bin);
   const script = join(dir, "pm2-start-fixed.sh");
@@ -163,13 +192,15 @@ function stage(dir, { helperPresent = true, helperMode = 0o644 } = {}) {
   chmodSync(flockPath, 0o755);
   const home = join(dir, "pm2home");
   mkdirSync(home);
-  return { script, bin, home, lifeLog: join(dir, "lifecycle.log") };
+  const proc = writeProc(dir, { inUnit, daemonService });
+  return { script, bin, home, proc, lifeLog: join(dir, "lifecycle.log") };
 }
 
 function baseEnv(staged, extra) {
   return {
     PATH: `${staged.bin}:${process.env.PATH}`,
     PM2_HOME: staged.home,
+    COLLAB_PROC: staged.proc,
     PM2_LIFECYCLE_LOG: staged.lifeLog,
     PM2_GUARD_CODE: "0",
     ...extra,
@@ -215,7 +246,11 @@ test("starts apps then messages and keeps the worker when the external flag is f
     NODE_ENV: "production",
   }));
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stderr, "");
+  assert.equal(result.stderr.includes("SECRET_DUMP"), false);
+  for (const phase of ["validate-home", "lock", "guard", "apps", "messages", "done"]) {
+    assert.match(result.stderr, new RegExp(`bootId=boot-test phase=${phase} edge=begin mono=\\d+`));
+    assert.match(result.stderr, new RegExp(`bootId=boot-test phase=${phase} edge=end mono=\\d+ durationMs=\\d+ code=0`));
+  }
   const calls = callsOf(logPath);
   assert.deepEqual(calls.map((call) => call.cmd), [
     ["start", appsConfig, "--update-env"],
@@ -513,4 +548,103 @@ test("a symlink lock path is refused and the target stays", async () => {
   assert.equal(code, 1);
   assert.equal(started, false);
   assert.equal(readFileSync(outside, "utf8"), "keep\n");
+});
+
+test("a delay in the first config consumes the one budget and does not start the second", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pm2-start-fixed-"));
+  const staged = stage(dir);
+  const { stubPath, logPath } = writePm2Stub(dir);
+  const appsConfig = join(dir, "mls-base", "pm2.config.js");
+  const messagesConfig = join(dir, "msg.collab.codes", "pm2.config.js");
+  mkdirSync(dirname(appsConfig), { recursive: true });
+  mkdirSync(dirname(messagesConfig), { recursive: true });
+  writeFileSync(appsConfig, appsFixture);
+  writeFileSync(messagesConfig, messagesFixture);
+  const started = Date.now();
+  const result = await invokeAsync(staged.script, [stubPath, appsConfig, messagesConfig], baseEnv(staged, {
+    PM2_STUB_LOG: logPath,
+    PM2_STUB_SLEEP_MS: "1500",
+    PM2_START_BUDGET_MS: "900",
+  }));
+  const elapsed = Date.now() - started;
+  assert.notEqual(result.status, 0);
+  assert.ok(elapsed < 5000, String(elapsed));
+  assert.deepEqual(callsOf(logPath).map((call) => call.cmd), [["start", appsConfig, "--update-env"]]);
+  assert.match(result.stderr, /phase=apps edge=end .* code=1/u);
+  assert.equal(/phase=messages /u.test(result.stderr), false);
+  assert.match(result.stderr, /phase=guard edge=end .* code=0/u);
+});
+
+test("lock wait is inside the same budget and does not start apps", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pm2-start-fixed-"));
+  const staged = stage(dir);
+  const { stubPath, logPath } = writePm2Stub(dir);
+  const appsConfig = join(dir, "mls-base", "pm2.config.js");
+  const messagesConfig = join(dir, "missing messages", "pm2.config.js");
+  mkdirSync(dirname(appsConfig), { recursive: true });
+  writeFileSync(appsConfig, appsFixture);
+  mkdirSync(`${staged.home}/collab-lifecycle.lock.hold`);
+  const started = Date.now();
+  const result = await invokeAsync(staged.script, [stubPath, appsConfig, messagesConfig], baseEnv(staged, {
+    PM2_STUB_LOG: logPath,
+    PM2_START_BUDGET_MS: "300",
+  }));
+  const elapsed = Date.now() - started;
+  rmSync(`${staged.home}/collab-lifecycle.lock.hold`, { recursive: true, force: true });
+  assert.notEqual(result.status, 0);
+  assert.ok(elapsed < 2000, String(elapsed));
+  assert.equal(callsOf(logPath).length, 0);
+  assert.match(result.stderr, /phase=lock edge=end .* code=1/u);
+  assert.equal(/phase=apps /u.test(result.stderr), false);
+  assert.equal(/phase=done /u.test(result.stderr), false);
+});
+
+test("manual use outside a unit cgroup fails before any pm2 command", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pm2-start-fixed-"));
+  const staged = stage(dir, { inUnit: false });
+  const { stubPath, logPath } = writePm2Stub(dir);
+  const appsConfig = join(dir, "mls-base", "pm2.config.js");
+  const messagesConfig = join(dir, "msg.collab.codes", "pm2.config.js");
+  mkdirSync(dirname(appsConfig), { recursive: true });
+  mkdirSync(dirname(messagesConfig), { recursive: true });
+  writeFileSync(appsConfig, appsFixture);
+  writeFileSync(messagesConfig, messagesFixture);
+  const result = invoke(staged.script, [stubPath, appsConfig, messagesConfig], baseEnv(staged, {
+    PM2_STUB_LOG: logPath,
+  }));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /systemctl/u);
+  assert.equal(callsOf(logPath).length, 0);
+  assert.equal(/phase=done /u.test(result.stderr), false);
+});
+
+test("an external daemon cgroup is not adopted as success", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pm2-start-fixed-"));
+  const staged = stage(dir, { daemonService: "other.service" });
+  const { stubPath, logPath } = writePm2Stub(dir);
+  const appsConfig = join(dir, "mls-base", "pm2.config.js");
+  const messagesConfig = join(dir, "missing", "pm2.config.js");
+  mkdirSync(dirname(appsConfig), { recursive: true });
+  writeFileSync(appsConfig, appsFixture);
+  const result = invoke(staged.script, [stubPath, appsConfig, messagesConfig], baseEnv(staged, {
+    PM2_STUB_LOG: logPath,
+  }));
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /phase=done edge=end .* code=1/u);
+  assert.equal(callsOf(logPath).some((call) => /resurrect|dump/u.test(call.cmd.join(" "))), false);
+});
+
+test("a missing pidfile is not success", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pm2-start-fixed-"));
+  const staged = stage(dir);
+  const { stubPath, logPath } = writePm2Stub(dir);
+  const appsConfig = join(dir, "missing apps", "pm2.config.js");
+  const messagesConfig = join(dir, "missing messages", "pm2.config.js");
+  const result = invoke(staged.script, [stubPath, appsConfig, messagesConfig], baseEnv(staged, {
+    PM2_STUB_LOG: logPath,
+    PM2_STUB_SKIP_PID: "1",
+  }));
+  assert.notEqual(result.status, 0);
+  assert.deepEqual(callsOf(logPath).map((call) => call.cmd), [["ping"]]);
+  assert.match(result.stderr, /phase=done edge=end .* code=1/u);
 });
