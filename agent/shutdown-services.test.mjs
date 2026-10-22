@@ -51,7 +51,10 @@ function harness(overrides = {}) {
       units[argv[2]] = "down";
       return Promise.resolve({ code: 0, stdout: "" });
     }
-    if (argv.includes("jlist")) {
+    if (argv.includes("which") && argv[argv.length - 1] === "pm2") {
+      return Promise.resolve({ code: 0, stdout: "/usr/bin/pm2\n" });
+    }
+    if (argv.includes("list") && argv.some((arg) => String(arg).includes("pm2-readonly.mjs"))) {
       return Promise.resolve({ code: 0, stdout: JSON.stringify(processes) });
     }
     if (argv.includes("stop") && argv.includes("pm2")) {
@@ -148,7 +151,12 @@ test("lost rpc and a missing daemon are not an empty stop", async () => {
     const h = harness();
     h.deps.exec = (argv) => {
       h.calls.push(argv.slice());
-      if (argv.includes("jlist")) return Promise.resolve({ code, stdout: "" });
+      if (argv.includes("which") && argv[argv.length - 1] === "pm2") {
+        return Promise.resolve({ code: 0, stdout: "/usr/bin/pm2\n" });
+      }
+      if (argv.includes("list") && argv.some((arg) => String(arg).includes("pm2-readonly.mjs"))) {
+        return Promise.resolve({ code, stdout: "" });
+      }
       if (argv[0] === "systemctl" && argv[1] === "show") {
         return Promise.resolve({ code: 0, stdout: show(h.units[argv[2]] ?? "missing") });
       }
@@ -161,7 +169,8 @@ test("lost rpc and a missing daemon are not an empty stop", async () => {
     const report = await stopServices(h.deps);
     assert.equal(report.servicesStopped, false);
     assert.ok(report.notStopped.includes("pm2"));
-    assert.equal(h.calls.filter((argv) => argv.includes("jlist")).length >= 1, true);
+    assert.equal(h.calls.filter((argv) => argv.includes("list") && argv.some((arg) => String(arg).includes("pm2-readonly.mjs"))).length >= 1, true);
+    assert.equal(h.calls.some((argv) => argv.includes("jlist") || argv.includes("start")), false);
     assert.equal(h.calls.some((argv) => argv.includes("pm2") && argv.includes("stop")), false);
     assert.equal(h.calls.some((argv) => argv[1] === "stop" && argv[2] === "redis-server.service"), false);
   }
@@ -303,13 +312,34 @@ test("a bad unit name from list-units is unconfirmed and not stopped", async () 
   assert.equal(h.calls.some((argv) => argv[1] === "stop" && String(argv[2] || "").includes("bad")), false);
 });
 
+test("a daemon that vanishes between reads is unconfirmed and does not autostart", async () => {
+  const h = harness();
+  let lists = 0;
+  const realExec = h.deps.exec;
+  h.deps.exec = (argv) => {
+    if (argv.includes("list") && argv.some((arg) => String(arg).includes("pm2-readonly.mjs"))) {
+      lists += 1;
+      h.calls.push(argv.slice());
+      if (lists === 1) return Promise.resolve({ code: 0, stdout: JSON.stringify(h.getProcesses()) });
+      return Promise.resolve({ code: 3, stdout: "" });
+    }
+    return realExec(argv);
+  };
+  const report = await stopServices(h.deps);
+  assert.equal(lists >= 2, true);
+  assert.equal(report.servicesStopped, false);
+  assert.ok(report.notStopped.includes("pm2") || report.notStopped.includes("app-b"));
+  assert.equal(h.calls.some((argv) => argv.includes("jlist") || argv.includes("start")), false);
+  assert.equal(h.calls.some((argv) => argv[1] === "stop" && argv[2] === "redis-server.service"), false);
+});
+
 test("an unknown pm2 target is an unconfirmed inventory, not an exception", async () => {
   for (const target of [{ pm2User: undefined, pm2Home: undefined }, { pm2User: "collab", pm2Home: "" }]) {
     const h = harness(target);
     const report = await stopServices(h.deps);
     assert.equal(report.servicesStopped, false);
     assert.ok(report.notStopped.includes("pm2"));
-    assert.equal(h.calls.some((argv) => argv.includes("jlist") || argv.includes("pm2")), false);
+    assert.equal(h.calls.some((argv) => argv.includes("jlist") || argv.includes("list") || argv.includes("pm2")), false);
     const redisStop = h.calls.some((argv) => argv[1] === "stop" && argv[2] === "redis-server.service");
     assert.equal(redisStop, false, "redis is only observed while apps are unconfirmed");
   }

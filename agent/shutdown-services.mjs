@@ -1,6 +1,9 @@
 // Ordered stop of managed services. Commands, clock and observation are injected.
 // This module never stops the host by itself and never builds a shell from data.
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { procIdentity } from "../scripts/pm2-lifecycle.mjs";
+import { listPm2 } from "../scripts/pm2-readonly.mjs";
 
 export const PLATFORM_PM2 = Object.freeze(["msg-worker", "msg"]);
 const PLATFORM_SET = new Set(PLATFORM_PM2);
@@ -51,7 +54,8 @@ export async function stopServices(deps) {
   const nginx = await stopUnit(deps, origin, "nginx", "nginx.service", log);
   effects.push(nginx);
 
-  const inventory = await readPm2(deps, origin);
+  const pm2Bin = pm2TargetKnown(deps) ? await resolvePm2Bin(deps, origin) : "";
+  const inventory = await readPm2(deps, origin, pm2Bin);
   const pm2Effects = [];
   if (!inventory.ok) {
     pm2Effects.push(effect("pm2", "pm2-inventory", "unconfirmed", []));
@@ -59,11 +63,11 @@ export async function stopServices(deps) {
   } else {
     const apps = selectApps(inventory.processes);
     for (const name of apps.early) {
-      pm2Effects.push(await stopPm2Name(deps, origin, inventory, name, "pm2-apps", log));
+      pm2Effects.push(await stopPm2Name(deps, origin, inventory, name, "pm2-apps", log, pm2Bin));
     }
-    pm2Effects.push(await stopPm2Name(deps, origin, inventory, "msg-worker", "msg-worker", log));
-    pm2Effects.push(await stopPm2Name(deps, origin, inventory, "msg", "msg", log));
-    const again = await readPm2(deps, origin);
+    pm2Effects.push(await stopPm2Name(deps, origin, inventory, "msg-worker", "msg-worker", log, pm2Bin));
+    pm2Effects.push(await stopPm2Name(deps, origin, inventory, "msg", "msg", log, pm2Bin));
+    const again = await readPm2(deps, origin, pm2Bin);
     if (!again.ok) {
       pm2Effects.push(effect("pm2", "pm2-confirm", "unconfirmed", []));
       log("stage=pm2-confirm result=unconfirmed");
@@ -282,9 +286,33 @@ async function observePostgresql(deps, origin, log, allowStop) {
   return out;
 }
 
-async function readPm2(deps, origin) {
-  if (!pm2TargetKnown(deps)) return { ok: false, processes: [] };
-  const ran = await runObserve(deps, origin, pm2Argv(deps, "jlist"));
+// Installed copies rewrite this import to /usr/local/lib/collab/pm2-readonly.mjs.
+function adapterScript() {
+  if (typeof listPm2 !== "function") throw new TypeError("pm2-readonly");
+  const self = fileURLToPath(import.meta.url);
+  const matched = readFileSync(self, "utf8").match(/from "([^"]+pm2-readonly\.mjs)"/);
+  if (!matched) throw new TypeError("pm2-readonly-import");
+  const spec = matched[1];
+  if (spec.startsWith("/")) return spec;
+  return fileURLToPath(new URL(spec, import.meta.url));
+}
+
+function asUser(deps, argv) {
+  if (deps.pm2User === "root") return ["env", `PM2_HOME=${deps.pm2Home}`, ...argv];
+  return ["sudo", "-n", "-u", deps.pm2User, "-H", "env", `PM2_HOME=${deps.pm2Home}`, ...argv];
+}
+
+async function resolvePm2Bin(deps, origin) {
+  if (typeof deps.pm2Bin === "string" && deps.pm2Bin.startsWith("/")) return deps.pm2Bin;
+  const ran = await runObserve(deps, origin, asUser(deps, ["which", "pm2"]));
+  if (ran.kind !== "ok" || ran.code !== 0) return "";
+  const line = String(ran.stdout ?? "").trim().split("\n")[0];
+  return line.startsWith("/") ? line : "";
+}
+
+async function readPm2(deps, origin, pm2Bin) {
+  if (!pm2TargetKnown(deps) || !pm2Bin) return { ok: false, processes: [] };
+  const ran = await runObserve(deps, origin, asUser(deps, [process.execPath, adapterScript(), "list", pm2Bin]));
   if (ran.kind !== "ok" || ran.code !== 0) return { ok: false, processes: [] };
   let parsed;
   try {
@@ -298,7 +326,7 @@ async function readPm2(deps, origin) {
     const name = row?.name;
     const pid = Number(row?.pid);
     const status = typeof row?.pm2_env?.status === "string" ? row.pm2_env.status : "";
-    // pm2 jlist has no startTime; pm_uptime is when this pid was started (ms).
+    // Passive list has no kernel startTime; pm_uptime is when this pid was started (ms).
     const startTime = Number(row?.pm2_env?.pm_uptime);
     if (typeof name !== "string" || !NAME_RE.test(name)) return { ok: false, processes: [] };
     if (!Number.isInteger(pid) || pid < 0) return { ok: false, processes: [] };
@@ -325,7 +353,7 @@ function pm2Argv(deps, command, name) {
   ];
 }
 
-async function stopPm2Name(deps, origin, inventory, name, stage, log) {
+async function stopPm2Name(deps, origin, inventory, name, stage, log, pm2Bin) {
   if (!NAME_RE.test(name)) {
     log(`stage=${stage} result=unconfirmed`);
     return effect(name, stage, "unconfirmed", []);
@@ -338,7 +366,7 @@ async function stopPm2Name(deps, origin, inventory, name, stage, log) {
   const identities = procs.map((proc) => identityOf(deps, proc));
   let ran = await runControl(deps, origin, stage, name, pm2Argv(deps, "stop", name));
   if (ran.kind === "observed") {
-    const mid = await readPm2(deps, origin);
+    const mid = await readPm2(deps, origin, pm2Bin);
     const still = mid.ok && mid.processes.some((proc) => proc.name === name && proc.alive);
     if (!mid.ok) {
       log(`stage=${stage} name=${name} result=unconfirmed`);
@@ -354,15 +382,15 @@ async function stopPm2Name(deps, origin, inventory, name, stage, log) {
     log(`stage=${stage} name=${name} result=unconfirmed`);
     return effect(name, stage, "unconfirmed", identities);
   }
-  const gone = await waitGone(deps, origin, name);
+  const gone = await waitGone(deps, origin, name, pm2Bin);
   log(`stage=${stage} name=${name} result=${gone}`);
   return effect(name, stage, gone, identities);
 }
 
-async function waitGone(deps, origin, name) {
+async function waitGone(deps, origin, name, pm2Bin) {
   for (;;) {
     if (aborted(deps) || remainingMs(deps, origin) <= 0) return "unconfirmed";
-    const seen = await readPm2(deps, origin);
+    const seen = await readPm2(deps, origin, pm2Bin);
     if (!seen.ok) return "unconfirmed";
     const live = seen.processes.some((proc) => proc.name === name && proc.alive);
     if (!live) return "stopped";

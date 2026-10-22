@@ -18,6 +18,7 @@ const shutdownSet = [
   "usr/local/lib/collab-sites-agent/shutdown-worker.mjs",
   "usr/local/lib/collab-sites-agent/shutdown-services.mjs",
   "usr/local/lib/collab/pm2-lifecycle.mjs",
+  "usr/local/lib/collab/pm2-readonly.mjs",
   "etc/systemd/system/collab-shutdown.service",
 ];
 const ID_A = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
@@ -157,10 +158,12 @@ test("maintenance install is idempotent and does not start a worker or touch env
     const worker = path.join(stage.root, "usr/local/lib/collab-sites-agent/shutdown-worker.mjs");
     const services = path.join(stage.root, "usr/local/lib/collab-sites-agent/shutdown-services.mjs");
     const lifecycle = path.join(stage.root, "usr/local/lib/collab/pm2-lifecycle.mjs");
+    const readonly = path.join(stage.root, "usr/local/lib/collab/pm2-readonly.mjs");
     for (const file of [
       worker,
       services,
       lifecycle,
+      readonly,
       path.join(stage.root, "usr/local/lib/collab-sites-agent/shutdown-state.mjs"),
       path.join(stage.root, "usr/local/lib/collab-sites-agent/collab-sites-agent.mjs"),
     ]) {
@@ -168,7 +171,9 @@ test("maintenance install is idempotent and does not start a worker or touch env
     }
     const servicesSource = await readFile(services, "utf8");
     assert.match(servicesSource, new RegExp(lifecycle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(servicesSource, new RegExp(readonly.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     assert.equal(servicesSource.includes("../scripts/pm2-lifecycle.mjs"), false);
+    assert.equal(servicesSource.includes("../scripts/pm2-readonly.mjs"), false);
     await import(pathToFileURL(services).href);
     await import(pathToFileURL(worker).href);
   } finally {
@@ -309,6 +314,8 @@ test("bootstrap and maintenance install the same set and do not fire an old requ
     }
     const services = await readFile(path.join(booted.root, "usr/local/lib/collab-sites-agent/shutdown-services.mjs"), "utf8");
     assert.match(services, new RegExp(path.join(booted.root, "usr/local/lib/collab/pm2-lifecycle.mjs").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(services, new RegExp(path.join(booted.root, "usr/local/lib/collab/pm2-readonly.mjs").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.equal(services.includes("../scripts/pm2-readonly.mjs"), false);
     const log = await readFile(booted.log, "utf8");
     assert.match(log, /daemon-reload/);
     assert.doesNotMatch(log, /\b(start|stop|restart|enable)\b/);
