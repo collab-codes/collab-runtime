@@ -344,16 +344,48 @@ install_pm2_fixed_helper() {
   mkdir -p "$lib_dir"
   install_rooted_copy "${SCRIPT_DIR}/pm2-start-fixed.sh" "${lib_dir}/pm2-start-fixed.sh" 0755
   install_rooted_copy "${SCRIPT_DIR}/pm2-lifecycle.mjs" "${lib_dir}/pm2-lifecycle.mjs" 0644
+  install_rooted_copy "${SCRIPT_DIR}/pm2-readonly.mjs" "${lib_dir}/pm2-readonly.mjs" 0644
+  retarget_pm2_readonly_import "${lib_dir}/pm2-lifecycle.mjs" "${lib_dir}/pm2-readonly.mjs" required
 }
 
-# Clears startup ExecStart (resurrect) and ExecStop (pm2 kill).
-# Does not set Type, PIDFile, User, or ExecReload.
+# Installed copies must import the library path, including a fixture prefix.
+# A second install copies the checkout again and rewrites the same path.
+retarget_pm2_readonly_import() {
+  local file="$1"
+  local dest="$2"
+  local mode="$3"
+  local spec tmp
+  spec="$(quote_exec_arg "$dest")"
+  if grep -q "from ${spec}" "$file"; then
+    return 0
+  fi
+  if ! grep -Eq 'from "(\./|\.\./scripts/)pm2-readonly\.mjs"' "$file"; then
+    if [[ "$mode" == "required" ]]; then
+      log_error "pm2-readonly import missing in ${file}"
+      exit 1
+    fi
+    return 0
+  fi
+  tmp="$(mktemp "${file}.XXXXXX")"
+  sed \
+    -e "s#from \"./pm2-readonly.mjs\"#from ${spec}#" \
+    -e "s#from \"../scripts/pm2-readonly.mjs\"#from ${spec}#" \
+    "$file" > "$tmp"
+  chmod 644 "$tmp"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    chown root: "$tmp"
+  fi
+  mv -f "$tmp" "$file"
+}
+
+# Clears startup ExecStart (resurrect), ExecStop (pm2 kill) and ExecStopPost.
+# Does not set PIDFile, User, or ExecReload. Type and start limits are explicit.
 write_pm2_fixed_configs_dropin() {
   local pm2_bin="$1"
   local unit="pm2-${DEPLOY_USER}.service"
   local dropin_dir="/etc/systemd/system/${unit}.d"
   local lib_dir="/usr/local/lib/collab"
-  local helper lifecycle node_bin apps messages body exec_line exec_stop
+  local helper lifecycle node_bin apps messages body exec_line exec_stop exec_post
   if [[ -n "${COLLAB_SYSTEMD_ETC:-}" ]]; then
     dropin_dir="${COLLAB_SYSTEMD_ETC}/${unit}.d"
   fi
@@ -367,12 +399,24 @@ write_pm2_fixed_configs_dropin() {
   messages="${COLLAB_DATA_ROOT}/msg.collab.codes/pm2.config.js"
   exec_line="ExecStart=$(quote_exec_arg "$helper") $(quote_exec_arg "$pm2_bin") $(quote_exec_arg "$apps") $(quote_exec_arg "$messages")"
   exec_stop="ExecStop=$(quote_exec_arg "$node_bin") $(quote_exec_arg "$lifecycle") stop $(quote_exec_arg "$pm2_bin")"
-  body="[Service]
+  exec_post="ExecStopPost=$(quote_exec_arg "$node_bin") $(quote_exec_arg "$lifecycle") post-stop"
+  body="[Unit]
+StartLimitIntervalSec=3600s
+StartLimitBurst=3
+[Service]
+Type=forking
+TimeoutStartSec=90s
+TimeoutStopSec=900s
+Restart=on-failure
+RestartSec=10s
+KillMode=control-group
+SendSIGKILL=yes
 ExecStart=
 ${exec_line}
 ExecStop=
 ${exec_stop}
-TimeoutStopSec=900s"
+ExecStopPost=
+${exec_post}"
   write_atomic_file "${dropin_dir}/fixed-configs.conf" 0644 "$body"
   log_info "systemd drop-in ${dropin_dir}/fixed-configs.conf"
 }

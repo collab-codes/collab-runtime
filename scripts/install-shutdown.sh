@@ -40,6 +40,7 @@ LIB_DIR="${PREFIX}/usr/local/lib/collab"
 UNIT_PATH="${PREFIX}/etc/systemd/system/collab-shutdown.service"
 WORKER_PATH="${AGENT_DIR}/shutdown-worker.mjs"
 LIFECYCLE_PATH="${LIB_DIR}/pm2-lifecycle.mjs"
+READONLY_PATH="${LIB_DIR}/pm2-readonly.mjs"
 SYSTEMCTL_BIN="${SYSTEMCTL:-systemctl}"
 ANALYZE_BIN="${SYSTEMD_ANALYZE:-systemd-analyze}"
 
@@ -65,6 +66,39 @@ copy_file "${SOURCE_ROOT}/agent/shutdown-state.mjs" "${AGENT_DIR}/shutdown-state
 copy_file "${SOURCE_ROOT}/agent/shutdown-worker.mjs" "$WORKER_PATH"
 copy_file "${SOURCE_ROOT}/agent/shutdown-services.mjs" "${AGENT_DIR}/shutdown-services.mjs"
 copy_file "${SOURCE_ROOT}/scripts/pm2-lifecycle.mjs" "$LIFECYCLE_PATH"
+copy_file "${SOURCE_ROOT}/scripts/pm2-readonly.mjs" "$READONLY_PATH"
+
+# Checkout imports of the passive reader become the installed copy, prefix included.
+retarget_pm2_readonly() {
+  local file="$1"
+  local required="$2"
+  local spec tmp
+  spec="\"${READONLY_PATH}\""
+  if grep -q "from ${spec}" "$file"; then
+    return 0
+  fi
+  if ! grep -Eq 'from "(\./|\.\./scripts/)pm2-readonly\.mjs"' "$file"; then
+    if [[ "$required" -eq 1 ]]; then
+      echo "[ERR]  pm2-readonly import missing in ${file}" >&2
+      exit 1
+    fi
+    return 0
+  fi
+  tmp="$(mktemp "$(dirname "$file")/.pm2-readonly.XXXXXX")"
+  sed \
+    -e "s#from \"./pm2-readonly.mjs\"#from ${spec}#" \
+    -e "s#from \"../scripts/pm2-readonly.mjs\"#from ${spec}#" \
+    "$file" > "$tmp"
+  mv "$tmp" "$file"
+  chmod 644 "$file"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    chown 0:0 "$file"
+  fi
+}
+
+retarget_pm2_readonly "$LIFECYCLE_PATH" 1
+retarget_pm2_readonly "${AGENT_DIR}/shutdown-services.mjs" 0
+retarget_pm2_readonly "${AGENT_DIR}/collab-sites-agent.mjs" 0
 
 # The checkout import is relative to the repo. The installed copy must use the
 # stable library path, including a staging prefix when one was injected.

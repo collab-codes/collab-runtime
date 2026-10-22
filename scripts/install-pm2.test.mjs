@@ -219,6 +219,13 @@ ExecStop=${ctx.pm2Bin} kill
   );
 }
 
+function installedLifecycle(readonlyPath) {
+  const source = readFileSync(join(root, "scripts/pm2-lifecycle.mjs"), "utf8");
+  const from = 'from "./pm2-readonly.mjs"';
+  assert.equal(source.includes(from), true);
+  return source.replaceAll(from, `from ${JSON.stringify(readonlyPath)}`);
+}
+
 function runStep(ctx, args) {
   return execFileSync("bash", [step08Path, ...args], {
     encoding: "utf8",
@@ -250,13 +257,16 @@ test("--startup-only writes one ExecStart, timeout 900, custom data root, and ke
   const first = readFileSync(join(dropin, "fixed-configs.conf"), "utf8");
   const helper = join(ctx.collabLib, "pm2-start-fixed.sh");
   const lifecycle = join(ctx.collabLib, "pm2-lifecycle.mjs");
+  const readonly = join(ctx.collabLib, "pm2-readonly.mjs");
   const helperBefore = readFileSync(helper);
   const lifecycleBefore = readFileSync(lifecycle);
+  const readonlyBefore = readFileSync(readonly);
   runStep(ctx, ["--startup-only"]);
   const fixed = readFileSync(join(dropin, "fixed-configs.conf"), "utf8");
   assert.equal(fixed, first);
   assert.deepEqual(readFileSync(helper), helperBefore);
   assert.deepEqual(readFileSync(lifecycle), lifecycleBefore);
+  assert.deepEqual(readFileSync(readonly), readonlyBefore);
   const mount = readFileSync(join(dropin, "data-mount.conf"), "utf8");
   const apps = `${dataRoot}/mls-base/pm2.config.js`;
   const messages = `${dataRoot}/msg.collab.codes/pm2.config.js`;
@@ -271,15 +281,29 @@ test("--startup-only writes one ExecStart, timeout 900, custom data root, and ke
     "ExecStop=",
     `ExecStop="${nodeBin}" "${lifecycle}" stop "${ctx.pm2Bin}"`,
   ]);
+  const postLines = fixed.split("\n").filter((line) => line.startsWith("ExecStopPost="));
+  assert.deepEqual(postLines, [
+    "ExecStopPost=",
+    `ExecStopPost="${nodeBin}" "${lifecycle}" post-stop`,
+  ]);
+  assert.match(fixed, /^\[Unit\]\nStartLimitIntervalSec=3600s\nStartLimitBurst=3\n\[Service\]\n/);
+  assert.match(fixed, /^Type=forking$/m);
+  assert.match(fixed, /^TimeoutStartSec=90s$/m);
+  assert.match(fixed, /^Restart=on-failure$/m);
+  assert.match(fixed, /^RestartSec=10s$/m);
+  assert.match(fixed, /^KillMode=control-group$/m);
+  assert.match(fixed, /^SendSIGKILL=yes$/m);
   assert.equal(fixed.match(/TimeoutStopSec=900s/g)?.length, 1);
-  assert.doesNotMatch(fixed, /Type=|PIDFile=|ExecReload=|oneshot/);
+  assert.doesNotMatch(fixed, /PIDFile=|ExecReload=|oneshot|Restart=always|IgnoreOnFailure|\.timer|reset-failed/);
   const escapedRoot = dataRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   assert.match(mount, new RegExp(`^\\[Unit\\]\\nRequiresMountsFor=${escapedRoot}\\n$`));
   assert.equal(readFileSync(join(dropin, "keep-me.conf"), "utf8"), "LeaveThis\n");
   assert.equal(statSync(helper).mode & 0o777, 0o755);
   assert.equal(statSync(lifecycle).mode & 0o777, 0o644);
+  assert.equal(statSync(readonly).mode & 0o777, 0o644);
   assert.equal(readFileSync(helper, "utf8"), readFileSync(join(root, "scripts/pm2-start-fixed.sh"), "utf8"));
-  assert.equal(readFileSync(lifecycle, "utf8"), readFileSync(join(root, "scripts/pm2-lifecycle.mjs"), "utf8"));
+  assert.equal(readFileSync(readonly, "utf8"), readFileSync(join(root, "scripts/pm2-readonly.mjs"), "utf8"));
+  assert.equal(readFileSync(lifecycle, "utf8"), installedLifecycle(readonly));
   const calls = readFileSync(ctx.calls, "utf8");
   assert.match(calls, /systemctl daemon-reload/);
   assert.match(calls, /systemd-analyze verify/);
@@ -418,7 +442,13 @@ exit 0
   assert.equal(execLines[0], "ExecStart=");
   assert.match(execLines[1], /pm2-start-fixed\.sh/);
   assert.match(fixed, /ExecStop=\nExecStop=.*pm2-lifecycle\.mjs" stop /);
-  assert.equal(readFileSync(join(ctx.collabLib, "pm2-lifecycle.mjs"), "utf8"), readFileSync(join(root, "scripts/pm2-lifecycle.mjs"), "utf8"));
+  assert.match(fixed, /StartLimitBurst=3/);
+  assert.match(fixed, /TimeoutStartSec=90s/);
+  assert.match(fixed, /ExecStopPost=\nExecStopPost=.*pm2-lifecycle\.mjs" post-stop/);
+  assert.doesNotMatch(fixed, /Restart=always|Type=oneshot|IgnoreOnFailure/);
+  const readonly = join(ctx.collabLib, "pm2-readonly.mjs");
+  assert.equal(readFileSync(readonly, "utf8"), readFileSync(join(root, "scripts/pm2-readonly.mjs"), "utf8"));
+  assert.equal(readFileSync(join(ctx.collabLib, "pm2-lifecycle.mjs"), "utf8"), installedLifecycle(readonly));
   assert.doesNotMatch(fixed, /resurrect/);
   // assert_one_pm2_unit scans the host with GNU find -printf. On macOS that
   // command exits 1 after logrotate, with no unit-count line. A Linux host
