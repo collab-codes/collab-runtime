@@ -144,6 +144,19 @@ systemd-analyze verify pm2-ubuntu.service
 
 Expect the helper on `ExecStart`, `pm2-lifecycle.mjs stop` on `ExecStop` with the unit's PM2 binary, and `TimeoutStopUSec=15min`.
 
+## Startup, health, and drain
+
+These are different facts.
+
+- **Startup** is the unit start. The helper budget is 80s monotonic, inside `TimeoutStartSec=90s`, and covers the lock plus both configs. The journal records `bootId` and the phase (`validate-home`, `lock`, `guard`, `apps`, `messages`, `done`) with start, end, monotonic duration, and exit code. A slow first boot is located by that phase. Passing the hook and unit tests does not name the cause of a previous 88s stall.
+- **Recovery** is finite: `StartLimitIntervalSec=3600s`, `StartLimitBurst=3`, `Restart=on-failure`, `RestartSec=10s`, `KillMode=control-group`, `SendSIGKILL=yes`. Nothing in this install runs `reset-failed` or starts the unit again after the burst. `ExecStopPost` is `pm2-lifecycle.mjs post-stop`: it checks `SERVICE_RESULT` and leftover identities. It does not call `pm2 kill`, `jlist`, or `start`. A start killed by the kernel for timeout is not a graceful stop receipt.
+- **Drain** is the synchronous `ExecStop` (`pm2-lifecycle.mjs stop`, `TimeoutStopSec=900s`). Online processes and a zero helper exit are not a drain.
+- **Health** is HTTP `/health` of the real service, read only in a reserved proof. Unit `active`, a PM2 process `online`, or a present `dump.pm2` does not mean the app is healthy.
+
+Automatic readers use one passive helper, installed at `/usr/local/lib/collab/pm2-readonly.mjs` (0644, root). The command is `node pm2-readonly.mjs list <pm2-bin>` with `PM2_HOME` set to the deploy user's home. It talks to the existing `rpc.sock` and does not call `Client.start` or `pm2 jlist`. A missing socket or a non-zero exit is unavailable, not an empty process list. The list keeps only `pm_id`, `name`, `pid`, `monit.cpu`, `monit.memory`, and `pm2_env.status`, `pm_uptime`, `restart_time`, `exec_mode`, `pmx_module`. `version <pm2-bin>` reads `package.json` and does not connect. The heartbeat may add `payload.boot` (`id`, `uptimeSeconds`) and `payload.pm2.unit` (`name`, `activeState`, `subState`, `result`, `nRestarts`). `ready` requires the unit `active` and a valid process read. Real PM2 and systemd versions are recorded by the Linux tester, not by this document.
+
+`pm2 kill`, `stop`, `start`, `reload`, and `save` stay explicit mutations. They are not status checks.
+
 ## Backup and rollback
 
 Back up only the files this install changes. Restore those files only. Do not copy `dump.pm2` back, and do not restart.
