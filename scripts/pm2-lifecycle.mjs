@@ -392,6 +392,17 @@ function scanSameHome(io, uid, home, pm2Home) {
     if (seenUid !== uid) {
       continue;
     }
+    // Only the pm2 daemon (`PM2 v…`) and node apps can be the target. Other processes of the deploy user
+    // (sshd session, user systemd with the same HOME and no PM2_HOME: lima 22/10) are not, whatever their environ says.
+    let comm;
+    try {
+      comm = commFromStat(statText);
+    } catch {
+      return { complete: false, pids: [] };
+    }
+    if (!couldBePm2Process(comm)) {
+      continue;
+    }
     let environ;
     try {
       environ = readOptional(io, `/proc/${pid}/environ`);
@@ -403,17 +414,7 @@ function scanSameHome(io, uid, home, pm2Home) {
         continue;
       }
       if (error && (error.code === "EACCES" || error.code === "EPERM")) {
-        // Same uid but not dumpable (an sshd session of the deploy user, lima 22/10): not pm2 and not one of its apps,
-        // which are plain node processes. A pm2/node process we cannot read is still unclassifiable: fail closed.
-        let comm;
-        try {
-          comm = commFromStat(statText);
-        } catch {
-          return { complete: false, pids: [] };
-        }
-        if (!couldBePm2Process(comm)) {
-          continue;
-        }
+        // A pm2/node process of our uid that we cannot read is unclassifiable: fail closed.
         throw asObsError(error);
       }
       return { complete: false, pids: [] };

@@ -640,3 +640,19 @@ test("a same-uid process we cannot read is skipped unless it could be pm2 or nod
   assert.notEqual(await guardPm2(base(box.io, { helperPid: 1, controlPids: [1] })), 0);
   assert.equal(box.logs.some((line) => line.includes("permission")), true);
 });
+
+test("a same-uid non-pm2 process with the same HOME and no PM2_HOME is not the target (user systemd, lima 22/10)", async () => {
+  const box = world();
+  box.files.delete(`${PM2_HOME}/pm2.pid`);
+  box.rpc = false;
+  box.cgroup.clear();
+  box.cgroup.add(1);
+  box.procs.set(831, { stat: statLine(831, "systemd", 547), status: status(1000), environ: `HOME=${HOME}\0` });
+  box.io.listProcPids = () => [831];
+  assert.equal(await guardPm2(base(box.io, { helperPid: 1, controlPids: [1] })), 0);
+  assert.equal(box.logs.some((line) => line.includes("pid=831")), false);
+
+  // The same environ on a node process is still a pm2 candidate and refuses the start.
+  box.procs.set(831, { stat: statLine(831, "node", 547), status: status(1000), environ: `HOME=${HOME}\0` });
+  assert.notEqual(await guardPm2(base(box.io, { helperPid: 1, controlPids: [1] })), 0);
+});
