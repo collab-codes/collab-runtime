@@ -91,6 +91,21 @@ export function startTimeFromStat(statText) {
   return startTime;
 }
 
+/** The `comm` between the parentheses of /proc/<pid>/stat (world-readable, at most 15 chars). */
+export function commFromStat(statText) {
+  const open = statText.indexOf("(");
+  const close = statText.lastIndexOf(")");
+  if (open < 0 || close < open) {
+    throw new Error("proc stat");
+  }
+  return statText.slice(open + 1, close);
+}
+
+/** The pm2 daemon (`PM2 v…`) and its node apps. Everything else of our uid cannot be the pm2 target. */
+function couldBePm2Process(comm) {
+  return comm.startsWith("PM2") || comm === "node" || comm.startsWith("node ");
+}
+
 /**
  * @param {string} statusText
  * @returns {number}
@@ -388,7 +403,17 @@ function scanSameHome(io, uid, home, pm2Home) {
         continue;
       }
       if (error && (error.code === "EACCES" || error.code === "EPERM")) {
-        // Our own uid and still unreadable: fail closed, as before.
+        // Same uid but not dumpable (an sshd session of the deploy user, lima 22/10): not pm2 and not one of its apps,
+        // which are plain node processes. A pm2/node process we cannot read is still unclassifiable: fail closed.
+        let comm;
+        try {
+          comm = commFromStat(statText);
+        } catch {
+          return { complete: false, pids: [] };
+        }
+        if (!couldBePm2Process(comm)) {
+          continue;
+        }
         throw asObsError(error);
       }
       return { complete: false, pids: [] };

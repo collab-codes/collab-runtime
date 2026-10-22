@@ -620,3 +620,23 @@ test("another uid's environ is never read: EACCES on root's /proc/1 does not sto
   assert.notEqual(refused, 0);
   assert.equal(box.logs.some((line) => line.includes("permission")), true);
 });
+
+test("a same-uid process we cannot read is skipped unless it could be pm2 or node (sshd of the deploy user, lima 22/10)", async () => {
+  const box = world();
+  box.files.delete(`${PM2_HOME}/pm2.pid`);
+  box.rpc = false;
+  box.cgroup.clear();
+  box.cgroup.add(1);
+  const denied = Object.assign(new Error("EACCES"), { code: "EACCES" });
+  box.procs.set(1767, { stat: statLine(1767, "sshd", 300), status: status(1000), environ: denied });
+  box.procs.set(77, { stat: statLine(77, "PM2", 4242), status: status(1000), environ: environ() });
+  box.io.listProcPids = () => [1767, 77];
+  assert.equal(await guardPm2(base(box.io, { helperPid: 1, controlPids: [1] })), 1);
+  assert.equal(box.logs.some((line) => line.includes("pid=77")), true);
+  assert.equal(box.logs.some((line) => line.includes("permission")), false);
+
+  // An unreadable node process of our uid still refuses.
+  box.procs.set(1767, { stat: statLine(1767, "node", 300), status: status(1000), environ: denied });
+  assert.notEqual(await guardPm2(base(box.io, { helperPid: 1, controlPids: [1] })), 0);
+  assert.equal(box.logs.some((line) => line.includes("permission")), true);
+});
