@@ -59,6 +59,75 @@ _load_deploy_user() {
   return 1
 }
 
+# Passive PM2 reads. The CLI must never run `pm2 --version` or `pm2 ls`:
+# those clients can start a daemon. Version comes from package.json; list
+# uses the installed readonly adapter under the deploy user's PM2_HOME.
+_pm2_readonly_path() {
+  local candidate
+  local here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  for candidate in \
+    "/usr/local/lib/collab/pm2-readonly.mjs" \
+    "${here}/scripts/pm2-readonly.mjs"
+  do
+    if [[ -f "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+_pm2_bin_path() {
+  command -v pm2 2>/dev/null || return 1
+}
+
+# Prints the installed PM2 version, or returns 1. Does not execute the pm2 binary.
+_pm2_version_passive() {
+  local adapter bin ver
+  adapter="$(_pm2_readonly_path)" || return 1
+  bin="$(_pm2_bin_path)" || return 1
+  ver="$(node "$adapter" version "$bin" 2>/dev/null)" || return 1
+  [[ -n "$ver" ]] || return 1
+  printf '%s' "$ver"
+}
+
+# Prints a JSON list, or returns 1. Never creates PM2_HOME and never uses root's home.
+_pm2_list_passive() {
+  local adapter bin
+  adapter="$(_pm2_readonly_path)" || return 1
+  bin="$(_pm2_bin_path)" || return 1
+  if ! _load_deploy_user; then
+    return 1
+  fi
+  if [[ -z "${DEPLOY_USER:-}" || "$DEPLOY_USER" == "root" || -z "${DEPLOY_HOME:-}" ]]; then
+    return 1
+  fi
+  if ! declare -F run_as_deploy >/dev/null; then
+    return 1
+  fi
+  run_as_deploy env "PM2_HOME=${DEPLOY_HOME}/.pm2" node "$adapter" list "$bin"
+}
+
+_print_msg_pm2_summary() {
+  PM2_ROWS="$1" node --input-type=module -e '
+    let rows;
+    try { rows = JSON.parse(process.env.PM2_ROWS || ""); }
+    catch { process.exit(2); }
+    if (!Array.isArray(rows)) process.exit(2);
+    const msg = rows.filter((row) => row && typeof row.name === "string" && row.name.includes("msg"));
+    if (msg.length === 0) {
+      console.log("  (no msg processes)");
+      process.exit(0);
+    }
+    for (const row of msg) {
+      const status = row.pm2_env && row.pm2_env.status ? row.pm2_env.status : "unknown";
+      const pid = Number.isInteger(row.pid) ? row.pid : 0;
+      console.log(`  ${row.name}  ${status}  pid=${pid}`);
+    }
+  '
+}
+
 # ── Subcommand: logs ───────────────────────────────────────────────────────────
 cmd_logs() {
   local detail=false
@@ -112,7 +181,12 @@ cmd_status() {
   command -v redis-cli &>/dev/null && info "redis      $(redis-server --version)"
   command -v node      &>/dev/null && info "node       $(node --version)"
   command -v npm       &>/dev/null && info "npm        $(npm --version)"
-  command -v pm2       &>/dev/null && info "pm2        $(pm2 --version 2>/dev/null)"
+  local pm2_ver=""
+  if pm2_ver="$(_pm2_version_passive)"; then
+    info "pm2        ${pm2_ver}"
+  else
+    warn "pm2 unavailable"
+  fi
   command -v 7z        &>/dev/null && info "7zip       $(7z i 2>&1 | grep '7-Zip' | head -1 | awk '{print $1, $2}')"
   command -v certbot   &>/dev/null && info "certbot    $(certbot --version 2>&1 | awk '{print $2}')"
 
@@ -283,8 +357,12 @@ cmd_doctor() {
   echo -e "\n${C_BOLD}PM2${C_RESET}"
   divider
 
-  if command -v pm2 &>/dev/null; then
-    pass "pm2 $(pm2 --version 2>/dev/null) found"
+  local pm2_ver=""
+  if pm2_ver="$(_pm2_version_passive)"; then
+    pass "pm2 ${pm2_ver} found"
+  elif _pm2_bin_path >/dev/null; then
+    fail "pm2 unavailable"
+    (( failures++ )) || true
   else
     fail "pm2 not found"
     (( failures++ )) || true
@@ -458,14 +536,11 @@ cmd_msg() {
       else
         warn "no installed version recorded (${version_file} not found)"
       fi
-      if command -v pm2 &>/dev/null; then
-        if _load_deploy_user && declare -F run_as_deploy >/dev/null; then
-          run_as_deploy pm2 ls | grep -E "msg|─" || true
-        else
-          pm2 ls | grep -E "msg|─" || true
-        fi
+      local pm2_json
+      if pm2_json="$(_pm2_list_passive 2>/dev/null)"; then
+        _print_msg_pm2_summary "$pm2_json" || warn "pm2 unavailable"
       else
-        warn "pm2 not found"
+        warn "pm2 unavailable"
       fi
       echo ""
       ;;
