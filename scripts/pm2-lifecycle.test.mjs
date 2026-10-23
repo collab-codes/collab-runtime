@@ -46,6 +46,7 @@ function world(overrides = {}) {
   /** @type {number|null} */
   let killCode = null;
   const cgroup = new Set([1, 10, 11]);
+  let stopPid = 600;
 
   const put = (pid, startTime, uid = 1000) => {
     procs.set(pid, {
@@ -124,7 +125,16 @@ function world(overrides = {}) {
       }
       return [11];
     },
+    listProcesses() {
+      return typeof box.rows === "function" ? box.rows() : box.rows;
+    },
+    spawnStop(_bin, _home, pmId) {
+      box.events.push(`stop:${pmId}`);
+      stopPid += 1;
+      return { pid: stopPid, finished: Promise.resolve(box.onStop(pmId)) };
+    },
     spawnKill() {
+      box.events.push("kill");
       killCalls += 1;
       const finished = new Promise((resolve) => {
         finishKill = resolve;
@@ -133,8 +143,12 @@ function world(overrides = {}) {
     },
   };
 
-  return {
+  const box = {
     io,
+    // Passive list rows (array or function). Empty by default: no business phase, the old tests stay as they were.
+    rows: [],
+    events: [],
+    onStop: () => 0,
     procs,
     files,
     logs,
@@ -163,6 +177,7 @@ function world(overrides = {}) {
     },
     ...overrides,
   };
+  return box;
 }
 
 function base(io, extra = {}) {
@@ -655,4 +670,170 @@ test("a same-uid non-pm2 process with the same HOME and no PM2_HOME is not the t
   // The same environ on a node process is still a pm2 candidate and refuses the start.
   box.procs.set(831, { stat: statLine(831, "node", 547), status: status(1000), environ: `HOME=${HOME}\0` });
   assert.notEqual(await guardPm2(base(box.io, { helperPid: 1, controlPids: [1] })), 0);
+});
+
+// rt123 s12: ExecStop drains apps -> msg-worker -> msg before the daemon is killed.
+const PHASED = [
+  { name: "shop", pid: 11, start: 2000 },
+  { name: "shop", pid: 15, start: 2500 },
+  { name: "msg-worker", pid: 12, start: 3000 },
+  { name: "msg", pid: 13, start: 4000 },
+  { name: "pm2-logrotate", pid: 14, start: 4500, module: true },
+];
+
+function phasedWorld() {
+  const box = world();
+  for (const def of PHASED) {
+    box.procs.set(def.pid, { stat: statLine(def.pid, "node", def.start), status: status(1000), environ: environ() });
+    box.cgroup.add(def.pid);
+  }
+  box.procs.get(10).stat = statLine(10, "PM2 v5", 1000);
+  box.rows = () => PHASED.map((def, index) => ({
+    pm_id: index,
+    name: def.name,
+    pid: box.procs.has(def.pid) ? def.pid : 0,
+    pm2_env: { pmx_module: def.module === true },
+  }));
+  const gone = (pid) => {
+    box.procs.delete(pid);
+    box.cgroup.delete(pid);
+  };
+  box.gone = gone;
+  // pm_id is the index in PHASED: shop#0, shop#1, msg-worker#2, msg#3, module#4.
+  box.onStop = (pmId) => {
+    gone(PHASED[pmId].pid);
+    return 0;
+  };
+  const spawnKill = box.io.spawnKill;
+  box.io.spawnKill = (...args) => {
+    // The daemon and its modules leave only with pm2 kill.
+    gone(10);
+    gone(14);
+    box.files.delete(`${PM2_HOME}/pm2.pid`);
+    return spawnKill(...args);
+  };
+  return box;
+}
+
+test("stop drains apps, then msg-worker, then msg, and kills the daemon only after the last phase", async () => {
+  const box = phasedWorld();
+  const aliveAtStop = {};
+  const onStop = box.onStop;
+  box.onStop = (pmId) => {
+    aliveAtStop[pmId] = [11, 12, 13, 14, 15].filter((pid) => box.procs.has(pid));
+    return onStop(pmId);
+  };
+  assert.equal(await stopPm2(base(box.io)), 0);
+  // One stop per instance pm_id (two shop instances); the module is not a business phase.
+  assert.deepEqual(box.events, ["stop:0", "stop:1", "stop:2", "stop:3", "kill"]);
+  assert.deepEqual(aliveAtStop[0], [11, 12, 13, 14, 15]);
+  assert.deepEqual(aliveAtStop[2], [12, 13, 14]);
+  assert.deepEqual(aliveAtStop[3], [13, 14]);
+  const receipt = box.receipt();
+  assert.equal(receipt.phase, "stopped");
+  assert.equal(receipt.confirmed, true);
+  for (const def of PHASED) {
+    assert.ok(receipt.identities.some((id) => id.pid === def.pid && id.startTime === def.start), `identity ${def.pid}`);
+  }
+  assert.equal(box.logs.join("\n").includes(SECRET), false);
+});
+
+function assertBlockedBeforeMessages(box, code) {
+  assert.equal(code, 1);
+  assert.equal(box.events[0], "stop:0");
+  assert.equal(box.events.every((event) => event === "stop:0" || event === "stop:1"), true);
+  assert.equal(box.killCalls, 0);
+  assert.equal(box.procs.has(12) && box.procs.has(13), true);
+  assert.equal(box.receipt().phase, "stopping");
+  assert.equal(box.receipt().confirmed, false);
+  assert.match(box.logs.join("\n"), /error=order-unconfirmed phase=apps/);
+}
+
+test("a live app holds msg-worker and msg until the deadline, without a false receipt or kill", async () => {
+  const box = phasedWorld();
+  box.onStop = () => 0; // CLI exit 0, but the app is still alive
+  assertBlockedBeforeMessages(box, await stopPm2(base(box.io)));
+  assert.ok(box.now <= 200);
+});
+
+test("PM2 says stopped (pid 0) while the kernel identity lives: still blocks the next phase", async () => {
+  const box = phasedWorld();
+  const rows = box.rows;
+  box.onStop = () => {
+    box.rows = () => rows().map((row) => (row.name === "shop" ? { ...row, pid: 0 } : row));
+    return 0;
+  };
+  assertBlockedBeforeMessages(box, await stopPm2(base(box.io)));
+});
+
+test("lost RPC, failed stop command, hung stop command, and a new daemon do not release msg", async () => {
+  const lost = phasedWorld();
+  const onStopLost = lost.onStop;
+  lost.onStop = (pmId) => {
+    onStopLost(pmId);
+    lost.rows = () => {
+      throw new Error("rpc-sock-absent");
+    };
+    return 0;
+  };
+  assertBlockedBeforeMessages(lost, await stopPm2(base(lost.io)));
+  assert.match(lost.logs.join("\n"), /drain error=observe detail=rpc-sock-absent/);
+
+  const failed = phasedWorld();
+  failed.onStop = () => 2;
+  assertBlockedBeforeMessages(failed, await stopPm2(base(failed.io)));
+  assert.deepEqual(failed.events, ["stop:0"]);
+  assert.match(failed.logs.join("\n"), /error=cli name=shop#0 code=2/);
+
+  const hung = phasedWorld();
+  hung.onStop = () => new Promise(() => {});
+  assertBlockedBeforeMessages(hung, await stopPm2(base(hung.io)));
+  assert.ok(hung.now <= 200);
+  assert.deepEqual(hung.events, ["stop:0"]);
+  assert.match(hung.logs.join("\n"), /error=timeout name=shop#0/);
+
+  const swapped = phasedWorld();
+  const onStopSwap = swapped.onStop;
+  swapped.onStop = (pmId) => {
+    onStopSwap(pmId);
+    swapped.gone(10);
+    swapped.procs.set(20, { stat: statLine(20, "PM2 v5", 9000), status: status(1000), environ: environ() });
+    swapped.cgroup.add(20);
+    swapped.files.set(`${PM2_HOME}/pm2.pid`, "20\n");
+    return 0;
+  };
+  assertBlockedBeforeMessages(swapped, await stopPm2(base(swapped.io)));
+  assert.deepEqual(swapped.events, ["stop:0"]);
+  assert.match(swapped.logs.join("\n"), /drain error=daemon-changed pid=10/);
+});
+
+test("a reused pid with another start time is the old app gone; an unreadable inventory stops nothing", async () => {
+  const reused = phasedWorld();
+  const onStop = reused.onStop;
+  reused.onStop = (pmId) => {
+    onStop(pmId);
+    if (pmId === 0) {
+      // pid 11 reused by an unrelated node process of the same uid; PM2 lists the stopped app with pid 0.
+      reused.procs.set(11, { stat: statLine(11, "node", 7777), status: status(1000), environ: environ() });
+      const rows = reused.rows;
+      reused.rows = () => rows().map((row) => (row.pid === 11 ? { ...row, pid: 0 } : row));
+    }
+    return 0;
+  };
+  assert.equal(await stopPm2(base(reused.io)), 0, reused.logs.join("\n"));
+  assert.deepEqual(reused.events, ["stop:0", "stop:1", "stop:2", "stop:3", "kill"]);
+
+  const unreadable = phasedWorld();
+  unreadable.rows = () => {
+    throw new Error("timeout");
+  };
+  assert.equal(await stopPm2(base(unreadable.io)), 1);
+  assert.deepEqual(unreadable.events, []);
+  assert.equal(unreadable.receipt().confirmed, false);
+  assert.match(unreadable.logs.join("\n"), /drain error=inventory detail=timeout/);
+
+  const outside = phasedWorld();
+  outside.cgroup.delete(13); // listed by PM2 but not in the unit: not ours to stop
+  assert.equal(await stopPm2(base(outside.io)), 1);
+  assert.deepEqual(outside.events, []);
 });

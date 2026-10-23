@@ -6,6 +6,7 @@ import { existsSync, openSync, writeSync, fsyncSync, closeSync, renameSync, chmo
 import { pathToFileURL } from "node:url";
 import path from "node:path";
 import { listPm2 } from "./pm2-readonly.mjs";
+import { isPm2Module, runPm2StopOrder } from "./pm2-stop-order.mjs";
 
 /** Global monotonic budget. Shorter than systemd TimeoutStopSec=900s. */
 export const STOP_DEADLINE_MS = 840_000;
@@ -619,6 +620,203 @@ function controlPidsOf(options) {
   return list.filter((pid) => Number.isInteger(pid) && pid > 0);
 }
 
+function errorText(error) {
+  if (error instanceof ObsError) {
+    return error.kind;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Original kernel identity still alive? A different start time on the same pid is a reused pid: gone.
+ * @returns {boolean}
+ */
+function sameProcessAlive(io, id, options) {
+  let statText;
+  try {
+    statText = readOptional(io, `/proc/${id.pid}/stat`);
+  } catch (error) {
+    throw asObsError(error);
+  }
+  if (statText === null) {
+    return false;
+  }
+  let startTime;
+  try {
+    startTime = startTimeFromStat(statText);
+  } catch {
+    throw new ObsError("inconsistent", "proc identity");
+  }
+  if (startTime !== id.startTime) {
+    return false;
+  }
+  return aliveIdentity(io, id, options);
+}
+
+/**
+ * Live business/platform rows of the passive list, each tied to a kernel identity of this uid/PM2_HOME.
+ * PM2 modules stay for the final daemon close. A row with pid 0 is a stopped entry, not a process.
+ * @returns {Array<{ name: string, pm_id: unknown, pid: number, startTime: number, id: ProcIdentity }>}
+ */
+function listedInstances(io, rows, bootId, options, known) {
+  if (!Array.isArray(rows)) {
+    throw new ObsError("inconsistent", "pm2 list");
+  }
+  const out = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object") {
+      throw new ObsError("inconsistent", "pm2 list");
+    }
+    const pid = row.pid == null ? 0 : Number(row.pid);
+    if (pid === 0 || isPm2Module(row)) {
+      continue;
+    }
+    if (!Number.isInteger(pid) || pid < 0 || typeof row.name !== "string" || row.name === "") {
+      throw new ObsError("inconsistent", "pm2 list");
+    }
+    if (known && !known.has(pid)) {
+      throw new ObsError("inconsistent", "pm2 list outside unit");
+    }
+    const live = readLiveIdentity(io, pid, bootId, options.uid, options.home, options.pm2Home);
+    if (live) {
+      // startTime is the kernel one, never pm_uptime.
+      out.push({ name: row.name, pm_id: row.pm_id, pid, startTime: live.startTime, id: live });
+    }
+  }
+  return out;
+}
+
+/**
+ * apps -> msg-worker -> msg through the shared order, before the daemon is killed.
+ * Each phase is confirmed by kernel identity; a lost RPC, a changed daemon, a failed command
+ * or the deadline blocks the dependent phases. Stop commands are control children, not service.
+ * @returns {Promise<{ ok: boolean, phase: string }>}
+ */
+async function drainByPhases(options, first, exclude, seen, deadline, pollMs) {
+  const io = options.io;
+  const daemon = first.daemon;
+  const refreshExclude = () => {
+    for (const pid of ownDescendants(io, options.unitCgroup, options.helperPid)) {
+      if (!exclude.includes(pid)) {
+        exclude.push(pid);
+      }
+    }
+    return exclude.filter((pid) => Number.isInteger(pid) && pid > 0);
+  };
+  const listRows = () => {
+    if (typeof io.listProcesses !== "function") {
+      throw new ObsError("inconsistent", "pm2 list unavailable");
+    }
+    return io.listProcesses(options.pm2Bin, options.pm2Home);
+  };
+  const sameDaemon = async () => {
+    let obs;
+    try {
+      obs = await observeTarget({ ...options, excludePids: refreshExclude() }, false);
+    } catch (error) {
+      logLine(io, `drain error=${errorText(error)}`);
+      return null;
+    }
+    if (!obs.daemon || !sameIdentity(obs.daemon, daemon) || !obs.rpc) {
+      logLine(io, `drain error=daemon-changed pid=${daemon.pid}`);
+      return null;
+    }
+    return obs;
+  };
+
+  /** @type {Map<number, { name: string, id: ProcIdentity }>} */
+  const original = new Map();
+  let inventory;
+  try {
+    const listed = listedInstances(io, await listRows(), first.bootId, options, new Set(first.service.map((id) => id.pid)));
+    for (const inst of listed) {
+      original.set(inst.pid, { name: inst.name, id: inst.id });
+      seen.set(identityKey(inst.id), inst.id);
+    }
+    inventory = listed.map(({ name, pm_id, pid, startTime }) => ({ name, pm_id, pid, startTime }));
+  } catch (error) {
+    logLine(io, `drain error=inventory detail=${errorText(error)}`);
+    return { ok: false, phase: "inventory" };
+  }
+  writeReceipt(io, options.pm2Home, receiptFrom(first.bootId, "stopping", false, seen));
+
+  // One instance at a time by its pm_id: a name can be all digits, "all" or a namespace for the PM2 CLI.
+  const stop = async (phase, deadlineAt) => {
+    for (const inst of phase.instances) {
+      const name = `${inst.name}#${inst.pmId}`;
+      if (!Number.isInteger(inst.pmId) || inst.pmId < 0) {
+        logLine(io, `stage=pm2-${phase.phase} error=pm-id name=${inst.name}`);
+        return false;
+      }
+      if (!(await sameDaemon())) {
+        return false;
+      }
+      const child = io.spawnStop(options.pm2Bin, options.pm2Home, inst.pmId);
+      if (!child || !Number.isInteger(child.pid) || child.pid <= 0) {
+        logLine(io, `stage=pm2-${phase.phase} error=cli name=${name}`);
+        return false;
+      }
+      exclude.push(child.pid);
+      /** @type {number|null} */
+      let code = null;
+      child.finished.then((value) => {
+        code = Number.isInteger(value) ? value : 1;
+      });
+      await Promise.resolve();
+      while (code === null) {
+        const left = deadlineAt - io.now();
+        if (left <= 0) {
+          logLine(io, `stage=pm2-${phase.phase} error=timeout name=${name}`);
+          return false;
+        }
+        await io.sleep(Math.min(pollMs, left));
+      }
+      if (code !== 0) {
+        logLine(io, `stage=pm2-${phase.phase} error=cli name=${name} code=${code}`);
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const observe = async () => {
+    const obs = await sameDaemon();
+    if (!obs) {
+      return { ok: false };
+    }
+    try {
+      const processes = [];
+      for (const [pid, entry] of original) {
+        if (sameProcessAlive(io, entry.id, options)) {
+          processes.push({ name: entry.name, pid, startTime: entry.id.startTime });
+        }
+      }
+      for (const inst of listedInstances(io, await listRows(), obs.bootId, options, null)) {
+        seen.set(identityKey(inst.id), inst.id);
+        processes.push({ name: inst.name, pid: inst.pid, startTime: inst.startTime });
+      }
+      return { ok: true, processes };
+    } catch (error) {
+      logLine(io, `drain error=observe detail=${errorText(error)}`);
+      return { ok: false };
+    }
+  };
+
+  const result = await runPm2StopOrder({
+    inventory,
+    remainingMs: deadline - io.now(),
+    stop,
+    observe,
+    now: () => io.now(),
+    sleep: (ms) => io.sleep(ms),
+    pollMs,
+    log: (line) => logLine(io, line),
+  });
+  writeReceipt(io, options.pm2Home, receiptFrom(first.bootId, "stopping", false, seen));
+  const failed = result.phases.find((phase) => phase.result === "unconfirmed" || phase.result === "blocked");
+  return { ok: result.ok, phase: failed ? failed.phase : "" };
+}
+
 export async function stopPm2(options) {
   const io = options.io;
   const deadlineMs = options.deadlineMs ?? STOP_DEADLINE_MS;
@@ -634,6 +832,7 @@ export async function stopPm2(options) {
   let killCode = null;
   let killWait = null;
   let jlistAllowed = true;
+  let drained = false;
 
   const fail = (receiptBoot, message) => {
     if (receiptBoot) {
@@ -675,6 +874,16 @@ export async function stopPm2(options) {
     }
 
     if (obs.daemon && obs.rpc && kill === null && jlistAllowed) {
+      if (!drained) {
+        // The daemon (and PM2 modules) close only after every business phase is confirmed gone.
+        drained = true;
+        const order = await drainByPhases(options, obs, exclude, seen, deadline, pollMs);
+        if (!order.ok) {
+          writeReceipt(io, options.pm2Home, receiptFrom(obs.bootId, "stopping", false, seen));
+          logLine(io, `error=order-unconfirmed phase=${order.phase} stop=forced-by-systemd`);
+          return 1;
+        }
+      }
       kill = io.spawnKill(options.pm2Bin, options.pm2Home);
       if (!kill || !Number.isInteger(kill.pid) || kill.pid <= 0) {
         return fail(obs.bootId, "error=cli");
@@ -1203,6 +1412,22 @@ export function createHostIo() {
     },
     unlink(file) {
       unlinkSync(file);
+    },
+    listProcesses(pm2Bin, pm2Home) {
+      return listPm2({ pm2Bin, pm2Home });
+    },
+    spawnStop(pm2Bin, pm2Home, pmId) {
+      const child = spawn(pm2Bin, ["stop", String(pmId)], {
+        env: { ...process.env, PM2_HOME: pm2Home },
+        stdio: "ignore",
+      });
+      return {
+        pid: child.pid ?? 0,
+        finished: new Promise((resolve) => {
+          child.once("error", () => resolve(1));
+          child.once("exit", (code) => resolve(code ?? 1));
+        }),
+      };
     },
     spawnKill(pm2Bin, pm2Home) {
       const child = spawn(pm2Bin, ["kill"], {
