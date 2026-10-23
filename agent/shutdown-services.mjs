@@ -2,11 +2,12 @@
 // This module never stops the host by itself and never builds a shell from data.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { procIdentity } from "../scripts/pm2-lifecycle.mjs";
+import { procIdentity, startTimeFromStat, uidFromStatus } from "../scripts/pm2-lifecycle.mjs";
 import { listPm2 } from "../scripts/pm2-readonly.mjs";
+import { isPm2Module, runPm2StopOrder } from "../scripts/pm2-stop-order.mjs";
 
-export const PLATFORM_PM2 = Object.freeze(["msg-worker", "msg"]);
-const PLATFORM_SET = new Set(PLATFORM_PM2);
+const PHASE_STAGE = Object.freeze({ apps: "pm2-apps", "msg-worker": "msg-worker", msg: "msg" });
+const BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id";
 const CUTOFF_MARGIN_MS = 60_000;
 const NAME_RE = /^[A-Za-z0-9_.:@+-]{1,128}$/;
 const UNIT_RE = /^[A-Za-z0-9_.:@+-]{1,128}$/;
@@ -39,6 +40,7 @@ const USER_RE = /^[A-Za-z0-9_.-]{1,32}$/;
  * @param {{ inflight: Promise<{ code: number|null, stdout?: string }>|null }} [deps.control]
  * @param {(ms: number) => Promise<void>} [deps.sleep]
  * @param {number} [deps.pollMs]
+ * @param {(path: string) => string} [deps.readProc] /proc reader; ENOENT means gone
  */
 export async function stopServices(deps) {
   assertDeps(deps);
@@ -55,35 +57,7 @@ export async function stopServices(deps) {
   effects.push(nginx);
 
   const pm2Bin = pm2TargetKnown(deps) ? await resolvePm2Bin(deps, origin) : "";
-  const inventory = await readPm2(deps, origin, pm2Bin);
-  const pm2Effects = [];
-  if (!inventory.ok) {
-    pm2Effects.push(effect("pm2", "pm2-inventory", "unconfirmed", []));
-    log("stage=pm2-inventory result=unconfirmed");
-  } else {
-    const apps = selectApps(inventory.processes);
-    for (const name of apps.early) {
-      pm2Effects.push(await stopPm2Name(deps, origin, inventory, name, "pm2-apps", log, pm2Bin));
-    }
-    pm2Effects.push(await stopPm2Name(deps, origin, inventory, "msg-worker", "msg-worker", log, pm2Bin));
-    pm2Effects.push(await stopPm2Name(deps, origin, inventory, "msg", "msg", log, pm2Bin));
-    const again = await readPm2(deps, origin, pm2Bin);
-    if (!again.ok) {
-      pm2Effects.push(effect("pm2", "pm2-confirm", "unconfirmed", []));
-      log("stage=pm2-confirm result=unconfirmed");
-    } else {
-      const live = businessLive(again.processes);
-      if (live.length === 0) {
-        pm2Effects.push(effect("pm2", "pm2-confirm", "stopped", []));
-        log("stage=pm2-confirm result=stopped");
-      } else {
-        for (const proc of live) {
-          pm2Effects.push(effect(proc.name, "pm2-confirm", "unconfirmed", [identityOf(deps, proc)]));
-          log(`stage=pm2-confirm name=${proc.name} result=unconfirmed`);
-        }
-      }
-    }
-  }
+  const pm2Effects = await stopPm2InOrder(deps, origin, pm2Bin, log);
   effects.push(...pm2Effects);
 
   const appsClear = pm2Effects.every((item) => item.result !== "unconfirmed");
@@ -146,29 +120,6 @@ function effect(name, stage, result, identities) {
 
 function pushUnique(list, name) {
   if (!list.includes(name)) list.push(name);
-}
-
-function identityOf(deps, proc) {
-  const bootId = typeof deps.bootId === "string" && deps.bootId.length > 0 ? deps.bootId : "unknown";
-  return procIdentity(bootId, proc.pid, proc.startTime);
-}
-
-/**
- * @param {{ name: string, pid: number, status: string, startTime: number }[]} processes
- */
-export function selectApps(processes) {
-  const early = [];
-  for (const proc of processes) {
-    if (!proc || proc.alive !== true) continue;
-    if (PLATFORM_SET.has(proc.name)) continue;
-    if (!early.includes(proc.name)) early.push(proc.name);
-  }
-  early.sort();
-  return { early };
-}
-
-function businessLive(processes) {
-  return processes.filter((proc) => proc && proc.alive === true);
 }
 
 async function stopUnit(deps, origin, name, unit, log) {
@@ -326,7 +277,7 @@ async function readPm2(deps, origin, pm2Bin) {
     const name = row?.name;
     const pid = Number(row?.pid);
     const status = typeof row?.pm2_env?.status === "string" ? row.pm2_env.status : "";
-    // Passive list has no kernel startTime; pm_uptime is when this pid was started (ms).
+    // pm_uptime is only validated here; the identity start time is read from /proc.
     const startTime = Number(row?.pm2_env?.pm_uptime);
     if (typeof name !== "string" || !NAME_RE.test(name)) return { ok: false, processes: [] };
     if (!Number.isInteger(pid) || pid < 0) return { ok: false, processes: [] };
@@ -336,8 +287,9 @@ async function readPm2(deps, origin, pm2Bin) {
     processes.push({
       name,
       pid,
+      pm_id: row?.pm_id,
       status,
-      startTime,
+      pmxModule: isPm2Module(row),
       alive: pid > 0,
     });
   }
@@ -353,52 +305,192 @@ function pm2Argv(deps, command, name) {
   ];
 }
 
-async function stopPm2Name(deps, origin, inventory, name, stage, log, pm2Bin) {
-  if (!NAME_RE.test(name)) {
-    log(`stage=${stage} result=unconfirmed`);
-    return effect(name, stage, "unconfirmed", []);
-  }
-  const procs = inventory.processes.filter((proc) => proc.name === name && proc.alive);
-  if (procs.length === 0) {
-    log(`stage=${stage} name=${name} result=not_applicable`);
-    return effect(name, stage, "not_applicable", []);
-  }
-  const identities = procs.map((proc) => identityOf(deps, proc));
-  let ran = await runControl(deps, origin, stage, name, pm2Argv(deps, "stop", name));
-  if (ran.kind === "observed") {
-    const mid = await readPm2(deps, origin, pm2Bin);
-    const still = mid.ok && mid.processes.some((proc) => proc.name === name && proc.alive);
-    if (!mid.ok) {
-      log(`stage=${stage} name=${name} result=unconfirmed`);
-      return effect(name, stage, "unconfirmed", identities);
-    }
-    if (!still) {
-      log(`stage=${stage} name=${name} result=stopped`);
-      return effect(name, stage, "stopped", identities);
-    }
-    ran = await runControl(deps, origin, stage, name, pm2Argv(deps, "stop", name));
-  }
-  if (ran.kind === "skipped" || ran.kind === "aborted" || ran.kind === "unconfirmed") {
-    log(`stage=${stage} name=${name} result=unconfirmed`);
-    return effect(name, stage, "unconfirmed", identities);
-  }
-  const gone = await waitGone(deps, origin, name, pm2Bin);
-  log(`stage=${stage} name=${name} result=${gone}`);
-  return effect(name, stage, gone, identities);
+// pm2 reads "all" and an all-digit argument as every process or a pm_id, never as one app name.
+function stoppableName(name) {
+  return NAME_RE.test(name) && name !== "all" && !/^[0-9]+$/.test(name);
 }
 
-async function waitGone(deps, origin, name, pm2Bin) {
-  for (;;) {
-    if (aborted(deps) || remainingMs(deps, origin) <= 0) return "unconfirmed";
-    const seen = await readPm2(deps, origin, pm2Bin);
-    if (!seen.ok) return "unconfirmed";
-    const live = seen.processes.some((proc) => proc.name === name && proc.alive);
-    if (!live) return "stopped";
-    const slice = Math.min(deps.pollMs ?? 20, remainingMs(deps, origin));
-    if (slice <= 0) return "unconfirmed";
-    if (typeof deps.sleep === "function") await deps.sleep(slice);
-    else await new Promise((resolve) => setTimeout(resolve, slice));
+function errorText(error) {
+  if (error && typeof error === "object" && typeof error.code === "string") return error.code;
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** File text, or null when the path is gone (ENOENT). Any other failure is thrown. */
+function readProcOptional(deps, path) {
+  try {
+    return typeof deps.readProc === "function" ? deps.readProc(path) : readFileSync(path, "utf8");
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw error;
   }
+}
+
+/** Kernel identity of a pid, or null when the process is gone. */
+function kernelOf(deps, pid) {
+  const stat = readProcOptional(deps, `/proc/${pid}/stat`);
+  if (stat === null) return null;
+  const status = readProcOptional(deps, `/proc/${pid}/status`);
+  if (status === null) return null;
+  return { startTime: startTimeFromStat(stat), uid: uidFromStatus(status) };
+}
+
+function readBootId(deps) {
+  const text = readProcOptional(deps, BOOT_ID_PATH);
+  const bootId = String(text ?? "").trim();
+  if (bootId === "") throw new Error("boot_id");
+  return bootId;
+}
+
+/**
+ * apps -> msg-worker -> msg through the shared order (scripts/pm2-stop-order.mjs). Each phase is
+ * confirmed by kernel identity (boot_id, pid, /proc start time, uid): a row that leaves the list
+ * while its pid lives is still alive, a reused pid is not the old process, and a new instance of
+ * the phase name keeps the phase open. A phase not confirmed leaves its dependents without a stop.
+ */
+async function stopPm2InOrder(deps, origin, pm2Bin, log) {
+  const inventoryFailed = () => {
+    log("stage=pm2-inventory result=unconfirmed");
+    return [effect("pm2", "pm2-inventory", "unconfirmed", [])];
+  };
+  const inventory = await readPm2(deps, origin, pm2Bin);
+  if (!inventory.ok) return inventoryFailed();
+
+  let bootId;
+  /** @type {Map<number, { name: string, startTime: number, uid: number }>} */
+  const original = new Map();
+  const rows = [];
+  try {
+    bootId = readBootId(deps);
+    for (const proc of inventory.processes) {
+      if (proc.pmxModule) {
+        rows.push({ name: proc.name, pid: proc.pid, pmxModule: true });
+        continue;
+      }
+      if (!proc.alive) continue;
+      const kernel = kernelOf(deps, proc.pid);
+      if (!kernel) {
+        log(`stage=pm2-inventory name=${proc.name} pid=${proc.pid} result=absent`);
+        continue;
+      }
+      original.set(proc.pid, { name: proc.name, startTime: kernel.startTime, uid: kernel.uid });
+      rows.push({ name: proc.name, pm_id: proc.pm_id, pid: proc.pid, startTime: kernel.startTime });
+    }
+  } catch (error) {
+    log(`stage=pm2-inventory error=${errorText(error)}`);
+    return inventoryFailed();
+  }
+
+  /** @type {Map<string, Map<string, object>>} identities seen per name, for the report */
+  const seenIds = new Map();
+  const remember = (name, pid, startTime) => {
+    const id = procIdentity(bootId, pid, startTime);
+    if (!seenIds.has(name)) seenIds.set(name, new Map());
+    seenIds.get(name).set(`${pid}:${startTime}`, id);
+  };
+  for (const [pid, entry] of original) remember(entry.name, pid, entry.startTime);
+
+  const observe = async () => {
+    const seen = await readPm2(deps, origin, pm2Bin);
+    if (!seen.ok) return { ok: false };
+    try {
+      if (readBootId(deps) !== bootId) throw new Error("boot_id changed");
+      const processes = [];
+      const counted = new Set();
+      for (const [pid, entry] of original) {
+        const kernel = kernelOf(deps, pid);
+        if (!kernel || kernel.startTime !== entry.startTime) continue;
+        if (kernel.uid !== entry.uid) throw new Error(`uid changed pid=${pid}`);
+        processes.push({ name: entry.name, pid, startTime: kernel.startTime });
+        counted.add(pid);
+      }
+      for (const proc of seen.processes) {
+        if (proc.pmxModule || !proc.alive || counted.has(proc.pid)) continue;
+        const kernel = kernelOf(deps, proc.pid);
+        if (!kernel) continue;
+        remember(proc.name, proc.pid, kernel.startTime);
+        processes.push({ name: proc.name, pid: proc.pid, startTime: kernel.startTime });
+      }
+      return { ok: true, processes };
+    } catch (error) {
+      log(`stage=pm2-observe error=${errorText(error)}`);
+      return { ok: false };
+    }
+  };
+
+  const stop = async (phase) => {
+    const stage = PHASE_STAGE[phase.phase];
+    for (const name of phase.names) {
+      if (!stoppableName(name)) {
+        log(`stage=${stage} name=${name} error=reserved-name`);
+        return false;
+      }
+      const argv = pm2Argv(deps, "stop", name);
+      let ran = await runControl(deps, origin, stage, name, argv);
+      if (ran.kind === "observed") {
+        const mid = await observe();
+        if (!mid.ok) return false;
+        if (!mid.processes.some((proc) => proc.name === name)) continue;
+        ran = await runControl(deps, origin, stage, name, argv);
+      }
+      if (ran.kind !== "ok") {
+        log(`stage=${stage} name=${name} control=${ran.kind}`);
+        return false;
+      }
+      if (ran.code !== 0) log(`stage=${stage} name=${name} code=${ran.code}`);
+    }
+    return true;
+  };
+
+  const result = await runPm2StopOrder({
+    inventory: rows,
+    remainingMs: remainingMs(deps, origin),
+    stop,
+    observe,
+    now: deps.mono,
+    sleep: typeof deps.sleep === "function" ? deps.sleep : undefined,
+    pollMs: deps.pollMs ?? 20,
+    signal: deps.signal,
+    log,
+  });
+
+  const identitiesOf = (name) => [...(seenIds.get(name)?.values() ?? [])];
+  const out = [];
+  for (const phase of result.phases) {
+    const stage = PHASE_STAGE[phase.phase];
+    if (phase.instances.length === 0) {
+      // Absent before the order started: nothing to stop. The apps phase has no single name.
+      if (phase.phase !== "apps") out.push(effect(phase.phase, stage, "not_applicable", []));
+      continue;
+    }
+    for (const name of phase.names) {
+      if (phase.result === "stopped") {
+        out.push(effect(name, stage, "stopped", identitiesOf(name)));
+      } else if (phase.result === "blocked") {
+        // Not stopped because an earlier phase is not confirmed: still running, so unconfirmed.
+        out.push({ ...effect(name, stage, "unconfirmed", identitiesOf(name)), reason: "dependency" });
+        log(`stage=${stage} name=${name} result=unconfirmed reason=dependency`);
+      } else {
+        out.push(effect(name, stage, "unconfirmed", identitiesOf(name)));
+      }
+    }
+  }
+  if (!result.ok) return out;
+
+  // A process started outside the phases (or after its phase) must not pass as stopped.
+  const last = await observe();
+  if (!last.ok) {
+    out.push(effect("pm2", "pm2-confirm", "unconfirmed", []));
+    log("stage=pm2-confirm result=unconfirmed");
+  } else if (last.processes.length === 0) {
+    out.push(effect("pm2", "pm2-confirm", "stopped", []));
+    log("stage=pm2-confirm result=stopped");
+  } else {
+    for (const name of new Set(last.processes.map((proc) => proc.name))) {
+      out.push(effect(name, "pm2-confirm", "unconfirmed", identitiesOf(name)));
+      log(`stage=pm2-confirm name=${name} result=unconfirmed`);
+    }
+  }
+  return out;
 }
 
 async function runObserve(deps, origin, argv) {
