@@ -2,7 +2,7 @@
 
 A VM aceita um pedido, para os serviços na ordem fixa, publica um relatório final no heartbeat e pede `shutdown -h now`. Este documento descreve o que o runtime instalado faz. Não liga a agenda do sites, não chama StopInstances e não publica collab-messages. Uso remoto espera o produtor compatível e a coordenação operacional.
 
-A cópia em `/usr/local/lib` é a que a VM executa. O checkout pode estar à frente ou atrás dela. `shutdown-services.mjs` instalado não tem o mesmo hash do arquivo no git: o instalador troca o import `../scripts/pm2-lifecycle.mjs` pelo caminho estável `/usr/local/lib/collab/pm2-lifecycle.mjs`.
+A cópia em `/usr/local/lib` é a que a VM executa. O checkout pode estar à frente ou atrás dela. `shutdown-services.mjs` instalado não tem o mesmo hash do arquivo no git: o instalador troca os imports `../scripts/pm2-lifecycle.mjs`, `../scripts/pm2-readonly.mjs` e `../scripts/pm2-stop-order.mjs` pelos caminhos estáveis em `/usr/local/lib/collab/`. O `pm2-lifecycle.mjs` instalado também importa o `pm2-stop-order.mjs` instalado. Nada disso lê o checkout em tempo de execução.
 
 ## Pedido
 
@@ -45,6 +45,10 @@ O relógio monotônico não ganha prazo com salto do relógio de parede. Retry n
 
 Ordem: nginx, processos PM2 de negócio (todos os vivos, inclusive os de fora do dump, exceto `msg` e `msg-worker`), `msg-worker`, `msg`, reconfirmação, Redis e clusters `postgresql@*`. O nginx para com `QUIT` e dá 30 s para as requisições em andamento terminarem (drop-in `nginx.service.d/collab-graceful-stop.conf`, `--retry QUIT/30`, `TimeoutStopSec=35`; a unidade do Ubuntu dava 5 s); o que passa disso, inclusive WebSocket aberto, é cortado. Se um app não confirma, Redis e PostgreSQL ficam só observados. `services_stopped` exige confirmação de todos. Falha de leitura entra em `notStopped`, não vira lista vazia.
 
+A parte PM2 é a mesma ordem do `ExecStop` da unidade PM2, num arquivo só: `/usr/local/lib/collab/pm2-stop-order.mjs` (apps → `msg-worker` → `msg`). Uma fase só começa quando todas as instâncias da anterior somem pela identidade do kernel (boot id, pid, start time do `/proc`, uid); exit 0 do `pm2 stop` não prova nada, e linha `stopped` com pid vivo continua viva. Fase não confirmada deixa as seguintes sem `stop` (entram em `notStopped` com motivo `dependency`) e os serviços de dados só observados. Não há prazo por fase: todas dividem o mesmo `selfDeadlineAt` (stops novos param 60 s antes). Módulos PM2 (`pm2-logrotate`) não são fase nem entram no relatório.
+
+Diferença para o `ExecStop` (`pm2-lifecycle.mjs stop`, ver `pm2-fixed-startup.md`): ele usa a mesma ordem, mas só PM2, com 840 s dentro de `TimeoutStopSec=900s`, e encerra o daemon (`pm2 kill`) depois da última fase confirmada; nunca para nginx, Redis ou PostgreSQL. Ordem não confirmada nele é erro explícito (`error=order-unconfirmed`) e o resto fica para o SIGTERM/SIGKILL do systemd no fim do timeout, que não é dreno. A ordem num restart e num desligamento Linux reais é prova do tester, ainda pendente.
+
 Fases internas, no estado local: `requested`, `stopping`, `services_stopped`, `deadline_exceeded`, `failed`. Não vão no tipo do heartbeat.
 
 Até o relatório congelar, o heartbeat segue o status de saúde e não manda `payload.shutdown`. O relatório final é imutável: `requestId`, `stopped`, `notStopped`, `startedAt`, `finishedAt`. O body vai com `status: shutdown_ready`. `shutdown_ready` significa pronto para tentar o halt; `notStopped` pode continuar preenchido. Retries repetem o mesmo `finishedAt`.
@@ -70,6 +74,8 @@ Conjunto que anda junto:
 - `/usr/local/lib/collab-sites-agent/shutdown-services.mjs`
 - `/etc/systemd/system/nginx.service.d/collab-graceful-stop.conf`
 - `/usr/local/lib/collab/pm2-lifecycle.mjs`
+- `/usr/local/lib/collab/pm2-stop-order.mjs`
+- `/usr/local/lib/collab/pm2-readonly.mjs`
 - `/etc/systemd/system/collab-shutdown.service`
 
 A unidade não tem `[Install]` nem `WantedBy`. Não sobe no boot. `Restart=on-failure` vale para a execução já disparada.
@@ -77,12 +83,12 @@ A unidade não tem `[Install]` nem `WantedBy`. Não sobe no boot. `Restart=on-fa
 Conferir o que está instalado, não o checkout:
 
 ```sh
-sha256sum /usr/local/lib/collab-sites-agent/*.mjs /usr/local/lib/collab/pm2-lifecycle.mjs
+sha256sum /usr/local/lib/collab-sites-agent/*.mjs /usr/local/lib/collab/pm2-lifecycle.mjs /usr/local/lib/collab/pm2-stop-order.mjs /usr/local/lib/collab/pm2-readonly.mjs
 ```
 
 ## Rollback
 
-Restaurar as seis peças da revisão anterior compatível, `daemon-reload`, e só então reiniciar `collab-sites-agent` se essa revisão de agente for a que deve voltar a responder. Apagar ou trocar só `collab-sites-agent.mjs` deixa import pendente (`shutdown-state.mjs` / `shutdown-worker.mjs`). Apagar só um módulo do shutdown quebra o worker da mesma forma. O rollback não dá `start` em `collab-shutdown` e não mexe no env.
+Restaurar todas as peças do conjunto acima, da revisão anterior compatível, `daemon-reload`, e só então reiniciar `collab-sites-agent` se essa revisão de agente for a que deve voltar a responder. Apagar ou trocar só `collab-sites-agent.mjs` deixa import pendente (`shutdown-state.mjs` / `shutdown-worker.mjs`). Apagar só um módulo do shutdown quebra o worker da mesma forma. O rollback não dá `start` em `collab-shutdown` e não mexe no env.
 
 ## Fora deste runtime
 

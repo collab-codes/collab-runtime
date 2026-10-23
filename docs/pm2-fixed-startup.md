@@ -109,7 +109,7 @@ After a restart, read names, instance counts, and status from the two config fil
 
 ## Stop and restart (lifecycle helper)
 
-`--startup-only` and the normal step 08 both call `apply_pm2_fixed_startup`. That copies `pm2-start-fixed.sh` (0755) and `pm2-lifecycle.mjs` (0644) to `/usr/local/lib/collab`, root-owned, and writes the mount drop-in plus `fixed-configs.conf`. It then runs `systemctl daemon-reload` and `systemd-analyze verify`. It does not stop, restart, kill, save, install npm packages, or migrate a dump.
+`--startup-only` and the normal step 08 both call `apply_pm2_fixed_startup`. That copies `pm2-start-fixed.sh` (0755), `pm2-lifecycle.mjs`, `pm2-readonly.mjs` and `pm2-stop-order.mjs` (0644) to `/usr/local/lib/collab`, root-owned, rewrites the lifecycle imports to those installed paths (no checkout at run time), and writes the mount drop-in plus `fixed-configs.conf`. It then runs `systemctl daemon-reload` and `systemd-analyze verify`. It does not stop, restart, kill, save, install npm packages, or migrate a dump.
 
 `node` and `flock` must already be on `PATH`. The installer checks both and does not download them. `ExecStop` records the absolute `node` from that check. The stop command runs as the unit user.
 
@@ -150,12 +150,25 @@ These are different facts.
 
 - **Startup** is the unit start. The helper budget is 80s monotonic, inside `TimeoutStartSec=90s`, and covers the lock plus both configs. The journal records `bootId` and the phase (`validate-home`, `lock`, `guard`, `apps`, `messages`, `done`) with start, end, monotonic duration, and exit code. A slow first boot is located by that phase. Passing the hook and unit tests does not name the cause of a previous 88s stall.
 - **Recovery** is finite: `StartLimitIntervalSec=3600s`, `StartLimitBurst=3`, `Restart=on-failure`, `RestartSec=10s`, `KillMode=control-group`, `SendSIGKILL=yes`. Nothing in this install runs `reset-failed` or starts the unit again after the burst. `ExecStopPost` is `pm2-lifecycle.mjs post-stop`: it checks `SERVICE_RESULT` and leftover identities. It does not call `pm2 kill`, `jlist`, or `start`. A start killed by the kernel for timeout is not a graceful stop receipt.
-- **Drain** is the synchronous `ExecStop` (`pm2-lifecycle.mjs stop`, `TimeoutStopSec=900s`). Online processes and a zero helper exit are not a drain.
+- **Drain** is the synchronous `ExecStop` (`pm2-lifecycle.mjs stop`, `TimeoutStopSec=900s`), in the PM2-only order below. Online processes and a zero helper exit are not a drain.
 - **Health** is HTTP `/health` of the real service, read only in a reserved proof. Unit `active`, a PM2 process `online`, or a present `dump.pm2` does not mean the app is healthy.
 
 Automatic readers use one passive helper, installed at `/usr/local/lib/collab/pm2-readonly.mjs` (0644, root). The command is `node pm2-readonly.mjs list <pm2-bin>` with `PM2_HOME` set to the deploy user's home. It talks to the existing `rpc.sock` and does not call `Client.start` or `pm2 jlist`. A missing socket or a non-zero exit is unavailable, not an empty process list. The list keeps only `pm_id`, `name`, `pid`, `monit.cpu`, `monit.memory`, and `pm2_env.status`, `pm_uptime`, `restart_time`, `exec_mode`, `pmx_module`. `version <pm2-bin>` reads `package.json` and does not connect. The heartbeat may add `payload.boot` (`id`, `uptimeSeconds`) and `payload.pm2.unit` (`name`, `activeState`, `subState`, `result`, `nRestarts`). `ready` requires the unit `active` and a valid process read. Real PM2 and systemd versions are recorded by the Linux tester, not by this document.
 
 `pm2 kill`, `stop`, `start`, `reload`, and `save` stay explicit mutations. They are not status checks.
+
+## Stop order: ExecStop and VM shutdown
+
+The order lives in one file, `/usr/local/lib/collab/pm2-stop-order.mjs`: business apps (every live PM2 process except `msg`, `msg-worker` and PM2 modules), then `msg-worker`, then `msg`. Both stop paths import that installed copy: `ExecStop` (`pm2-lifecycle.mjs stop`) and the VM shutdown (`shutdown-services.mjs`, see `ordered_shutdown.md`). A phase starts only after every instance of the previous one is confirmed gone by kernel identity (boot id, pid, `/proc` start time, uid). A stop command that exits 0 proves nothing; a row that says `stopped` while its pid lives is still alive. PM2 modules such as `pm2-logrotate` are not a phase; they leave with the daemon.
+
+| operation | budget | what it touches | when a phase is not confirmed |
+| --- | --- | --- | --- |
+| Startup (`ExecStart`) | 80s inside `TimeoutStartSec=90s` | the two configs | unit fails; `ExecStopPost` checks leftovers |
+| Normal stop (`ExecStop`) | one 840s monotonic deadline for lock, every phase and `pm2 kill`, inside `TimeoutStopSec=900s` | PM2 only: apps, `msg-worker`, `msg`, then the daemon | later phases are not stopped, `pm2 kill` is not called, the receipt stays `stopping` with `confirmed=false`, exit 1 |
+| Forced stop | systemd after `TimeoutStopSec=900s` | the unit control group (`KillMode=control-group`, `SendSIGKILL=yes`) | none: this is SIGTERM/SIGKILL, not a drain and not an order |
+| VM shutdown | one deadline: `selfDeadlineAt` minus 60s for new stops | nginx, the same PM2 order, then Redis and PostgreSQL | dependents not stopped, Redis and PostgreSQL only observed, name in `notStopped` |
+
+There is no per-phase timeout: the phases share the deadline of their operation. `ExecStop` never calls the full VM shutdown, so it never stops nginx, Redis or PostgreSQL. An order that is not confirmed is an explicit error in the journal (`error=order-unconfirmed phase=<phase> stop=forced-by-systemd`), not a silent success: from that point systemd kills what is left when its timeout ends, and that kill is not a graceful drain. A lost RPC, a daemon that changed, an unreadable process list or a failed stop command is the same unconfirmed phase. Unit and installer tests prove the order with injected processes; the order on a real Linux restart and shutdown is the tester's proof, still pending.
 
 ## Backup and rollback
 
@@ -165,12 +178,12 @@ Back up only the files this install changes. Restore those files only. Do not co
 unit=pm2-ubuntu.service
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 mkdir -p "/var/backups/pm2-startup-$stamp"
-cp -a "/usr/local/lib/collab/pm2-start-fixed.sh" "/usr/local/lib/collab/pm2-lifecycle.mjs" "/var/backups/pm2-startup-$stamp/" 2>/dev/null || true
+cp -a "/usr/local/lib/collab/pm2-start-fixed.sh" "/usr/local/lib/collab/pm2-lifecycle.mjs" "/usr/local/lib/collab/pm2-readonly.mjs" "/usr/local/lib/collab/pm2-stop-order.mjs" "/var/backups/pm2-startup-$stamp/" 2>/dev/null || true
 cp -a "/etc/systemd/system/${unit}.d/fixed-configs.conf" "/etc/systemd/system/${unit}.d/data-mount.conf" "/var/backups/pm2-startup-$stamp/" 2>/dev/null || true
 ```
 
 ```bash
-cp -a "/var/backups/pm2-startup-$stamp/pm2-start-fixed.sh" "/var/backups/pm2-startup-$stamp/pm2-lifecycle.mjs" /usr/local/lib/collab/
+cp -a "/var/backups/pm2-startup-$stamp/pm2-start-fixed.sh" "/var/backups/pm2-startup-$stamp/pm2-lifecycle.mjs" "/var/backups/pm2-startup-$stamp/pm2-readonly.mjs" "/var/backups/pm2-startup-$stamp/pm2-stop-order.mjs" /usr/local/lib/collab/
 cp -a "/var/backups/pm2-startup-$stamp/fixed-configs.conf" "/var/backups/pm2-startup-$stamp/data-mount.conf" "/etc/systemd/system/${unit}.d/"
 systemctl daemon-reload
 systemd-analyze verify "$unit"

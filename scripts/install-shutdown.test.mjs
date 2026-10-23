@@ -19,6 +19,7 @@ const shutdownSet = [
   "usr/local/lib/collab-sites-agent/shutdown-services.mjs",
   "usr/local/lib/collab/pm2-lifecycle.mjs",
   "usr/local/lib/collab/pm2-readonly.mjs",
+  "usr/local/lib/collab/pm2-stop-order.mjs",
   "etc/systemd/system/collab-shutdown.service",
 ];
 const ID_A = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
@@ -26,9 +27,9 @@ const ID_B = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
 const NOW = Date.parse("2026-10-21T12:00:00.000Z");
 const DEADLINE = new Date(NOW + 60 * 60 * 1000).toISOString();
 
-function run(cmd, args, env = {}) {
+function run(cmd, args, env = {}, cwd = runtime) {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { env: { ...process.env, ...env }, cwd: runtime });
+    const child = spawn(cmd, args, { env: { ...process.env, ...env }, cwd });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => {
@@ -163,11 +164,13 @@ test("maintenance install is idempotent and does not start a worker or touch env
     const services = path.join(stage.root, "usr/local/lib/collab-sites-agent/shutdown-services.mjs");
     const lifecycle = path.join(stage.root, "usr/local/lib/collab/pm2-lifecycle.mjs");
     const readonly = path.join(stage.root, "usr/local/lib/collab/pm2-readonly.mjs");
+    const stopOrder = path.join(stage.root, "usr/local/lib/collab/pm2-stop-order.mjs");
     for (const file of [
       worker,
       services,
       lifecycle,
       readonly,
+      stopOrder,
       path.join(stage.root, "usr/local/lib/collab-sites-agent/shutdown-state.mjs"),
       path.join(stage.root, "usr/local/lib/collab-sites-agent/collab-sites-agent.mjs"),
     ]) {
@@ -178,6 +181,11 @@ test("maintenance install is idempotent and does not start a worker or touch env
     assert.match(servicesSource, new RegExp(readonly.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     assert.equal(servicesSource.includes("../scripts/pm2-lifecycle.mjs"), false);
     assert.equal(servicesSource.includes("../scripts/pm2-readonly.mjs"), false);
+    assert.match(servicesSource, new RegExp(stopOrder.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.equal(servicesSource.includes("../scripts/pm2-stop-order.mjs"), false);
+    const lifecycleSource = await readFile(lifecycle, "utf8");
+    assert.match(lifecycleSource, new RegExp(stopOrder.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.equal(lifecycleSource.includes("./pm2-stop-order.mjs"), false);
     await import(pathToFileURL(services).href);
     await import(pathToFileURL(worker).href);
   } finally {
@@ -369,6 +377,238 @@ test("rollback restores the whole set and a partial agent copy does not", async 
     ]);
     assert.equal(restored.code, 0, restored.stderr);
     assert.equal(await readFile(stage.envFile, "utf8"), "COLLAB_SITES_AGENT_TOKEN=do-not-touch\n");
+  } finally {
+    await rm(stage.root, { recursive: true, force: true });
+  }
+});
+
+// rt123 s15: both installed consumers of the shared PM2-only order (VM shutdown and ExecStop)
+// resolve the staged pm2-stop-order.mjs, without the checkout, and run apps -> msg-worker -> msg.
+const STOP_ORDER_REL = "usr/local/lib/collab/pm2-stop-order.mjs";
+const CONSUMERS = [
+  "usr/local/lib/collab-sites-agent/shutdown-services.mjs",
+  "usr/local/lib/collab/pm2-lifecycle.mjs",
+];
+
+function importIn(root, rel) {
+  return run(
+    process.execPath,
+    ["--input-type=module", "-e", `await import(${JSON.stringify(pathToFileURL(path.join(root, rel)).href)})`],
+    {},
+    root,
+  );
+}
+
+test("installed consumers load the staged stop order, and fail without it", async () => {
+  const stage = await stageRoot();
+  try {
+    const installed = await install(stage, ["--maintenance-only"]);
+    assert.equal(installed.code, 0, installed.stderr);
+    for (const rel of CONSUMERS) {
+      const ok = await importIn(stage.root, rel);
+      assert.equal(ok.code, 0, `${rel}: ${ok.stderr}`);
+    }
+    const order = path.join(stage.root, STOP_ORDER_REL);
+    const body = await readFile(order);
+    await rm(order);
+    for (const rel of CONSUMERS) {
+      const missing = await importIn(stage.root, rel);
+      assert.notEqual(missing.code, 0, rel);
+      assert.match(missing.stderr, /ERR_MODULE_NOT_FOUND/, rel);
+      assert.ok(missing.stderr.includes(order), `${rel} must name the staged path`);
+    }
+    await writeFile(order, body);
+    for (const rel of CONSUMERS) {
+      const back = await importIn(stage.root, rel);
+      assert.equal(back.code, 0, `${rel}: ${back.stderr}`);
+    }
+  } finally {
+    await rm(stage.root, { recursive: true, force: true });
+  }
+});
+
+function enoent(file) {
+  return Object.assign(new Error(`ENOENT ${file}`), { code: "ENOENT" });
+}
+
+test("installed stopServices runs apps -> msg-worker -> msg before the data services", async () => {
+  const stage = await stageRoot();
+  try {
+    const installed = await install(stage, ["--maintenance-only"]);
+    assert.equal(installed.code, 0, installed.stderr);
+    const { stopServices } = await import(
+      pathToFileURL(path.join(stage.root, "usr/local/lib/collab-sites-agent/shutdown-services.mjs")).href
+    );
+    const row = (name, pid, extra = {}) => ({ name, pm_id: pid, pid, pm2_env: { status: "online", pm_uptime: pid, ...extra } });
+    let processes = [
+      row("app-b", 20),
+      row("app-a", 21),
+      row("msg", 31),
+      row("msg-worker", 40),
+      row("pm2-logrotate", 50, { pmx_module: true }),
+    ];
+    const kernel = new Set(processes.map((item) => item.pid));
+    const units = { "nginx.service": "up", "redis-server.service": "up", "postgresql.service": "down" };
+    const show = (state) => (state === "up"
+      ? "MainPID=4242\nTasksCurrent=3\nLoadState=loaded\nActiveState=active\nSubState=running\n"
+      : state === "down"
+        ? "MainPID=0\nTasksCurrent=0\nLoadState=loaded\nActiveState=inactive\nSubState=dead\n"
+        : "MainPID=0\nTasksCurrent=[not set]\nLoadState=not-found\nActiveState=inactive\nSubState=dead\n");
+    const order = [];
+    let wall = 1_000_000;
+    let mono = 0;
+    const report = await stopServices({
+      requestId: "11111111-1111-4111-8111-111111111111",
+      selfDeadlineAt: wall + 90_000,
+      now: () => wall,
+      mono: () => mono,
+      pm2User: "collab",
+      pm2Home: "/home/collab/.pm2",
+      persist: async () => {},
+      control: { inflight: null },
+      pollMs: 10,
+      sleep: async (ms) => {
+        wall += ms;
+        mono += ms;
+      },
+      readProc: (file) => {
+        if (file === "/proc/sys/kernel/random/boot_id") return "boot-s15\n";
+        const matched = file.match(/^\/proc\/(\d+)\/(stat|status)$/);
+        const pid = matched ? Number(matched[1]) : 0;
+        if (!kernel.has(pid)) throw enoent(file);
+        if (matched[2] === "stat") return `${pid} (node) ${["S", ...Array(18).fill("0"), String(pid * 1000), "0", "0"].join(" ")}\n`;
+        return "Name:\tnode\nUid:\t1001\t1001\t1001\t1001\n";
+      },
+      exec: async (argv) => {
+        if (argv[0] === "systemctl" && argv[1] === "show") return { code: 0, stdout: show(units[argv[2]]) };
+        if (argv[0] === "systemctl" && argv[1] === "list-units") return { code: 0, stdout: "" };
+        if (argv[0] === "systemctl" && argv[1] === "stop") {
+          order.push(argv[2]);
+          units[argv[2]] = "down";
+          return { code: 0, stdout: "" };
+        }
+        if (argv.includes("which") && argv[argv.length - 1] === "pm2") return { code: 0, stdout: "/usr/bin/pm2\n" };
+        if (argv.includes("list") && argv.some((arg) => String(arg).endsWith("/usr/local/lib/collab/pm2-readonly.mjs"))) {
+          return { code: 0, stdout: JSON.stringify(processes) };
+        }
+        if (argv.includes("pm2") && argv.includes("stop")) {
+          const name = argv[argv.length - 1];
+          order.push(`pm2:${name}`);
+          for (const item of processes) if (item.name === name) kernel.delete(item.pid);
+          processes = processes.filter((item) => item.name !== name);
+          return { code: 0, stdout: "" };
+        }
+        return { code: 1, stdout: "" };
+      },
+    });
+    assert.deepEqual(order, [
+      "nginx.service",
+      "pm2:app-a",
+      "pm2:app-b",
+      "pm2:msg-worker",
+      "pm2:msg",
+      "redis-server.service",
+    ]);
+    assert.equal(report.servicesStopped, true, JSON.stringify(report.notStopped));
+    assert.equal(report.stopped.includes("pm2-logrotate"), false);
+  } finally {
+    await rm(stage.root, { recursive: true, force: true });
+  }
+});
+
+test("installed stopPm2 (ExecStop) drains apps -> msg-worker -> msg and kills the daemon last", async () => {
+  const stage = await stageRoot();
+  try {
+    const installed = await install(stage, ["--maintenance-only"]);
+    assert.equal(installed.code, 0, installed.stderr);
+    const { stopPm2 } = await import(pathToFileURL(path.join(stage.root, "usr/local/lib/collab/pm2-lifecycle.mjs")).href);
+    const HOME = "/home/deploy";
+    const PM2_HOME = `${HOME}/.pm2`;
+    const UNIT = "/sys/fs/cgroup/system.slice/pm2-deploy.service";
+    const phased = [
+      { name: "shop", pid: 11, start: 2000 },
+      { name: "shop", pid: 15, start: 2500 },
+      { name: "msg-worker", pid: 12, start: 3000 },
+      { name: "msg", pid: 13, start: 4000 },
+      { name: "pm2-logrotate", pid: 14, start: 4500, module: true },
+    ];
+    const environ = `HOME=${HOME}\0PM2_HOME=${PM2_HOME}\0`;
+    const procs = new Map();
+    const put = (pid, comm, start) => procs.set(pid, {
+      stat: `${pid} (${comm}) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 ${start}\n`,
+      status: "Name:\tnode\nUid:\t1000\t1000\t1000\t1000\n",
+      environ,
+    });
+    put(1, "app", 50);
+    put(10, "PM2 v5", 1000);
+    for (const def of phased) put(def.pid, "node", def.start);
+    const cgroup = new Set([1, 10, ...phased.map((def) => def.pid)]);
+    const files = new Map([[`${PM2_HOME}/pm2.pid`, "10\n"]]);
+    const gone = (pid) => {
+      procs.delete(pid);
+      cgroup.delete(pid);
+    };
+    const events = [];
+    let now = 0;
+    let stopPid = 600;
+    let finishKill = null;
+    const io = {
+      now: () => now,
+      async sleep(ms) {
+        now += ms;
+        finishKill?.(0);
+      },
+      log() {},
+      readFile(file) {
+        if (file === "/proc/sys/kernel/random/boot_id") return "boot-s15\n";
+        if (files.has(file)) return files.get(file);
+        const proc = /^\/proc\/(\d+)\/(stat|status|environ)$/.exec(file);
+        const entry = proc ? procs.get(Number(proc[1])) : undefined;
+        if (!entry) throw enoent(file);
+        return entry[proc[2]];
+      },
+      exists: (file) => file === `${PM2_HOME}/rpc.sock` || file === UNIT || files.has(file),
+      writeAtomic(file, text) {
+        files.set(file, text);
+      },
+      listCgroupPids: (root) => (root === UNIT ? [...cgroup] : [99]),
+      jlist: () => [11],
+      listProcesses: () => phased.map((def, index) => ({
+        pm_id: index,
+        name: def.name,
+        pid: procs.has(def.pid) ? def.pid : 0,
+        pm2_env: { pmx_module: def.module === true },
+      })),
+      spawnStop(_bin, _home, pmId) {
+        events.push(`stop:${phased[pmId].name}`);
+        gone(phased[pmId].pid);
+        stopPid += 1;
+        return { pid: stopPid, finished: Promise.resolve(0) };
+      },
+      spawnKill() {
+        events.push("kill");
+        gone(10);
+        gone(14);
+        files.delete(`${PM2_HOME}/pm2.pid`);
+        return { pid: 50, finished: new Promise((resolve) => { finishKill = resolve; }) };
+      },
+    };
+    const code = await stopPm2({
+      io,
+      pm2Bin: "/usr/bin/pm2",
+      pm2Home: PM2_HOME,
+      unitCgroup: UNIT,
+      uid: 1000,
+      home: HOME,
+      helperPid: 1,
+      deadlineMs: 200,
+      pollMs: 10,
+    });
+    assert.equal(code, 0);
+    assert.deepEqual(events, ["stop:shop", "stop:shop", "stop:msg-worker", "stop:msg", "kill"]);
+    const receipt = JSON.parse(files.get(`${PM2_HOME}/collab-stop.json`));
+    assert.equal(receipt.phase, "stopped");
+    assert.equal(receipt.confirmed, true);
   } finally {
     await rm(stage.root, { recursive: true, force: true });
   }
