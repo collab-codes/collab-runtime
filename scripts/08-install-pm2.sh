@@ -345,31 +345,35 @@ install_pm2_fixed_helper() {
   install_rooted_copy "${SCRIPT_DIR}/pm2-start-fixed.sh" "${lib_dir}/pm2-start-fixed.sh" 0755
   install_rooted_copy "${SCRIPT_DIR}/pm2-lifecycle.mjs" "${lib_dir}/pm2-lifecycle.mjs" 0644
   install_rooted_copy "${SCRIPT_DIR}/pm2-readonly.mjs" "${lib_dir}/pm2-readonly.mjs" 0644
+  install_rooted_copy "${SCRIPT_DIR}/pm2-stop-order.mjs" "${lib_dir}/pm2-stop-order.mjs" 0644
   retarget_pm2_readonly_import "${lib_dir}/pm2-lifecycle.mjs" "${lib_dir}/pm2-readonly.mjs" required
+  retarget_pm2_readonly_import "${lib_dir}/pm2-lifecycle.mjs" "${lib_dir}/pm2-stop-order.mjs" required
 }
 
 # Installed copies must import the library path, including a fixture prefix.
 # A second install copies the checkout again and rewrites the same path.
+# The module name comes from dest (pm2-readonly.mjs or pm2-stop-order.mjs).
 retarget_pm2_readonly_import() {
   local file="$1"
   local dest="$2"
   local mode="$3"
-  local spec tmp
+  local spec tmp name
+  name="$(basename "$dest")"
   spec="$(quote_exec_arg "$dest")"
-  if grep -q "from ${spec}" "$file"; then
+  if grep -qF "from ${spec}" "$file"; then
     return 0
   fi
-  if ! grep -Eq 'from "(\./|\.\./scripts/)pm2-readonly\.mjs"' "$file"; then
+  if ! grep -qF -e "from \"./${name}\"" -e "from \"../scripts/${name}\"" "$file"; then
     if [[ "$mode" == "required" ]]; then
-      log_error "pm2-readonly import missing in ${file}"
+      log_error "${name} import missing in ${file}"
       exit 1
     fi
     return 0
   fi
   tmp="$(mktemp "${file}.XXXXXX")"
   sed \
-    -e "s#from \"./pm2-readonly.mjs\"#from ${spec}#" \
-    -e "s#from \"../scripts/pm2-readonly.mjs\"#from ${spec}#" \
+    -e "s#from \"./${name}\"#from ${spec}#" \
+    -e "s#from \"../scripts/${name}\"#from ${spec}#" \
     "$file" > "$tmp"
   chmod 644 "$tmp"
   if [[ "$(id -u)" -eq 0 ]]; then

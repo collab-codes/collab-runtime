@@ -381,7 +381,7 @@ install_ordered_shutdown_set() {
       return 1
     fi
   done
-  if [[ ! -f "$lifecycle" || ! -f "$unit" ]]; then
+  if [[ ! -f "$lifecycle" || ! -f "$(dirname "$lifecycle")/pm2-stop-order.mjs" || ! -f "$unit" ]]; then
     echo "[ERR]  shutdown library or unit missing after install" >&2
     return 1
   fi

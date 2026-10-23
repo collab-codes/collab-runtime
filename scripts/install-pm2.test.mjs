@@ -224,8 +224,25 @@ ExecStop=${ctx.pm2Bin} kill
 function installedLifecycle(readonlyPath) {
   const source = readFileSync(join(root, "scripts/pm2-lifecycle.mjs"), "utf8");
   const from = 'from "./pm2-readonly.mjs"';
+  const fromStop = 'from "./pm2-stop-order.mjs"';
   assert.equal(source.includes(from), true);
-  return source.replaceAll(from, `from ${JSON.stringify(readonlyPath)}`);
+  assert.equal(source.includes(fromStop), true);
+  const stopOrder = join(dirname(readonlyPath), "pm2-stop-order.mjs");
+  return source
+    .replaceAll(from, `from ${JSON.stringify(readonlyPath)}`)
+    .replaceAll(fromStop, `from ${JSON.stringify(stopOrder)}`);
+}
+
+// The shared stop order is installed byte for byte, root-owned 0644, and the
+// installed lifecycle imports it by its library path.
+function assertStopOrderInstalled(collabLib) {
+  const stopOrder = join(collabLib, "pm2-stop-order.mjs");
+  assert.equal(readFileSync(stopOrder, "utf8"), readFileSync(join(root, "scripts/pm2-stop-order.mjs"), "utf8"));
+  assert.equal(statSync(stopOrder).mode & 0o777, 0o644);
+  const lifecycle = readFileSync(join(collabLib, "pm2-lifecycle.mjs"), "utf8");
+  assert.equal(lifecycle.includes(`from ${JSON.stringify(stopOrder)}`), true);
+  assert.equal(lifecycle.includes('"./pm2-stop-order.mjs"'), false);
+  return stopOrder;
 }
 
 function runStep(ctx, args) {
@@ -263,12 +280,14 @@ test("--startup-only writes one ExecStart, timeout 900, custom data root, and ke
   const helperBefore = readFileSync(helper);
   const lifecycleBefore = readFileSync(lifecycle);
   const readonlyBefore = readFileSync(readonly);
+  const stopOrderBefore = readFileSync(join(ctx.collabLib, "pm2-stop-order.mjs"));
   runStep(ctx, ["--startup-only"]);
   const fixed = readFileSync(join(dropin, "fixed-configs.conf"), "utf8");
   assert.equal(fixed, first);
   assert.deepEqual(readFileSync(helper), helperBefore);
   assert.deepEqual(readFileSync(lifecycle), lifecycleBefore);
   assert.deepEqual(readFileSync(readonly), readonlyBefore);
+  assert.deepEqual(readFileSync(assertStopOrderInstalled(ctx.collabLib)), stopOrderBefore);
   const mount = readFileSync(join(dropin, "data-mount.conf"), "utf8");
   const apps = `${dataRoot}/mls-base/pm2.config.js`;
   const messages = `${dataRoot}/msg.collab.codes/pm2.config.js`;
@@ -451,6 +470,7 @@ exit 0
   const readonly = join(ctx.collabLib, "pm2-readonly.mjs");
   assert.equal(readFileSync(readonly, "utf8"), readFileSync(join(root, "scripts/pm2-readonly.mjs"), "utf8"));
   assert.equal(readFileSync(join(ctx.collabLib, "pm2-lifecycle.mjs"), "utf8"), installedLifecycle(readonly));
+  assertStopOrderInstalled(ctx.collabLib);
   assert.doesNotMatch(fixed, /resurrect/);
   // assert_one_pm2_unit scans the host with GNU find -printf. On macOS that
   // command exits 1 after logrotate, with no unit-count line. A Linux host
@@ -566,4 +586,38 @@ test("root migration still resurrects onto the deploy user and rolls back withou
   assert.match(readFileSync(rollback.calls, "utf8"), /pm2 resurrect[\s\S]*pm2 resurrect/);
   assert.equal(readFileSync(join(rollback.etc, "pm2-root.service"), "utf8").includes("resurrect"), true);
   assert.doesNotMatch(readFileSync(rollback.calls, "utf8"), /pm2-start-fixed/);
+});
+
+test("install-shutdown installs the same stop order and retargets lifecycle and agent imports", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rt123-s14-"));
+  const bin = join(dir, "bin");
+  const calls = join(dir, "calls.log");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(calls, "");
+  const record = `printf '%s\\n' "$0 $*" >> ${JSON.stringify(calls)}`;
+  for (const name of ["pm2", "npm"]) writeStub(bin, name, `#!/bin/bash\n${record}\nexit 99\n`);
+  writeStub(bin, "systemctl", `#!/bin/bash\n${record}\n[[ "$1" == "daemon-reload" ]]\n`);
+  writeStub(bin, "systemd-analyze", `#!/bin/bash\n${record}\n[[ "$1" == "verify" ]]\n`);
+  const env = {
+    ...process.env,
+    PATH: `${bin}:${process.env.PATH}`,
+    COLLAB_SHUTDOWN_PREFIX: dir,
+    SYSTEMCTL: join(bin, "systemctl"),
+    SYSTEMD_ANALYZE: join(bin, "systemd-analyze"),
+  };
+  const installer = join(root, "scripts/install-shutdown.sh");
+  execFileSync("bash", [installer, "--maintenance-only"], { encoding: "utf8", env, timeout: 20000 });
+  execFileSync("bash", [installer, "--maintenance-only"], { encoding: "utf8", env, timeout: 20000 });
+  const collabLib = join(dir, "usr/local/lib/collab");
+  const stopOrder = assertStopOrderInstalled(collabLib);
+  const services = readFileSync(join(dir, "usr/local/lib/collab-sites-agent/shutdown-services.mjs"), "utf8");
+  assert.equal(services.includes(`from ${JSON.stringify(stopOrder)}`), true);
+  assert.equal(services.includes("../scripts/pm2-stop-order.mjs"), false);
+  assert.equal(
+    readFileSync(join(collabLib, "pm2-lifecycle.mjs"), "utf8"),
+    installedLifecycle(join(collabLib, "pm2-readonly.mjs")),
+  );
+  const log = readFileSync(calls, "utf8");
+  assert.doesNotMatch(log, /\/(pm2|npm) /);
+  assert.doesNotMatch(log, /systemctl (start|stop|restart|enable)/);
 });

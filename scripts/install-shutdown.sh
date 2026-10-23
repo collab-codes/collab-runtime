@@ -42,6 +42,7 @@ NGINX_DROPIN="${PREFIX}/etc/systemd/system/nginx.service.d/collab-graceful-stop.
 WORKER_PATH="${AGENT_DIR}/shutdown-worker.mjs"
 LIFECYCLE_PATH="${LIB_DIR}/pm2-lifecycle.mjs"
 READONLY_PATH="${LIB_DIR}/pm2-readonly.mjs"
+STOP_ORDER_PATH="${LIB_DIR}/pm2-stop-order.mjs"
 SYSTEMCTL_BIN="${SYSTEMCTL:-systemctl}"
 ANALYZE_BIN="${SYSTEMD_ANALYZE:-systemd-analyze}"
 
@@ -68,27 +69,31 @@ copy_file "${SOURCE_ROOT}/agent/shutdown-worker.mjs" "$WORKER_PATH"
 copy_file "${SOURCE_ROOT}/agent/shutdown-services.mjs" "${AGENT_DIR}/shutdown-services.mjs"
 copy_file "${SOURCE_ROOT}/scripts/pm2-lifecycle.mjs" "$LIFECYCLE_PATH"
 copy_file "${SOURCE_ROOT}/scripts/pm2-readonly.mjs" "$READONLY_PATH"
+copy_file "${SOURCE_ROOT}/scripts/pm2-stop-order.mjs" "$STOP_ORDER_PATH"
 
-# Checkout imports of the passive reader become the installed copy, prefix included.
-retarget_pm2_readonly() {
+# Checkout imports of the shared PM2 modules (passive reader, stop order)
+# become the installed copy, prefix included.
+retarget_lib_import() {
   local file="$1"
-  local required="$2"
-  local spec tmp
-  spec="\"${READONLY_PATH}\""
-  if grep -q "from ${spec}" "$file"; then
+  local dest="$2"
+  local required="$3"
+  local spec tmp name
+  name="$(basename "$dest")"
+  spec="\"${dest}\""
+  if grep -qF "from ${spec}" "$file"; then
     return 0
   fi
-  if ! grep -Eq 'from "(\./|\.\./scripts/)pm2-readonly\.mjs"' "$file"; then
+  if ! grep -qF -e "from \"./${name}\"" -e "from \"../scripts/${name}\"" "$file"; then
     if [[ "$required" -eq 1 ]]; then
-      echo "[ERR]  pm2-readonly import missing in ${file}" >&2
+      echo "[ERR]  ${name} import missing in ${file}" >&2
       exit 1
     fi
     return 0
   fi
-  tmp="$(mktemp "$(dirname "$file")/.pm2-readonly.XXXXXX")"
+  tmp="$(mktemp "$(dirname "$file")/.${name%.mjs}.XXXXXX")"
   sed \
-    -e "s#from \"./pm2-readonly.mjs\"#from ${spec}#" \
-    -e "s#from \"../scripts/pm2-readonly.mjs\"#from ${spec}#" \
+    -e "s#from \"./${name}\"#from ${spec}#" \
+    -e "s#from \"../scripts/${name}\"#from ${spec}#" \
     "$file" > "$tmp"
   mv "$tmp" "$file"
   chmod 644 "$file"
@@ -97,9 +102,11 @@ retarget_pm2_readonly() {
   fi
 }
 
-retarget_pm2_readonly "$LIFECYCLE_PATH" 1
-retarget_pm2_readonly "${AGENT_DIR}/shutdown-services.mjs" 0
-retarget_pm2_readonly "${AGENT_DIR}/collab-sites-agent.mjs" 0
+retarget_lib_import "$LIFECYCLE_PATH" "$READONLY_PATH" 1
+retarget_lib_import "${AGENT_DIR}/shutdown-services.mjs" "$READONLY_PATH" 0
+retarget_lib_import "${AGENT_DIR}/collab-sites-agent.mjs" "$READONLY_PATH" 0
+retarget_lib_import "$LIFECYCLE_PATH" "$STOP_ORDER_PATH" 1
+retarget_lib_import "${AGENT_DIR}/shutdown-services.mjs" "$STOP_ORDER_PATH" 1
 
 # The checkout import is relative to the repo. The installed copy must use the
 # stable library path, including a staging prefix when one was injected.
