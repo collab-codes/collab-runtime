@@ -150,6 +150,30 @@ if [[ "$INSTALLED_VERSION" == "$VERSION" && "$FORCE" != true ]] && run_as_deploy
   exit 0
 fi
 
+# The project the cm belongs to is kept outside the sources (/data/etc/shared.json, written once, never replaced by an
+# update): COLLAB_RELEASE_PROJECT_ID, or the only project on the VM. With several projects and no variable it is left
+# for `node scripts/runtime/sharedApps.mjs set-main --projeto <id>`.
+collab_set_shared_main() {
+  local tool="" candidate project="${COLLAB_RELEASE_PROJECT_ID:-}" ids
+  for candidate in "${COLLAB_SHARED_APPS_SCRIPT:-}" /data/mls-base/scripts/runtime/sharedApps.mjs /data/app*/mls-base/scripts/runtime/sharedApps.mjs; do
+    [[ -n "$candidate" && -f "$candidate" ]] && { tool="$candidate"; break; }
+  done
+  if [[ -z "$tool" ]] || ! command -v node >/dev/null 2>&1; then
+    log_warn "shared register: sharedApps.mjs or node not found; main project of the cm not recorded"
+    return 0
+  fi
+  if [[ ! "$project" =~ ^[0-9]+$ ]]; then
+    ids="$(ls "${COLLAB_ETC_DIR:-/data/etc}/projects" 2>/dev/null | sed -n 's/^\([0-9][0-9]*\)\.json$/\1/p' | sort -n)"
+    if [[ "$(printf '%s\n' "$ids" | grep -c .)" -eq 1 ]]; then project="$ids"; else project=""; fi
+  fi
+  if [[ -z "$project" ]]; then
+    log_info "shared register: no single project on this VM and no COLLAB_RELEASE_PROJECT_ID; set the cm main project with sharedApps.mjs set-main"
+    return 0
+  fi
+  node "$tool" set-main --nome cm --projeto "$project" --if-absent --etc "${COLLAB_ETC_DIR:-/data/etc}" || log_warn "shared register not written"
+  return 0
+}
+
 # From here a non-zero exit is a failed install: record it (the success path records and clears the trap).
 trap 'rc=$?; trap - EXIT; if [[ $rc -ne 0 ]]; then collab_record_shared falhou install "install exited with status $rc"; fi; exit $rc' EXIT
 
@@ -219,6 +243,7 @@ ensure_msg_configure_sdk
 log_ok "collab-messages ${VERSION} installed (pm2 app: msg, user: ${DEPLOY_USER})"
 collab_record_shared ok
 trap - EXIT
+collab_set_shared_main
 
 # ── nginx: expose /msg → 127.0.0.1:8180 ────────────────────────────────────────
 SNIPPET="/etc/nginx/snippets/collab-messages.conf"
