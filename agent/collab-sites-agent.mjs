@@ -8,6 +8,7 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readShutdownState, shutdownReportSnapshot } from "./shutdown-state.mjs";
 import { listPm2 } from "../scripts/pm2-readonly.mjs";
+import { NOTICE_INTERVAL_MS, sendPendingNotices } from "./release-notices.mjs";
 
 export const AGENT_VERSION = "0.3.1";
 const BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id";
@@ -677,15 +678,23 @@ export async function run(argv, deps = {}) {
   const envPath = argValue(argv, "--env") ?? DEFAULT_ENV_PATH;
   const once = argv.includes("--once");
   const config = await loadConfig(envPath, deps);
+  const notices = () => sendPendingNotices(config, { postJson: deps.postJson ?? defaultPostJson, ...(deps.noticeDirs ? { dirs: deps.noticeDirs } : {}) })
+    .catch((err) => console.error(`release notices failed: ${err.message}`));
   if (once) {
     await sendHeartbeat(config, deps);
+    await notices();
     return { config, once: true };
   }
   const server = startStatusServer(config, deps);
-  const beat = () => sendHeartbeat(config, deps);
+  const beat = async () => {
+    await sendHeartbeat(config, deps);
+    await notices();
+  };
   await beat();
   const timer = setInterval(beat, config.interval * 1000);
-  return { config, server, timer, once: false };
+  // A release that just ended is told within seconds, not at the next heartbeat; with nothing pending this is a readdir.
+  const noticeTimer = setInterval(notices, NOTICE_INTERVAL_MS);
+  return { config, server, timer, noticeTimer, once: false };
 }
 
 function isCliEntry() {

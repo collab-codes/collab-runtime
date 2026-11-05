@@ -376,7 +376,7 @@ install_ordered_shutdown_set() {
     echo "[ERR]  ordered shutdown installer failed" >&2
     return 1
   fi
-  for name in collab-sites-agent.mjs shutdown-state.mjs shutdown-worker.mjs shutdown-services.mjs; do
+  for name in collab-sites-agent.mjs shutdown-state.mjs shutdown-worker.mjs shutdown-services.mjs release-notices.mjs; do
     if [[ ! -f "${agent_dir}/${name}" ]]; then
       echo "[ERR]  shutdown module missing after install: ${agent_dir}/${name}" >&2
       return 1

@@ -67,6 +67,7 @@ copy_file "${SOURCE_ROOT}/agent/collab-sites-agent.mjs" "${AGENT_DIR}/collab-sit
 copy_file "${SOURCE_ROOT}/agent/shutdown-state.mjs" "${AGENT_DIR}/shutdown-state.mjs"
 copy_file "${SOURCE_ROOT}/agent/shutdown-worker.mjs" "$WORKER_PATH"
 copy_file "${SOURCE_ROOT}/agent/shutdown-services.mjs" "${AGENT_DIR}/shutdown-services.mjs"
+copy_file "${SOURCE_ROOT}/agent/release-notices.mjs" "${AGENT_DIR}/release-notices.mjs"
 copy_file "${SOURCE_ROOT}/scripts/pm2-lifecycle.mjs" "$LIFECYCLE_PATH"
 copy_file "${SOURCE_ROOT}/scripts/pm2-readonly.mjs" "$READONLY_PATH"
 copy_file "${SOURCE_ROOT}/scripts/pm2-stop-order.mjs" "$STOP_ORDER_PATH"
