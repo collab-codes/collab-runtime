@@ -7,7 +7,10 @@
 // treats the notice as idempotent by vmId + projetoId + releaseId.
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import http from "node:http";
+import https from "node:https";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export const NOTICE_ORIGIN = "collab-runtime-agent";
 export const NOTICE_INTERVAL_MS = 10_000;
@@ -110,3 +113,45 @@ export async function sendPendingNotices(config, { postJson, dirs = recordDirs(c
   }
   return { sent, failed };
 }
+
+// ── A small CLI, to send the pending notices once by hand or against a test receiver (no agent needed) ─────────────
+//   node agent/release-notices.mjs --url http://127.0.0.1:5199 --server srv_t --project 102047 --token test [--data-root /data]
+function httpPostJson(url, { headers, body, timeoutMs }) {
+  return new Promise((resolvePost, reject) => {
+    const target = new URL(url);
+    const client = target.protocol === "https:" ? https : http;
+    const req = client.request(target, { method: "POST", headers: { ...headers, "Content-Length": Buffer.byteLength(body) }, timeout: timeoutMs }, (res) => {
+      res.resume();
+      res.on("end", () => resolvePost({ statusCode: res.statusCode ?? 0 }));
+    });
+    req.on("timeout", () => req.destroy(new Error("timeout")));
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+
+function flagOf(argv, name) {
+  const at = argv.indexOf(name);
+  return at >= 0 ? argv[at + 1] : undefined;
+}
+
+export async function cli(argv) {
+  const url = flagOf(argv, "--url");
+  if (!url) {
+    process.stderr.write("usage: release-notices.mjs --url <sites url> --server <id> --project <id> --token <token> [--data-root /data]\n");
+    return 2;
+  }
+  const config = {
+    sitesUrl: url.replace(/\/+$/u, ""),
+    serverId: flagOf(argv, "--server") ?? "srv_test",
+    projectId: flagOf(argv, "--project") ?? "0",
+    token: flagOf(argv, "--token") ?? "test",
+    dataRoot: flagOf(argv, "--data-root") ?? "/data",
+  };
+  const result = await sendPendingNotices(config, { postJson: httpPostJson });
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+  return result.failed > 0 ? 1 : 0;
+}
+
+const entry = process.argv[1];
+if (entry && resolve(entry) === fileURLToPath(import.meta.url)) process.exit(await cli(process.argv.slice(2)));
