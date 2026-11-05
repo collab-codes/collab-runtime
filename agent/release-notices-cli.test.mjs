@@ -37,7 +37,7 @@ test("the cli sends against the test receiver: a 503 keeps the notice, the next 
     assert.deepEqual(JSON.parse(third.stdout), { sent: 0, failed: 0 });
     const lines = readFileSync(out, "utf8").trim().split("\n").map((line) => JSON.parse(line));
     assert.equal(lines.length, 1);
-    assert.equal(lines[0].key, "vm-1|102047|20261105140000|release.finished");
+    assert.equal(lines[0].key, "srv_t|102047|20261105140000|release.finished");
     assert.equal(lines[0].vezes, 1);
     assert.equal(lines[0].temToken, true);
   } finally {

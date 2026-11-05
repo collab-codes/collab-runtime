@@ -26,7 +26,7 @@ function leave(dir, id, codes, record = {}) {
 
 test("sends each pending code with the record as details and removes it once the sites confirms", async () => {
   await withDir(async (dir) => {
-    leave(dir, "20261105140000", ["release.started", "release.finished"]);
+    leave(dir, "20261105140000", ["release.started", "release.finished"], { vmId: "ip-172-31-26-102" });
     const posted = [];
     const postJson = async (url, { headers, body }) => {
       posted.push({ url, headers, body: JSON.parse(body) });
@@ -38,6 +38,7 @@ test("sends each pending code with the record as details and removes it once the
     assert.deepEqual(posted.map((p) => p.body.code), ["release.started", "release.finished"]);
     assert.equal(posted[0].body.details.releaseId, "20261105140000");
     assert.equal(posted[0].body.projectId, "102047");
+    assert.equal(posted[0].body.details.vmId, "srv_1", "the notice carries the server id the sites expects, not the record hostname");
     assert.equal(posted[0].headers["X-Collab-Origin"], "collab-runtime-agent");
     assert.equal(existsSync(join(dir, "20261105140000.aviso-pendente")), false);
     assert.equal(existsSync(join(dir, "20261105140000.json")), true, "the record stays");

@@ -88,7 +88,9 @@ export async function sendPendingNotices(config, { postJson, dirs = recordDirs(c
         level: code === "release.finished" && notice.record.resultado === "falhou" ? "warn" : "info",
         code,
         message: `${code} ${notice.record.fila} ${notice.record.releaseId} ${notice.record.resultado}`,
-        details: notice.record,
+        // The sites matches record.vmId against the server id of the URL. The release scripts run as the data owner and
+        // cannot read the agent env, so the record may carry the hostname; the agent, which knows the server id, says it.
+        details: { ...notice.record, vmId: config.serverId },
       });
       try {
         const result = await postJson(url, {
