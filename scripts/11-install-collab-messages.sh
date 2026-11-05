@@ -125,11 +125,33 @@ log_info "Latest release: ${VERSION}"
 INSTALLED_VERSION=""
 [[ -f "$VERSION_FILE" ]] && INSTALLED_VERSION="$(cat "$VERSION_FILE")"
 
+# ── Release record (controleReleases): the cm is a `shared` app of the project it is installed in ────────────────
+# Written by mls-base's releaseRecord.mjs (the only writer of the record), on success and on failure. Missing node or
+# script is only a warning: the install never fails because of the record.
+RELEASE_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+collab_record_shared() { # $1 = ok|falhou, $2 = failing step, $3 = message
+  local rec="" candidate
+  for candidate in "${COLLAB_RELEASE_RECORD_SCRIPT:-}" /data/mls-base/scripts/runtime/releaseRecord.mjs /data/app*/mls-base/scripts/runtime/releaseRecord.mjs; do
+    [[ -n "$candidate" && -f "$candidate" ]] && { rec="$candidate"; break; }
+  done
+  if [[ -z "$rec" ]] || ! command -v node >/dev/null 2>&1; then
+    log_warn "release record: releaseRecord.mjs or node not found; skipped"
+    return 0
+  fi
+  node "$rec" shared --nome cm --antes "$INSTALLED_VERSION" --depois "$VERSION" --passos "download,install" \
+    --inicio "$RELEASE_STARTED_AT" --resultado "$1" --falha "${2:-}" --mensagem "${3:-}" \
+    || log_warn "release record not written"
+  return 0
+}
+
 if [[ "$INSTALLED_VERSION" == "$VERSION" && "$FORCE" != true ]] && run_as_deploy pm2 describe msg &>/dev/null; then
   ensure_msg_configure_sdk
   log_ok "collab-messages ${VERSION} already installed and running (use --force to reinstall)"
   exit 0
 fi
+
+# From here a non-zero exit is a failed install: record it (the success path records and clears the trap).
+trap 'rc=$?; trap - EXIT; if [[ $rc -ne 0 ]]; then collab_record_shared falhou install "install exited with status $rc"; fi; exit $rc' EXIT
 
 # ── Download release ───────────────────────────────────────────────────────────
 mkdir -p "$INSTALL_DIR_MSG" "$NODE_DIR"
@@ -195,6 +217,8 @@ if [[ -f "$NODE_DIR/appconfig.json" ]]; then
 fi
 ensure_msg_configure_sdk
 log_ok "collab-messages ${VERSION} installed (pm2 app: msg, user: ${DEPLOY_USER})"
+collab_record_shared ok
+trap - EXIT
 
 # ── nginx: expose /msg → 127.0.0.1:8180 ────────────────────────────────────────
 SNIPPET="/etc/nginx/snippets/collab-messages.conf"
