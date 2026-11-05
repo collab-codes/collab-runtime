@@ -346,6 +346,9 @@ install_pm2_fixed_helper() {
   install_rooted_copy "${SCRIPT_DIR}/pm2-lifecycle.mjs" "${lib_dir}/pm2-lifecycle.mjs" 0644
   install_rooted_copy "${SCRIPT_DIR}/pm2-readonly.mjs" "${lib_dir}/pm2-readonly.mjs" 0644
   install_rooted_copy "${SCRIPT_DIR}/pm2-stop-order.mjs" "${lib_dir}/pm2-stop-order.mjs" 0644
+  # The apps config of the boot: one aggregator outside every tree (rt182), so migrate/revert/retire never edit the drop-in.
+  mkdir -p "${COLLAB_DATA_ROOT}/etc"
+  install_rooted_copy "${SCRIPT_DIR}/pm2-apps.config.js" "${COLLAB_DATA_ROOT}/etc/pm2.apps.config.js" 0644
   retarget_pm2_readonly_import "${lib_dir}/pm2-lifecycle.mjs" "${lib_dir}/pm2-readonly.mjs" required
   retarget_pm2_readonly_import "${lib_dir}/pm2-lifecycle.mjs" "${lib_dir}/pm2-stop-order.mjs" required
 }
@@ -399,7 +402,7 @@ write_pm2_fixed_configs_dropin() {
   node_bin="$(command -v node)"
   helper="${lib_dir}/pm2-start-fixed.sh"
   lifecycle="${lib_dir}/pm2-lifecycle.mjs"
-  apps="${COLLAB_DATA_ROOT}/mls-base/pm2.config.js"
+  apps="${COLLAB_DATA_ROOT}/etc/pm2.apps.config.js"
   messages="${COLLAB_DATA_ROOT}/msg.collab.codes/pm2.config.js"
   exec_line="ExecStart=$(quote_exec_arg "$helper") $(quote_exec_arg "$pm2_bin") $(quote_exec_arg "$apps") $(quote_exec_arg "$messages")"
   exec_stop="ExecStop=$(quote_exec_arg "$node_bin") $(quote_exec_arg "$lifecycle") stop $(quote_exec_arg "$pm2_bin")"

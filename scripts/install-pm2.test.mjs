@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -289,7 +289,8 @@ test("--startup-only writes one ExecStart, timeout 900, custom data root, and ke
   assert.deepEqual(readFileSync(readonly), readonlyBefore);
   assert.deepEqual(readFileSync(assertStopOrderInstalled(ctx.collabLib)), stopOrderBefore);
   const mount = readFileSync(join(dropin, "data-mount.conf"), "utf8");
-  const apps = `${dataRoot}/mls-base/pm2.config.js`;
+  const apps = `${dataRoot}/etc/pm2.apps.config.js`;
+  assert.deepEqual(readFileSync(apps), readFileSync(join(root, "scripts/pm2-apps.config.js")), "the aggregator is installed where the drop-in points");
   const messages = `${dataRoot}/msg.collab.codes/pm2.config.js`;
   const nodeBin = execFileSync("bash", ["-c", "command -v node"], { encoding: "utf8", env: ctx.env }).trim();
   const execLines = fixed.split("\n").filter((line) => line.startsWith("ExecStart="));
@@ -620,4 +621,57 @@ test("install-shutdown installs the same stop order and retargets lifecycle and 
   const log = readFileSync(calls, "utf8");
   assert.doesNotMatch(log, /\/(pm2|npm) /);
   assert.doesNotMatch(log, /systemctl (start|stop|restart|enable)/);
+});
+
+// rt182: the boot aggregator reads the project trees first, then the old tree for the names not seen yet.
+function aggregate(layout) {
+  const dir = mkdtempSync(join(tmpdir(), "rt182-agg-"));
+  mkdirSync(join(dir, "etc"), { recursive: true });
+  const installed = join(dir, "etc", "pm2.apps.config.js");
+  copyFileSync(join(root, "scripts/pm2-apps.config.js"), installed);
+  for (const [tree, apps] of Object.entries(layout)) {
+    const appsDir = tree === "mls-base" ? join(dir, "mls-base", "pm2.apps.d") : join(dir, tree, "mls-base", "pm2.apps.d");
+    mkdirSync(appsDir, { recursive: true });
+    for (const [file, cwd] of Object.entries(apps)) {
+      const name = file.replace(/\.config\.js.*$/u, "");
+      writeFileSync(join(appsDir, file), `module.exports = [{ name: ${JSON.stringify(name)}, cwd: ${JSON.stringify(cwd)} }];\n`);
+    }
+  }
+  const out = execFileSync("node", ["-e", `const c=require(${JSON.stringify(installed)});console.log(JSON.stringify(c.apps.map(a=>[a.name,a.cwd])))`], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  return { dir, apps: JSON.parse(out.trim()) };
+}
+
+test("boot aggregator: only the old tree starts the old tree", () => {
+  const { apps } = aggregate({ "mls-base": { "app2047.config.js": "old47", "app2056.config.js": "old56" } });
+  assert.deepEqual(apps, [["app2047", "old47"], ["app2056", "old56"]]);
+});
+
+test("boot aggregator: a migrated project wins, the other keeps the old tree", () => {
+  const { apps } = aggregate({
+    "mls-base": { "app2047.config.js": "old47", "app2056.config.js": "old56" },
+    app102056: { "app2056.config.js": "new56" },
+  });
+  assert.deepEqual(apps.sort(), [["app2047", "old47"], ["app2056", "new56"]]);
+});
+
+test("boot aggregator: a reverted project (.revertido) goes back to the old tree", () => {
+  const { dir } = aggregate({
+    "mls-base": { "app2056.config.js": "old56" },
+    app102056: { "app2056.config.js": "new56" },
+  });
+  const file = join(dir, "app102056", "mls-base", "pm2.apps.d", "app2056.config.js");
+  renameSync(file, `${file}.revertido`);
+  const out = execFileSync("node", ["-e", `const c=require(${JSON.stringify(join(dir, "etc", "pm2.apps.config.js"))});console.log(JSON.stringify(c.apps.map(a=>[a.name,a.cwd])))`], { encoding: "utf8" });
+  assert.deepEqual(JSON.parse(out.trim()), [["app2056", "old56"]]);
+});
+
+test("boot aggregator: no app at all says so on stderr and still returns an empty list", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rt182-agg-"));
+  mkdirSync(join(dir, "etc"), { recursive: true });
+  const installed = join(dir, "etc", "pm2.apps.config.js");
+  copyFileSync(join(root, "scripts/pm2-apps.config.js"), installed);
+  const result = spawnSync("node", ["-e", `console.log(JSON.stringify(require(${JSON.stringify(installed)}).apps))`], { encoding: "utf8" });
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout.trim(), "[]");
+  assert.match(result.stderr, /pm2 boot: no project apps found/);
 });

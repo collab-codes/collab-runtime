@@ -12,7 +12,7 @@ A real `systemctl restart` on Lima is still a separate proof. This document is t
 
 | Role | Path under `COLLAB_DATA_ROOT` (default `/data`) | Who writes it |
 | --- | --- | --- |
-| Apps | `mls-base/pm2.config.js` | `mls-base` `scripts/runtime/vmApps.mjs` (`ensureProjectApp`, aggregator over `pm2.apps.d`, two cluster workers per app) and `collab-sites` `buildPm2ConfigCommand` (one `pm2.apps.d/app<port>.config.js` per project). Removing a project is done by that producer. |
+| Apps | `<data>/etc/pm2.apps.config.js` (installed copy of `scripts/pm2-apps.config.js`, rt182) | `mls-base` `scripts/runtime/vmApps.mjs` (`ensureProjectApp`, aggregator over `pm2.apps.d`, two cluster workers per app) and `collab-sites` `buildPm2ConfigCommand` (one `pm2.apps.d/app<port>.config.js` per project). Removing a project is done by that producer. |
 | collab-messages | `msg.collab.codes/pm2.config.js` | Step 11 downloads the release `pm2.config.js` onto `$ROOT`. Current file: `msg` × 2 cluster, plus `msg-worker` × 1 fork when `COLLAB_MESSAGES_ENABLE_WORKER` is not `false`. `kill_timeout` is 660000. The helper unsets only that variable for the messages command so the file default keeps the worker. |
 
 There is no second project list. The helper starts each file that exists, with `start --update-env`. The same file is not started twice.
@@ -66,7 +66,7 @@ Then run the command above. It copies `scripts/pm2-start-fixed.sh` to `/usr/loca
 
 ```text
 ExecStart=
-ExecStart="/usr/local/lib/collab/pm2-start-fixed.sh" "<pm2-binary>" "<data>/mls-base/pm2.config.js" "<data>/msg.collab.codes/pm2.config.js"
+ExecStart="/usr/local/lib/collab/pm2-start-fixed.sh" "<pm2-binary>" "<data>/etc/pm2.apps.config.js" "<data>/msg.collab.codes/pm2.config.js"
 TimeoutStopSec=900s
 ```
 
@@ -117,7 +117,7 @@ The base unit keeps `Type`, `PIDFile`, `User`, `PM2_HOME`, and `ExecReload`. The
 
 ```text
 ExecStart=
-ExecStart="/usr/local/lib/collab/pm2-start-fixed.sh" "<pm2-binary-from-the-unit>" "<data>/mls-base/pm2.config.js" "<data>/msg.collab.codes/pm2.config.js"
+ExecStart="/usr/local/lib/collab/pm2-start-fixed.sh" "<pm2-binary-from-the-unit>" "<data>/etc/pm2.apps.config.js" "<data>/msg.collab.codes/pm2.config.js"
 ExecStop=
 ExecStop="<node>" "/usr/local/lib/collab/pm2-lifecycle.mjs" stop "<same-pm2-binary>"
 TimeoutStopSec=900s
@@ -188,3 +188,7 @@ cp -a "/var/backups/pm2-startup-$stamp/fixed-configs.conf" "/var/backups/pm2-sta
 systemctl daemon-reload
 systemd-analyze verify "$unit"
 ```
+
+## Apps config of the boot (rt182)
+
+`<data>/etc/pm2.apps.config.js` is root-owned and installed by step 08 from `scripts/pm2-apps.config.js`. It joins the `pm2.apps.d/*.config.js` of every project tree (`<data>/app<id>/mls-base`) first, then the ones of the old shared tree (`<data>/mls-base`) for the app names not seen yet, so a migrated project wins and the boot never names a tree. A reverted project has its app config renamed `*.config.js.revertido` (`migrateToProjectTree --revert`), which the aggregator skips; a repeated migration restores it. With no app at all it prints `pm2 boot: no project apps found` to the journal and the boot goes on with the messages config. An existing VM needs the new file installed and the drop-in pointed at it once, before the first migration.
