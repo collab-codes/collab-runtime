@@ -27,6 +27,9 @@ source "${REPO_ROOT}/core/utils.sh"
 log_section "Step 12 — client project on the VM (git-ready)"
 
 MLS_BASE_DIR="${MLS_BASE_DIR:-/data/mls-base}"
+MLS_BASE_REPO="${MLS_BASE_REPO:-https://github.com/expansiva/mls-base}"
+# One tree per project is the default (rt184): /data/app<id>/mls-base. MLS_PROJECT_TREE=0 keeps the old shared tree.
+MLS_PROJECT_TREE="${MLS_PROJECT_TREE:-1}"
 PNPM_STORE_DIR="${PNPM_STORE_DIR:-/data/.pnpm-store}"
 resolve_deploy_user
 AGENT_ENV="${AGENT_ENV:-/etc/collab/sites-agent.env}"
@@ -47,7 +50,7 @@ if ! [[ "$project_id" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-if [[ ! -d "${MLS_BASE_DIR}/.git" ]]; then
+if [[ "$MLS_PROJECT_TREE" != "1" && ! -d "${MLS_BASE_DIR}/.git" ]]; then
   log_error "${MLS_BASE_DIR} is not an mls-base checkout — did step 10 run?"
   exit 1
 fi
@@ -56,9 +59,8 @@ if ! command_exists node || ! command_exists git; then
   exit 1
 fi
 
-# Default (MLS_PROJECT_TREE unset): the shared tree, as before — the sites still sends /data/mls-base
-# until its own change. MLS_PROJECT_TREE=1 installs the project in /data/app<id>/mls-base instead.
-if [[ "${MLS_PROJECT_TREE:-0}" != "1" ]]; then
+# MLS_PROJECT_TREE=0 (explicit): the shared tree, as before. Default: the project's own tree below.
+if [[ "$MLS_PROJECT_TREE" != "1" ]]; then
   PROJECT_INIT="${MLS_BASE_DIR}/scripts/runtime/projectInit.mjs"
   if [[ ! -f "$PROJECT_INIT" ]]; then
     log_error "${PROJECT_INIT} not found — did step 10 (mls-base checkout) run?"
@@ -82,20 +84,29 @@ if [[ "${MLS_PROJECT_TREE:-0}" != "1" ]]; then
   exit 0
 fi
 
-# One tree per project. Step 10 keeps the shared checkout at MLS_BASE_DIR;
-# this step clones that commit into /data/app<id>/mls-base and never deletes it.
+# One tree per project: /data/app<id>/mls-base. A new VM has no shared checkout (step 10 does not create it), so the
+# platform comes straight from the mls-base repo. A VM that still has /data/mls-base clones that commit instead.
 PROJECT_ROOT="/data/app${project_id}/mls-base"
-commit="$(git -C "$MLS_BASE_DIR" rev-parse HEAD)"
-log_info "project tree ${PROJECT_ROOT} at ${commit} (as ${DEPLOY_USER})"
 ensure_dir "$(dirname "$PROJECT_ROOT")"
 chown "${DEPLOY_USER}:" "$(dirname "$PROJECT_ROOT")"
 if [[ ! -d "${PROJECT_ROOT}/.git" ]]; then
-  if [[ "$DEPLOY_USER" == "root" ]]; then
-    git clone "$MLS_BASE_DIR" "$PROJECT_ROOT"
-    git -C "$PROJECT_ROOT" checkout --detach "$commit"
+  if [[ -d "${MLS_BASE_DIR}/.git" ]]; then
+    commit="$(git -C "$MLS_BASE_DIR" rev-parse HEAD)"
+    log_info "project tree ${PROJECT_ROOT} at ${commit} from ${MLS_BASE_DIR} (as ${DEPLOY_USER})"
+    if [[ "$DEPLOY_USER" == "root" ]]; then
+      git clone "$MLS_BASE_DIR" "$PROJECT_ROOT"
+      git -C "$PROJECT_ROOT" checkout --detach "$commit"
+    else
+      sudo -u "$DEPLOY_USER" git clone "$MLS_BASE_DIR" "$PROJECT_ROOT"
+      sudo -u "$DEPLOY_USER" git -C "$PROJECT_ROOT" checkout --detach "$commit"
+    fi
   else
-    sudo -u "$DEPLOY_USER" git clone "$MLS_BASE_DIR" "$PROJECT_ROOT"
-    sudo -u "$DEPLOY_USER" git -C "$PROJECT_ROOT" checkout --detach "$commit"
+    log_info "project tree ${PROJECT_ROOT} from ${MLS_BASE_REPO} (as ${DEPLOY_USER})"
+    if [[ "$DEPLOY_USER" == "root" ]]; then
+      git clone "$MLS_BASE_REPO" "$PROJECT_ROOT"
+    else
+      sudo -u "$DEPLOY_USER" git clone "$MLS_BASE_REPO" "$PROJECT_ROOT"
+    fi
   fi
 else
   log_info "checkout already present — leaving its commit (re-run does not clone again)"
@@ -113,6 +124,10 @@ if [[ -f "${PROJECT_ROOT}/package.json" ]]; then
   fi
 fi
 
+# The runtime .env of this tree (database role/user, production mode): the same file step 10 wrote at /data/mls-base on
+# the old layout, now in the project's own tree. Left untouched when it is already there.
+source "${REPO_ROOT}/scripts/lib/mls-app-db.sh"
+ensure_mls_env "$PROJECT_ROOT" "$DEPLOY_USER"
 env_file="${PROJECT_ROOT}/.env"
 touch "$env_file"
 ensure_env_assignment() {

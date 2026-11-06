@@ -128,12 +128,25 @@ INSTALLED_VERSION=""
 # ── Release record (controleReleases): the cm is a `shared` app of the project it is installed in ────────────────
 # Written by mls-base's releaseRecord.mjs (the only writer of the record), on success and on failure. Missing node or
 # script is only a warning: the install never fails because of the record.
+# First existing runtime script (rt184): the override, then the project tree of the cm main project (shared.json), then
+# any project tree. The shared tree /data/mls-base is no longer a place to look: a new VM never creates it.
+find_runtime_script() { # $1 = override path (may be empty), $2 = file name under scripts/runtime
+  local override="$1" name="$2" data="${COLLAB_DATA_ROOT:-/data}" main candidate
+  if [[ -n "$override" && -f "$override" ]]; then printf '%s' "$override"; return 0; fi
+  main="$(sed -n 's/.*"projetoPrincipal"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "${COLLAB_ETC_DIR:-${data}/etc}/shared.json" 2>/dev/null | head -n 1)"
+  if [[ -n "$main" && -f "${data}/app${main}/mls-base/scripts/runtime/${name}" ]]; then
+    printf '%s' "${data}/app${main}/mls-base/scripts/runtime/${name}"; return 0
+  fi
+  for candidate in "${data}"/app*/mls-base/scripts/runtime/"${name}"; do
+    if [[ -f "$candidate" ]]; then printf '%s' "$candidate"; return 0; fi
+  done
+  return 1
+}
+
 RELEASE_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 collab_record_shared() { # $1 = ok|falhou, $2 = failing step, $3 = message
-  local rec="" candidate
-  for candidate in "${COLLAB_RELEASE_RECORD_SCRIPT:-}" /data/mls-base/scripts/runtime/releaseRecord.mjs /data/app*/mls-base/scripts/runtime/releaseRecord.mjs; do
-    [[ -n "$candidate" && -f "$candidate" ]] && { rec="$candidate"; break; }
-  done
+  local rec=""
+  rec="$(find_runtime_script "${COLLAB_RELEASE_RECORD_SCRIPT:-}" releaseRecord.mjs)" || rec=""
   if [[ -z "$rec" ]] || ! command -v node >/dev/null 2>&1; then
     log_warn "release record: releaseRecord.mjs or node not found; skipped"
     return 0
@@ -154,10 +167,8 @@ fi
 # update): COLLAB_RELEASE_PROJECT_ID, or the only project on the VM. With several projects and no variable it is left
 # for `node scripts/runtime/sharedApps.mjs set-main --projeto <id>`.
 collab_set_shared_main() {
-  local tool="" candidate project="${COLLAB_RELEASE_PROJECT_ID:-}" ids
-  for candidate in "${COLLAB_SHARED_APPS_SCRIPT:-}" /data/mls-base/scripts/runtime/sharedApps.mjs /data/app*/mls-base/scripts/runtime/sharedApps.mjs; do
-    [[ -n "$candidate" && -f "$candidate" ]] && { tool="$candidate"; break; }
-  done
+  local tool="" project="${COLLAB_RELEASE_PROJECT_ID:-}" ids
+  tool="$(find_runtime_script "${COLLAB_SHARED_APPS_SCRIPT:-}" sharedApps.mjs)" || tool=""
   if [[ -z "$tool" ]] || ! command -v node >/dev/null 2>&1; then
     log_warn "shared register: sharedApps.mjs or node not found; main project of the cm not recorded"
     return 0

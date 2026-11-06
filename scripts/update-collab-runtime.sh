@@ -17,11 +17,24 @@ STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 STEPS="pull"
 AFTER="$BEFORE"
 
-record() { # $1 = ok|falhou, $2 = failing step, $3 = message
-  local rec="" candidate
-  for candidate in "${COLLAB_RELEASE_RECORD_SCRIPT:-}" /data/mls-base/scripts/runtime/releaseRecord.mjs /data/app*/mls-base/scripts/runtime/releaseRecord.mjs; do
-    [[ -n "$candidate" && -f "$candidate" ]] && { rec="$candidate"; break; }
+# First existing runtime script (rt184): the override, then the project tree of the cm main project (shared.json), then
+# any project tree. The shared tree /data/mls-base is no longer a place to look: a new VM never creates it.
+find_runtime_script() { # $1 = override path (may be empty), $2 = file name under scripts/runtime
+  local override="$1" name="$2" data="${COLLAB_DATA_ROOT:-/data}" main candidate
+  if [[ -n "$override" && -f "$override" ]]; then printf '%s' "$override"; return 0; fi
+  main="$(sed -n 's/.*"projetoPrincipal"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "${COLLAB_ETC_DIR:-${data}/etc}/shared.json" 2>/dev/null | head -n 1)"
+  if [[ -n "$main" && -f "${data}/app${main}/mls-base/scripts/runtime/${name}" ]]; then
+    printf '%s' "${data}/app${main}/mls-base/scripts/runtime/${name}"; return 0
+  fi
+  for candidate in "${data}"/app*/mls-base/scripts/runtime/"${name}"; do
+    if [[ -f "$candidate" ]]; then printf '%s' "$candidate"; return 0; fi
   done
+  return 1
+}
+
+record() { # $1 = ok|falhou, $2 = failing step, $3 = message
+  local rec=""
+  rec="$(find_runtime_script "${COLLAB_RELEASE_RECORD_SCRIPT:-}" releaseRecord.mjs)" || rec=""
   if [[ -z "$rec" ]] || ! command -v node >/dev/null 2>&1; then
     echo "[WARN] release record: releaseRecord.mjs or node not found; skipped" >&2
     return 0

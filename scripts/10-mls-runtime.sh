@@ -21,6 +21,9 @@ log_section "Step 10 — mls-base runtime prerequisites"
 
 MLS_BASE_DIR="${MLS_BASE_DIR:-/data/mls-base}"
 MLS_BASE_REPO="${MLS_BASE_REPO:-https://github.com/expansiva/mls-base}"
+# One tree per project (rt184): the default. The project's tree /data/app<id>/mls-base is made by step 12 straight from
+# the mls-base repo, so this step no longer creates the shared /data/mls-base. MLS_PROJECT_TREE=0 keeps the old layout.
+MLS_PROJECT_TREE="${MLS_PROJECT_TREE:-1}"
 # Same user as pm2 (step 08) and the collab-sites dataOwnerUser: the owner of
 # /data, typically ubuntu. Cloud-init runs `sudo install.sh` as root, so
 # SUDO_USER is not the deploy user.
@@ -51,43 +54,55 @@ else
   log_warn "corepack not found — ensure the Node.js step (06) ran; pnpm not enabled"
 fi
 
-# ── mls-base checkout ─────────────────────────────────────────────────────────────
-ensure_dir "$MLS_BASE_DIR"
-chown "${DEPLOY_USER}:" "$MLS_BASE_DIR"
-if [[ -d "${MLS_BASE_DIR}/.git" ]]; then
-  log_info "mls-base checkout present — pulling latest…"
-  run_with_timeout "$NET_CMD_TIMEOUT_SECS" sudo -u "$DEPLOY_USER" git -C "$MLS_BASE_DIR" pull --ff-only \
-    || log_warn "git pull failed (continuing)"
+if [[ "$MLS_PROJECT_TREE" == "1" ]]; then
+  log_info "one tree per project: no shared ${MLS_BASE_DIR} checkout here (step 12 makes /data/app<id>/mls-base)"
 else
-  log_info "Cloning mls-base into ${MLS_BASE_DIR}…"
-  run_with_timeout "$NET_CMD_TIMEOUT_SECS" sudo -u "$DEPLOY_USER" git clone "$MLS_BASE_REPO" "$MLS_BASE_DIR" \
-    || log_warn "git clone failed (continuing)"
-fi
-chown -R "${DEPLOY_USER}:" "$MLS_BASE_DIR"
-
-# After clone/pull. Without this, the first build dies at `Cannot find
-# package 'esbuild'` (measured 03/09, 102043 VM). No lockfile flag: mls-base
-# `.npmrc` has frozen-lockfile=false (gb55). As the deploy user so
-# node_modules is theirs; -H bash -lc for HOME + corepack PATH.
-if [[ -f "${MLS_BASE_DIR}/package.json" ]]; then
-  log_info "Installing mls-base dependencies (as ${DEPLOY_USER})…"
-  if run_with_timeout 900 sudo -u "$DEPLOY_USER" -H bash -lc "cd \"$MLS_BASE_DIR\" && pnpm install"; then
-    log_ok "mls-base dependencies installed"
+  # ── mls-base checkout ─────────────────────────────────────────────────────────────
+  ensure_dir "$MLS_BASE_DIR"
+  chown "${DEPLOY_USER}:" "$MLS_BASE_DIR"
+  if [[ -d "${MLS_BASE_DIR}/.git" ]]; then
+    log_info "mls-base checkout present — pulling latest…"
+    run_with_timeout "$NET_CMD_TIMEOUT_SECS" sudo -u "$DEPLOY_USER" git -C "$MLS_BASE_DIR" pull --ff-only \
+      || log_warn "git pull failed (continuing)"
   else
-    log_warn "pnpm install failed in ${MLS_BASE_DIR} — no build will work on this VM until this passes"
+    log_info "Cloning mls-base into ${MLS_BASE_DIR}…"
+    run_with_timeout "$NET_CMD_TIMEOUT_SECS" sudo -u "$DEPLOY_USER" git clone "$MLS_BASE_REPO" "$MLS_BASE_DIR" \
+      || log_warn "git clone failed (continuing)"
   fi
-else
-  log_warn "no package.json in ${MLS_BASE_DIR} — checkout did not land; no build will work on this VM until this passes"
+  chown -R "${DEPLOY_USER}:" "$MLS_BASE_DIR"
+
+  # After clone/pull. Without this, the first build dies at `Cannot find
+  # package 'esbuild'` (measured 03/09, 102043 VM). No lockfile flag: mls-base
+  # `.npmrc` has frozen-lockfile=false (gb55). As the deploy user so
+  # node_modules is theirs; -H bash -lc for HOME + corepack PATH.
+  if [[ -f "${MLS_BASE_DIR}/package.json" ]]; then
+    log_info "Installing mls-base dependencies (as ${DEPLOY_USER})…"
+    if run_with_timeout 900 sudo -u "$DEPLOY_USER" -H bash -lc "cd \"$MLS_BASE_DIR\" && pnpm install"; then
+      log_ok "mls-base dependencies installed"
+    else
+      log_warn "pnpm install failed in ${MLS_BASE_DIR} — no build will work on this VM until this passes"
+    fi
+  else
+    log_warn "no package.json in ${MLS_BASE_DIR} — checkout did not land; no build will work on this VM until this passes"
+  fi
+  if [[ -d "${MLS_BASE_DIR}/node_modules" ]]; then
+    chown -R "${DEPLOY_USER}:" "${MLS_BASE_DIR}/node_modules"
+  fi
+  log_ok "${MLS_BASE_DIR} ready (cloned and installed, owner: ${DEPLOY_USER})"
 fi
-if [[ -d "${MLS_BASE_DIR}/node_modules" ]]; then
-  chown -R "${DEPLOY_USER}:" "${MLS_BASE_DIR}/node_modules"
-fi
-log_ok "${MLS_BASE_DIR} ready (cloned and installed, owner: ${DEPLOY_USER})"
 
 # ── application role, database and runtime .env ──────────────────────────────────
 # One owner for the three: scripts/lib/mls-app-db.sh, also sourced by mls-base's
 # vmInitialSetup.sh (the ssh path of the traditional publish). The role itself stays
 # 03-install-postgres.sh's job on this path — it already ran by the time we get here.
 source "${REPO_ROOT}/scripts/lib/mls-app-db.sh"
-ensure_mls_env "$MLS_BASE_DIR" "$DEPLOY_USER"
+if [[ "$MLS_PROJECT_TREE" != "1" ]]; then
+  ensure_mls_env "$MLS_BASE_DIR" "$DEPLOY_USER"
+fi
 ensure_app_database
+
+# ── /data/logs: log of the VM-level commands (cm, VM log) — made by the install, owned by the deploy user (rt184) ──
+DATA_LOGS_DIR="${COLLAB_DATA_ROOT:-/data}/logs"
+ensure_dir "$DATA_LOGS_DIR"
+chown "${DEPLOY_USER}:" "$DATA_LOGS_DIR"
+log_ok "${DATA_LOGS_DIR} ready (owner: ${DEPLOY_USER})"
