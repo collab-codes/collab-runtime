@@ -113,66 +113,26 @@ else
 fi
 chown -R "${DEPLOY_USER}:" "$PROJECT_ROOT"
 
-if [[ -f "${PROJECT_ROOT}/package.json" ]]; then
-  ensure_dir "$PNPM_STORE_DIR"
-  chown "${DEPLOY_USER}:" "$PNPM_STORE_DIR"
-  log_info "pnpm install in ${PROJECT_ROOT} (store ${PNPM_STORE_DIR})"
-  if [[ "$DEPLOY_USER" == "root" ]]; then
-    (cd "$PROJECT_ROOT" && pnpm install --store-dir "$PNPM_STORE_DIR")
-  else
-    sudo -u "$DEPLOY_USER" -H bash -lc "cd $(printf '%q' "$PROJECT_ROOT") && pnpm install --store-dir $(printf '%q' "$PNPM_STORE_DIR")"
-  fi
-fi
-
-# The runtime .env of this tree (database role/user, production mode): the same file step 10 wrote at /data/mls-base on
-# the old layout, now in the project's own tree. Left untouched when it is already there.
+# The runtime .env with the installer's database secrets: the same file step 10 wrote at /data/mls-base on the old
+# layout, now in the project's own tree. Left untouched when it is already there.
 source "${REPO_ROOT}/scripts/lib/mls-app-db.sh"
 ensure_mls_env "$PROJECT_ROOT" "$DEPLOY_USER"
-env_file="${PROJECT_ROOT}/.env"
-touch "$env_file"
-ensure_env_assignment() {
-  local key="$1" value="$2"
-  if grep -q "^${key}=" "$env_file"; then
-    return 0
-  fi
-  printf '%s=%s\n' "$key" "$value" >> "$env_file"
-}
-ensure_env_assignment CBE_PROJECTS_DIR "$PROJECT_ROOT"
-ensure_env_assignment CBE_STATIC_DIR "${PROJECT_ROOT}/static"
-chown "${DEPLOY_USER}:" "$env_file"
 
-PROJECT_INIT="${PROJECT_ROOT}/scripts/runtime/projectInit.mjs"
-if [[ ! -f "$PROJECT_INIT" ]]; then
-  log_error "${PROJECT_INIT} not found after the project clone"
+# Everything else a project needs in its own tree is ONE script of mls-base (rt187), also called by the collab-sites
+# slot over SSM, so the two never diverge: the dependencies install, the CBE_ keys of the .env, the project from the model, the
+# pm2 app config and, only when a release already exists, pm2. It runs as the deploy user (the pm2 daemon is theirs).
+PROJECT_TREE_INIT="${PROJECT_ROOT}/scripts/runtime/projectTreeInit.mjs"
+if [[ ! -f "$PROJECT_TREE_INIT" ]]; then
+  log_error "${PROJECT_TREE_INIT} not found after the project clone — is mls-base on a commit with projectTreeInit.mjs?"
   exit 1
 fi
-log_info "creating mls-${project_id} in ${PROJECT_ROOT} from model (as ${DEPLOY_USER})"
+data_root="$(dirname "$(dirname "$PROJECT_ROOT")")"
+log_info "creating mls-${project_id} in ${PROJECT_ROOT} (projectTreeInit, as ${DEPLOY_USER})"
 if [[ "$DEPLOY_USER" == "root" ]]; then
-  node "$PROJECT_INIT" "$project_id" --root "$PROJECT_ROOT" --from-model
+  tree_result="$(cd "$PROJECT_ROOT" && node "$PROJECT_TREE_INIT" "$project_id" --data "$data_root" --store "$PNPM_STORE_DIR")"
 else
-  sudo -u "$DEPLOY_USER" node "$PROJECT_INIT" "$project_id" --root "$PROJECT_ROOT" --from-model
+  tree_result="$(sudo -u "$DEPLOY_USER" -H bash -lc "cd $(printf '%q' "$PROJECT_ROOT") && node $(printf '%q' "$PROJECT_TREE_INIT") $(printf '%q' "$project_id") --data $(printf '%q' "$data_root") --store $(printf '%q' "$PNPM_STORE_DIR")")"
 fi
-
-# pm2.apps.d of this tree points the app at <project>/current. Start only once
-# a release exists; a brand-new tree has no current yet.
-tail3="${project_id: -3}"
-port=$((2000 + 10#$tail3))
-app_name="app${port}"
-if [[ "$DEPLOY_USER" == "root" ]]; then
-  (cd "$PROJECT_ROOT" && PROJECT_ROOT="$PROJECT_ROOT" PROJECT_ID="$project_id" node --input-type=module -e 'import { ensureProjectApp } from "./scripts/runtime/vmApps.mjs"; console.log(JSON.stringify(ensureProjectApp({ root: process.env.PROJECT_ROOT, projectId: process.env.PROJECT_ID })));')
-else
-  sudo -u "$DEPLOY_USER" bash -lc "cd $(printf '%q' "$PROJECT_ROOT") && PROJECT_ROOT=$(printf '%q' "$PROJECT_ROOT") PROJECT_ID=$(printf '%q' "$project_id") node --input-type=module -e 'import { ensureProjectApp } from \"./scripts/runtime/vmApps.mjs\"; console.log(JSON.stringify(ensureProjectApp({ root: process.env.PROJECT_ROOT, projectId: process.env.PROJECT_ID })));'"
-fi
-app_config="${PROJECT_ROOT}/pm2.apps.d/${app_name}.config.js"
-if [[ -L "${PROJECT_ROOT}/current" || -d "${PROJECT_ROOT}/current" ]]; then
-  if command_exists pm2; then
-    pm2 startOrReload "$app_config" --update-env
-    log_ok "pm2 ${app_name} → ${PROJECT_ROOT}/current"
-  else
-    log_warn "pm2 not found — ${app_config} is written; start ${app_name} after step 08"
-  fi
-else
-  log_info "no release at ${PROJECT_ROOT}/current yet — ${app_name} is configured and starts after the first release"
-fi
+log_info "projectTreeInit: $(printf '%s' "$tree_result" | tail -n 1)"
 
 log_ok "mls-${project_id} is git-ready — clone it with: git clone <vm>:${PROJECT_ROOT}/mls-${project_id}"

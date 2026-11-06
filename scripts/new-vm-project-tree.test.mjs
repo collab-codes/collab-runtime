@@ -21,8 +21,18 @@ test("12 defaults to the project tree, clones from the repo when there is no sha
   assert.match(step12, /git clone "\$MLS_BASE_REPO" "\$PROJECT_ROOT"/);
   assert.match(step12, /ensure_mls_env "\$PROJECT_ROOT" "\$DEPLOY_USER"/);
   const envAt = step12.indexOf('ensure_mls_env "$PROJECT_ROOT"');
-  const touchAt = step12.indexOf('touch "$env_file"');
-  assert.ok(envAt > 0 && touchAt > envAt, "the .env is made before the CBE_ lines are appended to it");
+  const initAt = step12.indexOf('projectTreeInit.mjs');
+  assert.ok(envAt > 0 && initAt > envAt, "the installer .env is made before projectTreeInit completes the tree");
+});
+
+test("12 calls the one projectTreeInit script (rt187) instead of repeating its logic in shell", () => {
+  assert.match(step12, /PROJECT_TREE_INIT="\$\{PROJECT_ROOT\}\/scripts\/runtime\/projectTreeInit\.mjs"/);
+  assert.match(step12, /--data "\$data_root" --store "\$PNPM_STORE_DIR"/);
+  assert.doesNotMatch(step12, /ensureProjectApp/);
+  assert.doesNotMatch(step12, /pnpm install/);
+  assert.doesNotMatch(step12, /pm2 startOrReload/);
+  assert.doesNotMatch(step12, /ensure_env_assignment/);
+  assert.doesNotMatch(step12, /projectInit\.mjs" "\$project_id" --root "\$PROJECT_ROOT"/);
 });
 
 test("10 does not create the shared /data/mls-base by default, keeps the role/database, and creates /data/logs for the deploy user", () => {
