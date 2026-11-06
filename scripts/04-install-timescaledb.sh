@@ -93,6 +93,7 @@ fi
 # ── Configure shared_preload_libraries ────────────────────────────────────────
 CURRENT_PRELOAD="$(sudo -u postgres psql -Atqc "SHOW shared_preload_libraries;" 2>/dev/null || true)"
 
+RESTART_NEEDED=0
 if [[ "$CURRENT_PRELOAD" == *timescaledb* ]]; then
   log_info "timescaledb already in shared_preload_libraries"
 else
@@ -104,6 +105,29 @@ else
   log_info "Setting shared_preload_libraries='${NEW_PRELOAD}'…"
   sudo -u postgres psql -v ON_ERROR_STOP=1 -d postgres \
     -c "ALTER SYSTEM SET shared_preload_libraries = '${NEW_PRELOAD}';"
+  RESTART_NEEDED=1
+fi
+
+# Worker limits (rt185). Every database made from template1 carries the extension and gets one TimescaleDB scheduler;
+# `timescaledb.max_background_workers` is the TOTAL for TimescaleDB (schedulers + launcher + job workers) and must fit
+# in `max_worker_processes`. The Postgres default (8) left the VM without a worker for the jobs: the log filled with
+# "failed to launch job ... failed to start a background worker" (1.9 GB in 5 days) and no retention/aggregate job ran.
+#   timescaledb.max_background_workers >= 1 + databases with the extension + concurrent jobs
+#   max_worker_processes               >= 3 + timescaledb.max_background_workers + max_parallel_workers (8)
+# Telemetry off: the reporter is one more job that needs a worker.
+TSDB_MAX_WORKER_PROCESSES="${TSDB_MAX_WORKER_PROCESSES:-40}"
+TSDB_MAX_BACKGROUND_WORKERS="${TSDB_MAX_BACKGROUND_WORKERS:-20}"
+sudo -u postgres psql -v ON_ERROR_STOP=1 -d postgres \
+  -c "ALTER SYSTEM SET max_worker_processes = ${TSDB_MAX_WORKER_PROCESSES};" \
+  -c "ALTER SYSTEM SET timescaledb.max_background_workers = ${TSDB_MAX_BACKGROUND_WORKERS};" \
+  -c "ALTER SYSTEM SET timescaledb.telemetry_level = 'off';" \
+  -c "SELECT pg_reload_conf();" >/dev/null
+# One restart for the preload change and the worker limits together; none when nothing changed.
+if [[ "$(sudo -u postgres psql -Atqc "SELECT count(*) FROM pg_settings WHERE pending_restart;" 2>/dev/null || echo 0)" != "0" ]]; then
+  RESTART_NEEDED=1
+fi
+if [[ "$RESTART_NEEDED" -eq 1 ]]; then
+  log_info "Restarting PostgreSQL (preload / worker limits)…"
   systemctl restart postgresql
 fi
 
