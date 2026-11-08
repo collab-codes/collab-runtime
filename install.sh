@@ -349,6 +349,9 @@ if [[ -f "$CLI_SRC" ]]; then
   chmod +x /usr/local/lib/collab/msg-configure.mjs
   cp "${INSTALL_DIR}/scripts/msg-vapid.mjs" /usr/local/lib/collab/msg-vapid.mjs
   chmod +x /usr/local/lib/collab/msg-vapid.mjs
+  cp "${INSTALL_DIR}/scripts/vm-inventory.mjs" /usr/local/lib/collab/vm-inventory.mjs
+  cp "${INSTALL_DIR}/scripts/vm-update.mjs" /usr/local/lib/collab/vm-update.mjs
+  chmod +x /usr/local/lib/collab/vm-inventory.mjs /usr/local/lib/collab/vm-update.mjs
   record_step_result "collab CLI" "PASS" "installed to ${CLI_DEST}"
   log_ok "collab CLI installed to ${CLI_DEST}"
   collab_sites_event "info" "runtime.cli_installed" "collab CLI installed" "" "{\"path\":\"$(json_escape "$CLI_DEST")\"}"

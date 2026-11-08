@@ -598,9 +598,39 @@ vm_shutdown_args_ok() {
   [[ "$seen_id" -eq 1 && "$seen_deadline" -eq 1 ]]
 }
 
+# Installed copy first (install.sh puts the vm scripts in /usr/local/lib/collab), then this checkout.
+_vm_script_path() { # $1 = file name
+  local candidate here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  for candidate in "/usr/local/lib/collab/$1" "${here}/scripts/$1"; do
+    if [[ -f "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 cmd_vm() {
   local mode="${1:-}"
   case "$mode" in
+    inventory)
+      shift
+      local inv
+      inv="$(_vm_script_path vm-inventory.mjs)" || { echo "[ERR]  vm-inventory.mjs not found (run install.sh)" >&2; exit 1; }
+      # Read only; the sites asks for it (SSM). Needs root to read Postgres as the postgres user.
+      exec node "$inv" "$@"
+      ;;
+    update)
+      shift
+      if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+        echo "[ERR]  'collab vm update' must be run as root. Use: sudo collab vm update timescaledb [--dry-run]" >&2
+        exit 1
+      fi
+      local upd
+      upd="$(_vm_script_path vm-update.mjs)" || { echo "[ERR]  vm-update.mjs not found (run install.sh)" >&2; exit 1; }
+      exec node "$upd" "$@"
+      ;;
     shutdown)
       shift
       if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -637,11 +667,17 @@ cmd_vm() {
       echo "      Admit one shutdown request as root and start collab-shutdown.service."
       echo "      The installed worker is /usr/local/lib/collab-sites-agent/shutdown-worker.mjs."
       echo ""
+      echo "  collab vm inventory"
+      echo "      What is installed on this VM (read only); the last line is the vm-inventory JSON."
+      echo ""
+      echo "  collab vm update timescaledb [--dry-run]"
+      echo "      Restart Postgres and ALTER EXTENSION timescaledb UPDATE in each database (root)."
+      echo ""
       exit 0
       ;;
     *)
       echo "Unknown option: ${mode}" >&2
-      echo "Usage: collab vm shutdown --request-id <uuid> --deadline <ISO-8601 UTC>" >&2
+      echo "Usage: collab vm shutdown --request-id <uuid> --deadline <ISO-8601 UTC> | inventory | update timescaledb [--dry-run]" >&2
       exit 1
       ;;
   esac
