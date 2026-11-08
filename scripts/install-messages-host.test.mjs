@@ -7,6 +7,7 @@ import { test } from "node:test";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const install = readFileSync(join(root, "install.sh"), "utf8");
 const cli = readFileSync(join(root, "collab"), "utf8");
+const installCli = readFileSync(join(root, "scripts", "install-cli.sh"), "utf8");
 
 test("install.sh defaults to skipping collab-messages and logs the skip", () => {
   assert.match(install, /MESSAGES_HOST=false/);
@@ -25,7 +26,9 @@ test("collab CLI exposes msg vapid and install.sh copies the script", () => {
   assert.match(cli, /vapid\)/);
   assert.match(cli, /msg-vapid\.mjs/);
   assert.match(cli, /vapid init\|show/);
-  assert.match(install, /msg-vapid\.mjs/);
+  // the copy lives in scripts/install-cli.sh (rt196), which install.sh and update-collab-runtime.sh both run
+  assert.match(installCli, /msg-vapid\.mjs/);
+  assert.match(install, /install-cli\.sh/);
 });
 
 test("install.sh never installs the AWS CLI", () => {

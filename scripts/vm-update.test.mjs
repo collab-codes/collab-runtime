@@ -9,7 +9,11 @@ function machine({ pkg = '2.31.0', dbs = { a: '2.30.0', b: '2.30.0', c: '2.30.0'
     const line = [command, ...args].join(' ');
     state.calls.push(line);
     if (command === 'dpkg-query') return { code: 0, out: `timescaledb-2-postgresql-17|${pkg}~ubuntu24.04-1700\n`, err: '' };
-    if (line.includes('select datname')) return { code: 0, out: `${Object.keys(state.dbs).join('\n')}\n`, err: '' };
+    if (line.includes('select datname')) {
+      // the real query orders template1 first
+      const names = Object.keys(state.dbs).sort((x, y) => (y === 'template1') - (x === 'template1') || x.localeCompare(y));
+      return { code: 0, out: `${names.join('\n')}\n`, err: '' };
+    }
     if (line.includes('select extversion')) {
       const db = args[args.indexOf('-d') + 1];
       return { code: 0, out: `${state.dbs[db]}\n`, err: '' };
@@ -134,4 +138,24 @@ test('findReleaseRecordScript: override, projeto principal, qualquer árvore de 
   assert.equal(findReleaseRecordScript({ ...base, env: { COLLAB_RELEASE_RECORD_SCRIPT: '/x/rr.mjs' } }), '/x/rr.mjs');
   assert.equal(findReleaseRecordScript({ ...base, env: {} }), '/data/app102056/mls-base/scripts/runtime/releaseRecord.mjs');
   assert.equal(findReleaseRecordScript({ ...base, exists: () => false, env: {} }), null);
+});
+
+test('rt196: o banco-modelo (template1) entra, vai primeiro, e um rascunho criado depois nasce na versão nova', async () => {
+  const m = machine({ dbs: { a: '2.30.0', template1: '2.30.0', b: '2.30.0' } });
+  const result = await updateTimescale({ ...m.deps });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.bancos.map((b) => b.db), ['template1', 'a', 'b'], 'template1 primeiro');
+  const order = alters(m).map((line) => /-d (\w+)/u.exec(line)[1]);
+  assert.deepEqual(order, ['template1', 'a', 'b']);
+  assert.match(m.writes.join(''), /template1 \(2\.30\.0\) \[modelo dos rascunhos\]/u);
+  // CREATE DATABASE copies template1: a draft database created now is born at the package version
+  const bornNow = m.dbs.template1;
+  assert.equal(bornNow, '2.31.0');
+});
+
+test('rt196: os bancos de rascunho que já existem em versão antiga entram no mesmo update', async () => {
+  const m = machine({ dbs: { collab_app_draft_team_102056: '2.30.0', collab_app_draft_102056_u44dd34ecef2b: '2.30.0', template1: '2.30.0', outro: '2.31.0' } });
+  const result = await updateTimescale({ ...m.deps });
+  assert.deepEqual(result.bancos.map((b) => b.db).sort(), ['collab_app_draft_102056_u44dd34ecef2b', 'collab_app_draft_team_102056', 'template1']);
+  assert.deepEqual(Object.values(m.dbs), ['2.31.0', '2.31.0', '2.31.0', '2.31.0']);
 });

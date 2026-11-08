@@ -339,25 +339,13 @@ log_section "Installing collab CLI"
 CLI_SRC="${INSTALL_DIR}/collab"
 CLI_DEST="/usr/local/bin/collab"
 
-if [[ -f "$CLI_SRC" ]]; then
-  cp "$CLI_SRC" "$CLI_DEST"
-  chmod +x "$CLI_DEST"
-  mkdir -p /usr/local/lib/collab
-  cp "${INSTALL_DIR}/scripts/11-install-collab-messages.sh" /usr/local/lib/collab/install-collab-messages.sh
-  chmod +x /usr/local/lib/collab/install-collab-messages.sh
-  cp "${INSTALL_DIR}/scripts/msg-configure.mjs" /usr/local/lib/collab/msg-configure.mjs
-  chmod +x /usr/local/lib/collab/msg-configure.mjs
-  cp "${INSTALL_DIR}/scripts/msg-vapid.mjs" /usr/local/lib/collab/msg-vapid.mjs
-  chmod +x /usr/local/lib/collab/msg-vapid.mjs
-  cp "${INSTALL_DIR}/scripts/vm-inventory.mjs" /usr/local/lib/collab/vm-inventory.mjs
-  cp "${INSTALL_DIR}/scripts/vm-update.mjs" /usr/local/lib/collab/vm-update.mjs
-  chmod +x /usr/local/lib/collab/vm-inventory.mjs /usr/local/lib/collab/vm-update.mjs
+if [[ -f "$CLI_SRC" ]] && COLLAB_CLI_SRC="$INSTALL_DIR" bash "${INSTALL_DIR}/scripts/install-cli.sh"; then
   record_step_result "collab CLI" "PASS" "installed to ${CLI_DEST}"
   log_ok "collab CLI installed to ${CLI_DEST}"
   collab_sites_event "info" "runtime.cli_installed" "collab CLI installed" "" "{\"path\":\"$(json_escape "$CLI_DEST")\"}"
 else
-  record_step_result "collab CLI" "FAIL" "source file not found: ${CLI_SRC}"
-  log_error "collab CLI source not found at ${CLI_SRC}"
+  record_step_result "collab CLI" "FAIL" "install failed or source file not found: ${CLI_SRC}"
+  log_error "collab CLI install failed (source ${CLI_SRC})"
   collab_sites_event "error" "runtime.cli_failed" "collab CLI source not found" "failed" "{\"path\":\"$(json_escape "$CLI_SRC")\"}"
 fi
 

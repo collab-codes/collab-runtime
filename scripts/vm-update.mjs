@@ -13,7 +13,7 @@
 import { existsSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readTimescale, realRun } from './vm-inventory.mjs';
+import { TEMPLATE_DATABASE, readTimescale, realRun } from './vm-inventory.mjs';
 
 const PG = ['sudo', '-n', '-u', 'postgres', 'psql', '-X', '-At', '-v', 'ON_ERROR_STOP=1'];
 const RESTART_TIMEOUT_MS = 120_000;
@@ -90,7 +90,7 @@ export async function updateTimescale({ dryRun = false, ...overrides } = {}) {
     deps.write(`timescaledb: ${databases.length} banco(s) já na ${pkg}; nada a fazer\n`);
     return { ...summary, ok: true, nothing: true };
   }
-  deps.write(`timescaledb: pacote ${pkg}; extensão atrasada em ${behind.length} banco(s): ${behind.map(({ db, version }) => `${db} (${version})`).join(', ')}\n`);
+  deps.write(`timescaledb: pacote ${pkg}; extensão atrasada em ${behind.length} banco(s): ${behind.map(({ db, version }) => `${db} (${version})${db === TEMPLATE_DATABASE ? ' [modelo dos rascunhos]' : ''}`).join(', ')}\n`);
   if (dryRun) {
     deps.write('--dry-run: reiniciaria o Postgres e rodaria ALTER EXTENSION timescaledb UPDATE em cada banco acima, um por vez. Nada foi alterado.\n');
     return { ...summary, ok: true, nothing: false };

@@ -2,6 +2,8 @@
 # scripts/update-collab-runtime.sh
 # Update the management (this checkout of collab-runtime) to origin/main and record the update in the `vm` queue of
 # the release record (controleReleases): commit before and after, steps, result, also on failure.
+# After the pull it reinstalls the `collab` CLI and the scripts it calls (scripts/install-cli.sh, the same step install.sh
+# runs) so an existing VM gets the new CLI too (rt196). It restarts no service: the sites agent has its own path.
 #   sudo /data/collab-runtime/scripts/update-collab-runtime.sh
 # Git runs as the owner of the checkout (root breaks the fetch). The record is written by mls-base's releaseRecord.mjs;
 # without it or without node the update still runs and only a warning is printed.
@@ -15,6 +17,7 @@ as_owner() { if [[ "$(id -u)" -eq 0 && "$OWNER" != "root" ]]; then sudo -u "$OWN
 BEFORE="$(as_owner git -C "$RUNTIME_DIR" rev-parse HEAD)"
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 STEPS="pull"
+FAIL_STEP="pull"
 AFTER="$BEFORE"
 
 # First existing runtime script (rt184): the override, then the project tree of the cm main project (shared.json), then
@@ -45,11 +48,25 @@ record() { # $1 = ok|falhou, $2 = failing step, $3 = message
   return 0
 }
 
-trap 'rc=$?; trap - EXIT; if [[ $rc -ne 0 ]]; then record falhou pull "update exited with status $rc"; fi; exit $rc' EXIT
+trap 'rc=$?; trap - EXIT; if [[ $rc -ne 0 ]]; then record falhou "$FAIL_STEP" "update exited with status $rc"; fi; exit $rc' EXIT
 
 as_owner git -C "$RUNTIME_DIR" fetch origin
 as_owner git -C "$RUNTIME_DIR" merge --ff-only origin/main
 AFTER="$(as_owner git -C "$RUNTIME_DIR" rev-parse HEAD)"
 echo "collab-runtime: ${BEFORE:0:7} -> ${AFTER:0:7}"
+
+# The CLI step runs the install-cli.sh of the checkout that was just pulled; an older checkout without it is skipped.
+# Needs root (it writes /usr/local); COLLAB_CLI_PREFIX redirects the destinations (tests), so it needs no root then.
+CLI_SCRIPT="${RUNTIME_DIR}/scripts/install-cli.sh"
+if [[ -f "$CLI_SCRIPT" ]]; then
+  if [[ "$(id -u)" -eq 0 || -n "${COLLAB_CLI_PREFIX:-}" ]]; then
+    STEPS="pull,cli"
+    FAIL_STEP="cli"
+    COLLAB_CLI_SRC="$RUNTIME_DIR" bash "$CLI_SCRIPT"
+    FAIL_STEP="pull"
+  else
+    echo "[WARN] not root: the collab CLI was not reinstalled (run with sudo)" >&2
+  fi
+fi
 record ok
 trap - EXIT

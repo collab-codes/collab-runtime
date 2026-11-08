@@ -18,6 +18,8 @@ import { fileURLToPath } from 'node:url';
 
 export const CONTRACT_VERSION = 1;
 export const COMPONENT_TIMEOUT_MS = 2500;
+export const TEMPLATE_DATABASE = 'template1';
+const dbLabel = (db) => (db === TEMPLATE_DATABASE ? `${db} (modelo dos rascunhos)` : db);
 const PG = ['sudo', '-n', '-u', 'postgres', 'psql', '-X', '-At'];
 
 /** Run a command with a deadline. Never throws: a missing binary is code 127, a timeout is code 124. */
@@ -69,7 +71,9 @@ export async function readTimescale(run) {
   if (!pkgLine) throw new Error('pacote timescaledb-2-postgresql-* não instalado');
   const [pkgName, pkgFull] = pkgLine.split('|');
   const pkg = String(pkgFull).split('~')[0];
-  const dbsOut = await ok(run, PG[0], [...PG.slice(1), '-c', 'select datname from pg_database where datallowconn and not datistemplate order by 1'], 'psql databases');
+  // `template1` COUNTS (rt196): the draft databases are made with `CREATE DATABASE` from it, so a template left behind makes
+  // every new draft be born one version late. It comes first: a draft created during the update is born updated.
+  const dbsOut = await ok(run, PG[0], [...PG.slice(1), '-c', "select datname from pg_database where datallowconn order by (datname = 'template1') desc, 1"], 'psql databases');
   const names = dbsOut.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
   const databases = [];
   for (const db of names) {
@@ -138,7 +142,7 @@ const READERS = {
     for (const { db, version } of databases) groups.set(version, [...(groups.get(version) ?? []), db]);
     const detail = databases.length === 0
       ? 'nenhum banco com a extensão'
-      : [...groups].map(([version, dbs]) => `extensão ${version}: ${dbs.length} banco(s)${version === pkg ? '' : ` (${dbs.join(', ')})`}`).join('; ');
+      : [...groups].map(([version, dbs]) => `extensão ${version}: ${dbs.length} banco(s)${version === pkg ? '' : ` (${dbs.map(dbLabel).join(', ')})`}`).join('; ');
     const behind = databases.some(({ version }) => version !== pkg);
     return behind
       ? { instalado: pkg, estado: 'desatualizado', acao: 'timescaledb', exigeReinicio: true, detalhe: detail }

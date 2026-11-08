@@ -30,7 +30,7 @@ function machine(answers = {}, files = {}) {
   };
 }
 
-const DBS = 'collab_a\ncollab_b\ncollab_c\n';
+const DBS = 'template1\ncollab_a\ncollab_b\ncollab_c\n';
 const FULL = {
   'git -c safe.directory=* -C /data/collab-runtime rev-parse': { out: 'b5e586b\n' },
   'sh -c command -v pm2': { out: '' },
@@ -83,13 +83,21 @@ test('versões: runtime, nginx, node, deno, redis, postgres, pm2', async () => {
   assert.match(pm2.detalhe, /\/data\/etc\/pm2\.apps\.config\.js/u);
 });
 
-test('timescaledb: pacote 2.31 × extensão 2.30 em dois bancos = desatualizado, com a ação e o reinício', async () => {
+test('timescaledb: pacote 2.31 × extensão 2.30 em três bancos (com o template1) = desatualizado, com a ação e o reinício', async () => {
   const timescale = byId(await buildInventory(machine(FULL, FILES).deps), 'timescaledb');
   assert.equal(timescale.instalado, '2.31.0');
   assert.equal(timescale.estado, 'desatualizado');
   assert.equal(timescale.acao, 'timescaledb');
   assert.equal(timescale.exigeReinicio, true);
-  assert.match(timescale.detalhe, /extensão 2\.30\.0: 2 banco\(s\) \(collab_b, collab_c\)/u);
+  assert.match(timescale.detalhe, /extensão 2\.30\.0: 3 banco\(s\) \(template1 \(modelo dos rascunhos\), collab_b, collab_c\)/u);
+});
+
+test('timescaledb: o template1 atrasado aparece como modelo dos rascunhos e a consulta o inclui', async () => {
+  const { deps, calls } = machine({ ...FULL, 'select extversion': (line) => ({ code: 0, out: line.includes('template1') ? '2.30.0\n' : '2.31.0\n', err: '' }) }, FILES);
+  const timescale = byId(await buildInventory(deps), 'timescaledb');
+  assert.equal(timescale.estado, 'desatualizado');
+  assert.match(timescale.detalhe, /template1 \(modelo dos rascunhos\)/u);
+  assert.ok(calls.some((line) => line.includes("select datname") && !line.includes('not datistemplate')), 'a consulta não exclui os modelos');
 });
 
 test('timescaledb: tudo igual ao pacote = ok, sem ação', async () => {
