@@ -68,5 +68,22 @@ if [[ -f "$CLI_SCRIPT" ]]; then
     echo "[WARN] not root: the collab CLI was not reinstalled (run with sudo)" >&2
   fi
 fi
+
+# The sites agent (rt199): install its files from the checkout just pulled, with the same step as install.sh. The record
+# (`pull,cli,agente`) is written BEFORE the restart, and the restart comes LAST, outside this process (a transient systemd
+# timer), and only when a file that runs inside the agent changed. An older checkout without vm-update.mjs is skipped.
+AGENT_RESTART=0
+UPDATE_SCRIPT="${RUNTIME_DIR}/scripts/vm-update.mjs"
+if [[ -f "$UPDATE_SCRIPT" ]] && command -v node >/dev/null 2>&1 && { [[ "$(id -u)" -eq 0 ]] || [[ -n "${COLLAB_CLI_PREFIX:-}" ]]; }; then
+  STEPS="${STEPS},agente"
+  FAIL_STEP="agente"
+  AGENT_OUT="$(COLLAB_RUNTIME_DIR="$RUNTIME_DIR" node "$UPDATE_SCRIPT" agente --no-record --no-restart)"
+  echo "$AGENT_OUT"
+  if printf '%s' "$AGENT_OUT" | grep -q '"reinicio":true'; then AGENT_RESTART=1; fi
+  FAIL_STEP="pull"
+fi
 record ok
 trap - EXIT
+if [[ "$AGENT_RESTART" -eq 1 ]]; then
+  COLLAB_RUNTIME_DIR="$RUNTIME_DIR" node "$UPDATE_SCRIPT" agente --restart-only || echo "[WARN] agent restart not scheduled" >&2
+fi

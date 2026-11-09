@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// scripts/vm-update.mjs — `collab vm update <componente> [--dry-run]` (rt195 s2). First component: `timescaledb`.
+// scripts/vm-update.mjs — `collab vm update <componente> [--dry-run]` (rt195 s2). Components: `timescaledb`, `agente` (rt199).
 //
 // timescaledb: the package was upgraded (2.31) but each database still has the old extension (2.30): the new library
 // is loaded only after a Postgres restart, and `ALTER EXTENSION timescaledb UPDATE` must be the FIRST command of a
@@ -10,9 +10,11 @@
 // recorded in the `vm` queue of the release record (releaseRecord.mjs, like update-collab-runtime.sh), also on failure.
 // The code does not say "updated": the NEXT `collab vm inventory` does.
 
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { compareAgent } from './vm-agent.mjs';
 import { TEMPLATE_DATABASE, readTimescale, realRun } from './vm-inventory.mjs';
 
 const PG = ['sudo', '-n', '-u', 'postgres', 'psql', '-X', '-At', '-v', 'ON_ERROR_STOP=1'];
@@ -124,6 +126,83 @@ export async function updateTimescale({ dryRun = false, ...overrides } = {}) {
   return finish('ok');
 }
 
+const sha12 = (path) => createHash('sha256').update(readFileSync(path)).digest('hex').slice(0, 12);
+const AGENT_UNIT = 'collab-sites-agent';
+
+/**
+ * Restart the agent OUTSIDE this process, 2 s from now (a transient systemd timer), so the output and the record of this
+ * command are already out. The agent is not the parent of the command (the sites sends it by SSM), but a restart in the
+ * middle of the command's own output is never needed. Not while an ordered shutdown is running.
+ */
+export async function restartAgent(overrides = {}) {
+  const env = overrides.env ?? process.env;
+  const deps = { ...realDeps(env), ...overrides, env };
+  const shutdown = await deps.run('systemctl', ['is-active', 'collab-shutdown'], { timeoutMs: 5000 });
+  if (/^(active|activating|deactivating)$/u.test(String(shutdown.out).trim())) {
+    deps.write('agente: reinício adiado, há um desligamento ordenado em curso (collab-shutdown); reinicie depois\n');
+    return { scheduled: false, deferred: true };
+  }
+  const timer = await deps.run('systemd-run', ['--on-active=2s', '--unit=collab-agent-restart', '--description=restart collab-sites-agent (collab vm update agente)', 'systemctl', 'restart', AGENT_UNIT], { timeoutMs: 15_000 });
+  if (timer.code === 0) {
+    deps.write('agente: reinício marcado para daqui a 2 s (systemd-run)\n');
+    return { scheduled: true, deferred: false };
+  }
+  deps.write(`[WARN] systemd-run falhou (exit ${timer.code}); reiniciando o agente agora\n`);
+  const direct = await deps.run('systemctl', ['restart', AGENT_UNIT], { timeoutMs: 60_000 });
+  return { scheduled: direct.code === 0, deferred: false, direct: true, ...(direct.code === 0 ? {} : { falha: `systemctl restart: exit ${direct.code}` }) };
+}
+
+/**
+ * `vm update agente`: install the agent files with the SAME step as install.sh (`install-shutdown.sh --maintenance-only`),
+ * record it in the `vm` queue, and restart the agent LAST, only when a file that runs inside it changed. Equal to the
+ * checkout: nothing happens. `record: false` and `restart: false` are for update-collab-runtime.sh, which records its own
+ * `pull,cli,agente` entry first and restarts afterwards (`--restart-only`).
+ */
+export async function updateAgent({ dryRun = false, record = true, restart = true, ...overrides } = {}) {
+  const env = overrides.env ?? process.env;
+  const deps = { ...realDeps(env), hashOf: sha12, ...overrides, env };
+  const runtimeDir = env.COLLAB_RUNTIME_DIR ?? '/data/collab-runtime';
+  const prefix = env.COLLAB_SHUTDOWN_PREFIX ?? '';
+  const diff = compareAgent({ runtimeDir, prefix, exists: deps.exists, hashOf: deps.hashOf });
+  const summary = { acao: 'agente', dryRun, arquivos: diff.changed.map((c) => c.file), reinicio: diff.restartNeeded };
+
+  if (diff.changed.length === 0) {
+    deps.write('agente: já igual ao checkout; nada a fazer\n');
+    return { ...summary, ok: true, nothing: true, reinicio: false };
+  }
+  deps.write(`agente: ${diff.changed.length} arquivo(s) diferente(s): ${diff.changed.map((c) => `${c.file}${c.reason === 'not-installed' ? ' (não instalado)' : ''}`).join(', ')}\n`);
+  if (dryRun) {
+    deps.write(`--dry-run: instalaria pelo install-shutdown.sh --maintenance-only${diff.restartNeeded ? ' e reiniciaria o collab-sites-agent por último' : ' (sem reiniciar: nenhum arquivo que roda dentro do agente mudou)'}. Nada foi alterado.\n`);
+    return { ...summary, ok: true, nothing: false };
+  }
+
+  const startedAt = new Date(deps.now()).toISOString();
+  const steps = ['agente'];
+  const finish = async (result, failedStep, message) => {
+    if (record) {
+      await writeRecord(deps, { before: `agente ${diff.installedMain}`, after: `agente ${diff.checkoutMain}`, steps, startedAt, result, failedStep, message });
+    }
+    return { ...summary, ok: result === 'ok', nothing: false, ...(failedStep ? { falha: { passo: failedStep, mensagem: message } } : {}) };
+  };
+
+  const installer = join(runtimeDir, 'scripts', 'install-shutdown.sh');
+  if (!deps.exists(installer)) return finish('falhou', 'agente', `install-shutdown.sh not found at ${installer}`);
+  const install = await deps.run('bash', [installer, '--maintenance-only'], { timeoutMs: 120_000 });
+  if (install.code !== 0) {
+    const detail = String(install.err || install.out).split(/\r?\n/u).map((line) => line.trim()).find(Boolean) ?? `exit ${install.code}`;
+    return finish('falhou', 'agente', `install-shutdown.sh: ${detail}`);
+  }
+  deps.write('agente: arquivos instalados (install-shutdown.sh --maintenance-only)\n');
+  if (diff.restartNeeded && restart) steps.push('restart-agente');
+  const result = await finish('ok');          // the record is written BEFORE the restart
+  if (diff.restartNeeded && restart) {
+    const outcome = await restartAgent({ ...overrides, env });
+    return { ...result, reinicio: outcome.scheduled, ...(outcome.deferred ? { reinicioAdiado: true } : {}) };
+  }
+  // `restart: false` (update-collab-runtime.sh): `reinicio` says a restart is NEEDED; the script does it after its record.
+  return { ...result, reinicio: diff.restartNeeded && !restart };
+}
+
 function invokedAsMain() {
   try {
     return process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
@@ -134,16 +213,22 @@ function invokedAsMain() {
 
 if (invokedAsMain()) {
   const [component, ...flags] = process.argv.slice(2);
-  const dryRun = flags.includes('--dry-run');
-  if (component !== 'timescaledb' || flags.some((flag) => flag !== '--dry-run')) {
-    process.stderr.write('Usage: collab vm update timescaledb [--dry-run]\n');
+  const known = component === 'timescaledb' ? ['--dry-run'] : component === 'agente' ? ['--dry-run', '--no-record', '--no-restart', '--restart-only'] : null;
+  if (!known || flags.some((flag) => !known.includes(flag))) {
+    process.stderr.write('Usage: collab vm update timescaledb [--dry-run] | collab vm update agente [--dry-run]\n');
     process.exit(2);
   }
-  updateTimescale({ dryRun }).then((result) => {
+  const dryRun = flags.includes('--dry-run');
+  const task = component === 'timescaledb'
+    ? updateTimescale({ dryRun })
+    : flags.includes('--restart-only')
+      ? restartAgent().then((outcome) => ({ acao: 'agente', ok: !outcome.falha, ...outcome }))
+      : updateAgent({ dryRun, record: !flags.includes('--no-record'), restart: !flags.includes('--no-restart') });
+  task.then((result) => {
     process.stdout.write(`${JSON.stringify(result)}\n`);
     process.exit(result.ok ? 0 : 1);
   }).catch((error) => {
-    process.stderr.write(`vm update timescaledb: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.stderr.write(`vm update ${component}: ${error instanceof Error ? error.message : String(error)}\n`);
     process.exit(1);
   });
 }

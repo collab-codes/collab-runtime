@@ -624,7 +624,7 @@ cmd_vm() {
     update)
       shift
       if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-        echo "[ERR]  'collab vm update' must be run as root. Use: sudo collab vm update timescaledb [--dry-run]" >&2
+        echo "[ERR]  'collab vm update' must be run as root. Use: sudo collab vm update timescaledb|agente [--dry-run]" >&2
         exit 1
       fi
       local upd
@@ -673,11 +673,15 @@ cmd_vm() {
       echo "  collab vm update timescaledb [--dry-run]"
       echo "      Restart Postgres and ALTER EXTENSION timescaledb UPDATE in each database (root)."
       echo ""
+      echo "  collab vm update agente [--dry-run]"
+      echo "      Install the sites agent files from the checkout (install-shutdown.sh --maintenance-only), record it in"
+      echo "      the vm queue, and restart collab-sites-agent last, only when a file that runs inside it changed (root)."
+      echo ""
       exit 0
       ;;
     *)
       echo "Unknown option: ${mode}" >&2
-      echo "Usage: collab vm shutdown --request-id <uuid> --deadline <ISO-8601 UTC> | inventory | update timescaledb [--dry-run]" >&2
+      echo "Usage: collab vm shutdown --request-id <uuid> --deadline <ISO-8601 UTC> | inventory | update timescaledb|agente [--dry-run]" >&2
       exit 1
       ;;
   esac

@@ -42,13 +42,13 @@ const FULL = {
   'node --version': { out: 'v22.11.0\n' },
   'deno --version': { out: 'deno 2.1.4 (stable, release, aarch64-unknown-linux-gnu)\nv8 13.0\n' },
   'redis-server --version': { out: 'Redis server v=7.0.15 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64 build=x\n' },
-  'apt-get -s upgrade': { out: 'Reading package lists...\nInst libssl3 [3.0.1] (3.0.2 Ubuntu)\nInst curl [8.1] (8.2 Ubuntu)\nConf curl (8.2 Ubuntu)\n' },
   'df -Pk': { out: 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/a 20971520 8388608 12582912 40% /\n/dev/b 41943040 16777216 25165824 40% /data\n' },
 };
 const FILES = {
   '/usr/local/lib/collab-sites-agent/collab-sites-agent.mjs': 'aaaaaaaaaaaa',
   '/data/collab-runtime/agent/collab-sites-agent.mjs': 'aaaaaaaaaaaa',
   '/usr/lib/node_modules/pm2/package.json': JSON.stringify({ version: '5.4.3' }),
+  '/var/lib/update-notifier/updates-available': '\nExpanded Security Maintenance for Applications is not enabled.\n\n2 updates can be applied immediately.\n',
   '/etc/systemd/system/pm2-ubuntu.service.d/fixed-configs.conf': '[Service]\nExecStart=/usr/bin/pm2 resurrect "/data/etc/pm2.apps.config.js"\n',
 };
 const byId = (inventory, id) => inventory.componentes.find((c) => c.id === id);
@@ -106,24 +106,53 @@ test('timescaledb: tudo igual ao pacote = ok, sem ação', async () => {
   assert.equal(timescale.acao, undefined);
 });
 
-test('agente: cópia igual ao checkout = ok; diferente = desatualizado', async () => {
+test('agente: tudo igual ao checkout = ok; um arquivo que roda no agente diferente = desatualizado com acao e reinício', async () => {
   assert.equal(byId(await buildInventory(machine(FULL, FILES).deps), 'agente').estado, 'ok');
   const files = { ...FILES, '/data/collab-runtime/agent/collab-sites-agent.mjs': 'bbbbbbbbbbbb' };
   const agente = byId(await buildInventory(machine(FULL, files).deps), 'agente');
   assert.equal(agente.estado, 'desatualizado');
+  assert.equal(agente.acao, 'agente');
+  assert.equal(agente.exigeReinicio, true);
   assert.equal(agente.instalado, 'aaaaaaaaaaaa');
-  assert.match(agente.detalhe, /checkout bbbbbbbbbbbb/u);
+  assert.match(agente.detalhe, /agent\/collab-sites-agent\.mjs; checkout bbbbbbbbbbbb/u);
 });
 
-test('sistema: conta os pacotes do cache do apt (sem apt update) e vê o reboot pedido', async () => {
+test('agente: arquivo do conjunto que não roda no agente (pm2-lifecycle) diferente = desatualizado, sem exigir reinício; arquivo não instalado conta', async () => {
+  const lifecycle = { ...FILES, '/data/collab-runtime/scripts/pm2-lifecycle.mjs': 'new', '/usr/local/lib/collab/pm2-lifecycle.mjs': 'old' };
+  const a = byId(await buildInventory(machine(FULL, lifecycle).deps), 'agente');
+  assert.equal(a.estado, 'desatualizado');
+  assert.equal(a.exigeReinicio, undefined);
+  assert.match(a.detalhe, /scripts\/pm2-lifecycle\.mjs/u);
+  const notInstalled = { ...FILES, '/data/collab-runtime/agent/release-notices.mjs': 'rn' };
+  const b = byId(await buildInventory(machine(FULL, notInstalled).deps), 'agente');
+  assert.equal(b.estado, 'desatualizado');
+  assert.equal(b.exigeReinicio, true);
+  assert.match(b.detalhe, /agent\/release-notices\.mjs \(não instalado\)/u);
+});
+
+test('sistema: lê a contagem do cache do sistema (um arquivo, sem apt) e vê o reboot pedido', async () => {
   const { deps, calls } = machine(FULL, { ...FILES, '/var/run/reboot-required': '' });
   const sistema = byId(await buildInventory(deps), 'sistema');
   assert.equal(sistema.instalado, '2 pacote(s) a atualizar');
   assert.equal(sistema.estado, 'desatualizado');
   assert.equal(sistema.exigeReinicio, true);
   assert.match(sistema.detalhe, /reboot pedido/u);
-  assert.ok(calls.some((line) => line === 'apt-get -s upgrade'));
-  assert.ok(!calls.some((line) => /apt(-get)? update/u.test(line)), 'não pode rodar apt update');
+  assert.ok(!calls.some((line) => /\bapt(-get)?\b/u.test(line)), 'nenhum apt: só leitura do arquivo');
+});
+
+test('sistema: cache com 0 atualizações = ok; sem o arquivo do cache = erro dizendo qual', async () => {
+  const none = { ...FILES, '/var/lib/update-notifier/updates-available': '0 updates can be applied immediately.\n' };
+  assert.equal(byId(await buildInventory(machine(FULL, none).deps), 'sistema').estado, 'ok');
+  const { '/var/lib/update-notifier/updates-available': _gone, ...withoutCache } = FILES;
+  const sistema = byId(await buildInventory(machine(FULL, withoutCache).deps), 'sistema');
+  assert.equal(sistema.estado, 'erro');
+  assert.match(sistema.detalhe, /sem \/var\/lib\/update-notifier\/updates-available/u);
+});
+
+test('prazo por componente: o sistema tem 1 s e os outros 2,5 s', async () => {
+  const { COMPONENT_TIMEOUT_MS, COMPONENT_TIMEOUTS_MS } = await import('./vm-inventory.mjs');
+  assert.equal(COMPONENT_TIMEOUT_MS, 2500);
+  assert.deepEqual(COMPONENT_TIMEOUTS_MS, { sistema: 1000 });
 });
 
 test('disco: uso de / e /data', async () => {

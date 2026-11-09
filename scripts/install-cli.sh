@@ -38,7 +38,7 @@ put() { # $1 = source, $2 = destination
 
 put "${SRC}/collab" "${BIN_DIR}/collab"
 put "${SRC}/scripts/11-install-collab-messages.sh" "${LIB_DIR}/install-collab-messages.sh"
-for name in msg-configure.mjs msg-vapid.mjs vm-inventory.mjs vm-update.mjs; do
+for name in msg-configure.mjs msg-vapid.mjs vm-agent.mjs vm-inventory.mjs vm-update.mjs; do
   put "${SRC}/scripts/${name}" "${LIB_DIR}/${name}"
 done
 

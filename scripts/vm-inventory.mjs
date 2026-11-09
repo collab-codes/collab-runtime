@@ -15,9 +15,13 @@ import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { compareAgent } from './vm-agent.mjs';
 
 export const CONTRACT_VERSION = 1;
 export const COMPONENT_TIMEOUT_MS = 2500;
+/** A component with its own deadline (rt199): the system packages come from the cache file and must never hold the total. */
+export const COMPONENT_TIMEOUTS_MS = { sistema: 1000 };
+export const UPDATES_CACHE_FILE = '/var/lib/update-notifier/updates-available';
 export const TEMPLATE_DATABASE = 'template1';
 const dbLabel = (db) => (db === TEMPLATE_DATABASE ? `${db} (modelo dos rascunhos)` : db);
 const PG = ['sudo', '-n', '-u', 'postgres', 'psql', '-X', '-At'];
@@ -92,15 +96,21 @@ const READERS = {
   },
 
   agente: async ({ env, exists, hashOf }) => {
-    const installed = env.COLLAB_AGENT_INSTALLED ?? '/usr/local/lib/collab-sites-agent/collab-sites-agent.mjs';
-    const checkout = env.COLLAB_AGENT_CHECKOUT ?? join(env.COLLAB_RUNTIME_DIR ?? '/data/collab-runtime', 'agent', 'collab-sites-agent.mjs');
-    if (!exists(installed)) throw new Error(`agente não instalado em ${installed}`);
-    const copy = hashOf(installed);
-    if (!exists(checkout)) return { instalado: copy, estado: 'ok', detalhe: 'sem checkout para comparar' };
-    const source = hashOf(checkout);
-    return copy === source
-      ? { instalado: copy, estado: 'ok' }
-      : { instalado: copy, estado: 'desatualizado', detalhe: `checkout ${source}` };
+    const runtimeDir = env.COLLAB_RUNTIME_DIR ?? '/data/collab-runtime';
+    const prefix = env.COLLAB_SHUTDOWN_PREFIX ?? '';
+    const main = join(prefix || '/', 'usr/local/lib/collab-sites-agent/collab-sites-agent.mjs');
+    if (!exists(main)) throw new Error(`agente não instalado em ${main}`);
+    const diff = compareAgent({ runtimeDir, prefix, exists, hashOf });
+    if (diff.changed.length === 0) {
+      return { instalado: diff.installedMain, estado: 'ok', ...(diff.checkoutMain ? {} : { detalhe: 'sem checkout para comparar' }) };
+    }
+    return {
+      instalado: diff.installedMain || hashOf(main),
+      estado: 'desatualizado',
+      acao: 'agente',
+      ...(diff.restartNeeded ? { exigeReinicio: true } : {}),
+      detalhe: `${diff.changed.map((c) => `${c.file}${c.reason === 'not-installed' ? ' (não instalado)' : ''}`).join(', ')}${diff.checkoutMain ? `; checkout ${diff.checkoutMain}` : ''}`,
+    };
   },
 
   pm2: async ({ run, env, exists, readText, listDir }) => {
@@ -170,10 +180,11 @@ const READERS = {
     return { instalado: match[1], estado: 'ok' };
   },
 
-  // The apt CACHE only (a simulation, no `apt update`): a number a minute old is fine, a network call is not.
-  sistema: async ({ run, exists }) => {
-    const out = await ok(run, 'apt-get', ['-s', 'upgrade'], 'apt-get -s upgrade');
-    const pending = out.split(/\r?\n/u).filter((line) => line.startsWith('Inst ')).length;
+  // The count the system already keeps (`/var/lib/update-notifier/updates-available`, refreshed by apt itself): a file read.
+  // `apt-get -s upgrade` takes ~2.2 s on the 102056 and has no place in a 1 s budget. No cache file = an error saying so.
+  sistema: async ({ exists, readText }) => {
+    if (!exists(UPDATES_CACHE_FILE)) throw new Error(`sem ${UPDATES_CACHE_FILE} (o apt não gerou o cache de atualizações)`);
+    const pending = Number(/(\d+)\s+updates?\s+can\s+be\s+(?:applied|installed)/iu.exec(readText(UPDATES_CACHE_FILE))?.[1] ?? 0);
     const reboot = exists('/var/run/reboot-required');
     const parts = [`${pending} pacote(s) a atualizar`];
     if (reboot) parts.push('reboot pedido');
@@ -241,9 +252,9 @@ async function readComponent(id, deps, timeoutMs) {
 export async function buildInventory(overrides = {}) {
   const env = overrides.env ?? process.env;
   const deps = { ...realDeps(env), ...overrides };
-  const timeoutMs = overrides.timeoutMs ?? COMPONENT_TIMEOUT_MS;
   const startedAt = deps.now();
-  const componentes = await Promise.all(COMPONENT_IDS.map((id) => readComponent(id, deps, timeoutMs)));
+  const timeoutOf = (id) => overrides.timeoutMs ?? COMPONENT_TIMEOUTS_MS[id] ?? COMPONENT_TIMEOUT_MS;
+  const componentes = await Promise.all(COMPONENT_IDS.map((id) => readComponent(id, deps, timeoutOf(id))));
   return {
     versaoContrato: CONTRACT_VERSION,
     vmId: deps.vmId(),
