@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { COMPONENT_IDS, buildInventory, formatInventory } from './vm-inventory.mjs';
 
 // A fake machine: `answers` maps "command arg arg…" prefixes to { code, out, err }; the first matching prefix wins.
@@ -51,6 +52,7 @@ const FILES = {
   '/var/lib/update-notifier/updates-available': '\nExpanded Security Maintenance for Applications is not enabled.\n\n2 updates can be applied immediately.\n',
   '/etc/systemd/system/pm2-ubuntu.service.d/fixed-configs.conf': '[Service]\nExecStart=/usr/bin/pm2 resurrect "/data/etc/pm2.apps.config.js"\n',
 };
+const sha12 = (text) => createHash('sha256').update(text).digest('hex').slice(0, 12);
 const byId = (inventory, id) => inventory.componentes.find((c) => c.id === id);
 
 test('o documento segue o contrato vm-inventory v1 e traz todos os componentes', async () => {
@@ -113,8 +115,8 @@ test('agente: tudo igual ao checkout = ok; um arquivo que roda no agente diferen
   assert.equal(agente.estado, 'desatualizado');
   assert.equal(agente.acao, 'agente');
   assert.equal(agente.exigeReinicio, true);
-  assert.equal(agente.instalado, 'aaaaaaaaaaaa');
-  assert.match(agente.detalhe, /agent\/collab-sites-agent\.mjs; checkout bbbbbbbbbbbb/u);
+  assert.equal(agente.instalado, sha12('aaaaaaaaaaaa'));
+  assert.match(agente.detalhe, new RegExp(`agent/collab-sites-agent\\.mjs; checkout ${sha12('bbbbbbbbbbbb')}`, 'u'));
 });
 
 test('agente: arquivo do conjunto que não roda no agente (pm2-lifecycle) diferente = desatualizado, sem exigir reinício; arquivo não instalado conta', async () => {

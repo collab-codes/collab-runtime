@@ -10,7 +10,6 @@
 // recorded in the `vm` queue of the release record (releaseRecord.mjs, like update-collab-runtime.sh), also on failure.
 // The code does not say "updated": the NEXT `collab vm inventory` does.
 
-import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -126,7 +125,6 @@ export async function updateTimescale({ dryRun = false, ...overrides } = {}) {
   return finish('ok');
 }
 
-const sha12 = (path) => createHash('sha256').update(readFileSync(path)).digest('hex').slice(0, 12);
 const AGENT_UNIT = 'collab-sites-agent';
 
 /**
@@ -160,10 +158,10 @@ export async function restartAgent(overrides = {}) {
  */
 export async function updateAgent({ dryRun = false, record = true, restart = true, ...overrides } = {}) {
   const env = overrides.env ?? process.env;
-  const deps = { ...realDeps(env), hashOf: sha12, ...overrides, env };
+  const deps = { ...realDeps(env), ...overrides, env };
   const runtimeDir = env.COLLAB_RUNTIME_DIR ?? '/data/collab-runtime';
   const prefix = env.COLLAB_SHUTDOWN_PREFIX ?? '';
-  const diff = compareAgent({ runtimeDir, prefix, exists: deps.exists, hashOf: deps.hashOf });
+  const diff = compareAgent({ runtimeDir, prefix, exists: deps.exists, readText: deps.readText });
   const summary = { acao: 'agente', dryRun, arquivos: diff.changed.map((c) => c.file), reinicio: diff.restartNeeded };
 
   if (diff.changed.length === 0) {

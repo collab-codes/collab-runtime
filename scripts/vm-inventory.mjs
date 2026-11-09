@@ -95,17 +95,17 @@ const READERS = {
     return { instalado: firstLine(out), estado: 'ok' };
   },
 
-  agente: async ({ env, exists, hashOf }) => {
+  agente: async ({ env, exists, readText }) => {
     const runtimeDir = env.COLLAB_RUNTIME_DIR ?? '/data/collab-runtime';
     const prefix = env.COLLAB_SHUTDOWN_PREFIX ?? '';
     const main = join(prefix || '/', 'usr/local/lib/collab-sites-agent/collab-sites-agent.mjs');
     if (!exists(main)) throw new Error(`agente não instalado em ${main}`);
-    const diff = compareAgent({ runtimeDir, prefix, exists, hashOf });
+    const diff = compareAgent({ runtimeDir, prefix, exists, readText });
     if (diff.changed.length === 0) {
       return { instalado: diff.installedMain, estado: 'ok', ...(diff.checkoutMain ? {} : { detalhe: 'sem checkout para comparar' }) };
     }
     return {
-      instalado: diff.installedMain || hashOf(main),
+      instalado: diff.installedMain,
       estado: 'desatualizado',
       acao: 'agente',
       ...(diff.restartNeeded ? { exigeReinicio: true } : {}),
