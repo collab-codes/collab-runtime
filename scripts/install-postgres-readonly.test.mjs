@@ -85,6 +85,14 @@ test("13 creates a read-only role, grants SELECT in the app database, and writes
   assert.equal((env102056.match(/^DATABASE_URL_READONLY=/gmu) ?? []).length, 1);
 });
 
+test("13 runs standalone when LOG_DIR does not exist yet (the lima run failed here)", () => {
+  const s = sandbox();
+  assert.equal(existsSync(join(s.dir, "logs")), false);
+  const r = s.run();
+  assert.equal(r.status, 0, r.stderr + r.stdout);
+  assert.ok(existsSync(join(s.dir, "logs")));
+});
+
 test("13 keeps the password out of the arguments, the output and the logs; the file is root-only", () => {
   const s = sandbox();
   const r = s.run();

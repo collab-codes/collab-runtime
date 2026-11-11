@@ -26,6 +26,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # shellcheck source=../core/logger.sh
 source "${REPO_ROOT}/core/logger.sh"
+# Standalone run (the lima, an existing VM): the logger appends to LOG_DIR and does not create it.
+mkdir -p "${LOG_DIR:-/var/log/collab}"
 
 RO_USER="${DB_READONLY_USER:-collab_readonly}"
 APP_USER="${DB_APP_USER:-collab}"
