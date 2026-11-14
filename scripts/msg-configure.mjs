@@ -84,7 +84,11 @@ function canonicalProjectId(projectId) {
   return Number.isSafeInteger(numeric) && numeric > 0 && String(numeric) === projectId;
 }
 
-function httpsOrigin(value) {
+// Contrato (19/10): o baseUrl de cada app e a URL completa do POST do despertar; o cm posta nele como esta e a Nora
+// troca este caminho por /exec/assistant. Aceita a origem ou o caminho exato; grava sempre o caminho completo.
+const WORKFLOW_EVENT_PATH = "/exec/workflow-event";
+
+function workflowEventUrl(value) {
   if (typeof value !== "string" || value.length === 0 || value !== value.trim()) return null;
   let url;
   try {
@@ -95,8 +99,9 @@ function httpsOrigin(value) {
   if (url.protocol !== "https:") return null;
   if (url.username || url.password) return null;
   if (url.search || url.hash) return null;
-  if (url.pathname !== "/") return null;
-  return url.origin;
+  const path = url.pathname.length > 1 && url.pathname.endsWith("/") ? url.pathname.slice(0, -1) : url.pathname;
+  if (path !== "/" && path !== WORKFLOW_EVENT_PATH) return null;
+  return `${url.origin}${WORKFLOW_EVENT_PATH}`;
 }
 
 function parseAppsMap(apps) {
@@ -130,12 +135,12 @@ function parseAppsMap(apps) {
       problems.push(`config.apps project ${key} token is invalid`);
       itemOk = false;
     }
-    const origin = httpsOrigin(item.baseUrl);
-    if (!origin) {
+    const baseUrl = workflowEventUrl(item.baseUrl);
+    if (!baseUrl) {
       problems.push(`config.apps project ${key} baseUrl is invalid`);
       itemOk = false;
     }
-    if (itemOk) entries.push([key, { token, baseUrl: origin }]);
+    if (itemOk) entries.push([key, { token, baseUrl }]);
   }
   if (invalidId) problems.unshift("config.apps has an invalid project id");
   if (problems.length > 0) throw new Error(problems.join("; "));

@@ -277,8 +277,8 @@ const TWO_APPS = {
 
 test("parsePublicConfig accepts two apps from a string or an object", () => {
   const expected = {
-    "102034": { token: "tok-app-a", baseUrl: "https://app.example" },
-    "102035": { token: "tok-app-b", baseUrl: "https://other.example:8443" },
+    "102034": { token: "tok-app-a", baseUrl: "https://app.example/exec/workflow-event" },
+    "102035": { token: "tok-app-b", baseUrl: "https://other.example:8443/exec/workflow-event" },
   };
   const fromString = parsePublicConfig(JSON.stringify({ storage: { bucket: "collab-msg-x" }, apps: TWO_APPS }));
   assert.equal(fromString.storage.bucket, "collab-msg-x");
@@ -288,6 +288,34 @@ test("parsePublicConfig accepts two apps from a string or an object", () => {
   assert.equal(fromObject.instanceId, "i-host");
   assert.deepEqual(fromObject.apps, expected);
   assert.equal(source.apps["102034"].baseUrl, "https://app.example/");
+});
+
+test("parsePublicConfig writes the full workflow-event URL from an origin or from the exact path", () => {
+  const full = "https://app.example/exec/workflow-event";
+  for (const baseUrl of [
+    "https://app.example",
+    "https://app.example/",
+    full,
+    `${full}/`,
+  ]) {
+    const { apps } = parsePublicConfig({ apps: { "102034": { token: "tok-app-a", baseUrl } } });
+    assert.deepEqual(apps["102034"], { token: "tok-app-a", baseUrl: full }, baseUrl);
+  }
+});
+
+test("parsePublicConfig refuses any other path without writing the map", () => {
+  for (const baseUrl of [
+    "https://app.example/exec/assistant",
+    "https://app.example/x",
+    "https://app.example/exec/workflow-event/x",
+    "https://app.example/exec",
+  ]) {
+    assert.throws(
+      () => parsePublicConfig({ apps: { "102034": { token: "tok-app-a", baseUrl } } }),
+      /project 102034 baseUrl is invalid/,
+      baseUrl,
+    );
+  }
 });
 
 test("parsePublicConfig keeps apps absent and accepts an explicit empty map", () => {
@@ -428,8 +456,8 @@ test("configure replaces modules.apps and leaves a bad map or malformed modules 
     "102035": { token: "tok-app-b", baseUrl: "https://other.example:8443" },
   };
   const expected = {
-    "102034": { token: "tok-app-a", baseUrl: "https://app.example" },
-    "102035": { token: "tok-app-b", baseUrl: "https://other.example:8443" },
+    "102034": { token: "tok-app-a", baseUrl: "https://app.example/exec/workflow-event" },
+    "102035": { token: "tok-app-b", baseUrl: "https://other.example:8443/exec/workflow-event" },
   };
   await run({ apps: two });
   let written = JSON.parse(readFileSync(appconfig, "utf8"));
