@@ -235,6 +235,15 @@ if [[ -f "$NODE_DIR/appconfig.json" ]]; then
   chown "${DEPLOY_USER}:" "$NODE_DIR/appconfig.json"
 fi
 
+# ── Postgres of the cm (rt231): role + database + `db` block of the appconfig, BEFORE the release starts ─────────
+# The cm refuses to run without a Postgres (pg_01). Step 14 is idempotent and also runs alone on an existing VM.
+CM_DB_STEP="${SCRIPT_DIR}/14-postgres-cm.sh"
+if [[ ! -f "$CM_DB_STEP" ]]; then
+  log_error "14-postgres-cm.sh not found next to this script (${SCRIPT_DIR}) — run 'collab' CLI install (install-cli.sh) again"
+  exit 1
+fi
+COLLAB_MESSAGES_DEPLOY_ROOT="$ROOT" bash "$CM_DB_STEP"
+
 # ── Install release (release layout + pm2 startOrReload) ────────────────────────
 PNPM_RESOLVED="$(command -v pnpm || true)"
 if [[ -z "$PNPM_RESOLVED" ]]; then

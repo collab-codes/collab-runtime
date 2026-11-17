@@ -176,6 +176,13 @@ test("mergeAppConfig altera chaves no lugar e preserva o resto", () => {
   assert.equal(merged.storage.dynamoRegion, "us-east-1");
 });
 
+test("mergeAppConfig deixa o bloco db do Postgres do cm intacto (rt231)", () => {
+  const db = { host: "127.0.0.1", port: 5432, database: "cm", user: "cm", password: "pg-secret-kept" };
+  const merged = mergeAppConfig({ ...OLD_APPCONFIG, db }, SECRET, { storage: { s3Region: "us-east-1" } });
+  assert.deepEqual(merged.db, db);
+  assert.equal(mergeAppConfig(OLD_APPCONFIG, SECRET, {}).db, undefined, "sem bloco antes, o configure não inventa um");
+});
+
 test("mergeAppConfig does not drop extra storage keys already present", () => {
   const current = { ...OLD_APPCONFIG, storage: { dynamoRegion: "us-west-1", extra: "keep" } };
   const merged = mergeAppConfig(current, SECRET, { storage: { dynamoRegion: "us-east-1" } });

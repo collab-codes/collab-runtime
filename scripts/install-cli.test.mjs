@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 const SCRIPTS = dirname(fileURLToPath(import.meta.url));
 const INSTALL_CLI = join(SCRIPTS, "install-cli.sh");
 const GIT_ENV = { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
-const FILES = ["11-install-collab-messages.sh", "msg-configure.mjs", "msg-vapid.mjs", "vm-agent.mjs", "vm-inventory.mjs", "vm-update.mjs"];
+const FILES = ["11-install-collab-messages.sh", "14-postgres-cm.sh", "msg-cm-db.mjs", "msg-configure.mjs", "msg-vapid.mjs", "vm-agent.mjs", "vm-inventory.mjs", "vm-update.mjs"];
 
 /** A fake checkout with the CLI and the scripts it installs (contents are markers, not the real files). */
 function checkout(root, tag) {
@@ -35,7 +35,7 @@ test("copia a CLI e os scripts que ela chama, executáveis", () => {
     assert.equal(result.status, 0, result.stderr);
     assert.equal(readFileSync(join(prefix, "usr/local/bin/collab"), "utf8"), "#!/bin/bash\n# collab v1\n");
     assert.equal(readFileSync(dest(prefix, "install-collab-messages.sh"), "utf8"), "// 11-install-collab-messages.sh v1\n");
-    for (const name of ["msg-configure.mjs", "msg-vapid.mjs", "vm-agent.mjs", "vm-inventory.mjs", "vm-update.mjs"]) {
+    for (const name of ["14-postgres-cm.sh", "msg-cm-db.mjs", "msg-configure.mjs", "msg-vapid.mjs", "vm-agent.mjs", "vm-inventory.mjs", "vm-update.mjs"]) {
       assert.equal(readFileSync(dest(prefix, name), "utf8"), `// ${name} v1\n`);
       assert.ok((statSync(dest(prefix, name)).mode & 0o111) !== 0, `${name} executável`);
     }
