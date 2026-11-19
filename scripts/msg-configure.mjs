@@ -362,6 +362,8 @@ export function storageOkFromHealth(body) {
 }
 
 export const DEFAULT_MSG_NODE = "/data/msg.collab.codes/node";
+/** The active release of collab-messages: since collab-workspace@5a01f7c each release carries its own node_modules. */
+export const DEFAULT_MSG_CURRENT = "/data/msg.collab.codes/current";
 export const DEFAULT_CLI_DIR = "/usr/local/lib/collab";
 
 function step(name) {
@@ -416,6 +418,8 @@ export function hasAwsSdk(nodeModulesDir) {
 export function findAwsSdkDir(overrides = {}) {
   const scriptDir = dirname(fileURLToPath(import.meta.url));
   const candidates = overrides.candidates ?? [
+    overrides.msgCurrentNodeModules ?? join(overrides.msgCurrent ?? DEFAULT_MSG_CURRENT, "node_modules"),
+    // The old shared folder: only a VM that has not received a release with its own node_modules still has the SDK here.
     overrides.msgNodeModules ?? join(overrides.msgNode ?? DEFAULT_MSG_NODE, "node_modules"),
     overrides.cliNodeModules ?? join(overrides.cliDir ?? DEFAULT_CLI_DIR, "node_modules"),
     join(scriptDir, "node_modules"),

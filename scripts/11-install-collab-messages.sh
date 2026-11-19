@@ -88,16 +88,19 @@ VERSION_FILE="$NODE_DIR/collab-messages.version"
 CLI_LIB_DIR="/usr/local/lib/collab"
 
 # AWS SDK for `collab msg configure` (no AWS CLI). Prefer the collab-messages
-# node_modules; current releases ship @aws-sdk/client-sts but not client-ssm,
+# node_modules of the active release (current/), then the old shared node/; current releases ship @aws-sdk/client-sts but not client-ssm,
 # so fall back to installing both next to the CLI script. Versions stay in
 # sync with collab-runtime/package.json.
 ensure_msg_configure_sdk() {
   mkdir -p "$CLI_LIB_DIR"
-  local msg_nm="${NODE_DIR}/node_modules"
-  if [[ -d "${msg_nm}/@aws-sdk/client-sts" && -d "${msg_nm}/@aws-sdk/client-ssm" ]]; then
-    log_info "msg-configure AWS SDK: ${msg_nm}"
-    return 0
-  fi
+  # The active release first (each release carries its own node_modules), then the old shared folder as a reserve.
+  local msg_nm
+  for msg_nm in "${ROOT}/current/node_modules" "${NODE_DIR}/node_modules"; do
+    if [[ -d "${msg_nm}/@aws-sdk/client-sts" && -d "${msg_nm}/@aws-sdk/client-ssm" ]]; then
+      log_info "msg-configure AWS SDK: ${msg_nm}"
+      return 0
+    fi
+  done
   if [[ -d "${CLI_LIB_DIR}/node_modules/@aws-sdk/client-sts" && -d "${CLI_LIB_DIR}/node_modules/@aws-sdk/client-ssm" ]]; then
     log_info "msg-configure AWS SDK: ${CLI_LIB_DIR}/node_modules"
     return 0

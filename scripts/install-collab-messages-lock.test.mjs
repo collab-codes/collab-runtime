@@ -42,3 +42,10 @@ test("a successful download lands as install/pnpm-lock.yaml", () => {
 test("the installer is valid bash", () => {
   execFileSync("bash", ["-n", installerPath], { stdio: "pipe" });
 });
+
+test("rt248: the installer looks for the msg-configure AWS SDK in the active release first, then in the old shared folder", () => {
+  assert.match(installer, /for msg_nm in "\$\{ROOT\}\/current\/node_modules" "\$\{NODE_DIR\}\/node_modules"; do/);
+  const first = installer.indexOf('"${ROOT}/current/node_modules"');
+  const reserve = installer.indexOf('"${NODE_DIR}/node_modules"');
+  assert.ok(first > 0 && reserve > first);
+});

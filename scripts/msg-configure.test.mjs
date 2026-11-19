@@ -1306,3 +1306,26 @@ test("parseSecretParameter still accepts an old secret without collabtoken (T7)"
     { ...SECRET, collabtoken: COLLABTOKEN_PROBE },
   );
 });
+
+test("rt248: findAwsSdkDir looks first in the active release (current/node_modules)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "aws-sdk-"));
+  const currentNm = join(dir, "current", "node_modules");
+  const oldNm = join(dir, "node", "node_modules");
+  const cliNm = join(dir, "cli", "node_modules");
+  writeFakeAwsSdk(currentNm);
+  writeFakeAwsSdk(oldNm);
+  writeFakeAwsSdk(cliNm);
+  assert.equal(findAwsSdkDir({ msgCurrentNodeModules: currentNm, msgNodeModules: oldNm, cliNodeModules: cliNm }), currentNm);
+});
+
+test("rt248: findAwsSdkDir falls back to the old shared folder when the release has no SDK, then to the CLI dir", () => {
+  const dir = mkdtempSync(join(tmpdir(), "aws-sdk-"));
+  const currentNm = join(dir, "current", "node_modules");
+  const oldNm = join(dir, "node", "node_modules");
+  const cliNm = join(dir, "cli", "node_modules");
+  writeFakeAwsSdk(oldNm);
+  writeFakeAwsSdk(cliNm);
+  assert.equal(findAwsSdkDir({ msgCurrentNodeModules: currentNm, msgNodeModules: oldNm, cliNodeModules: cliNm }), oldNm);
+  const bare = mkdtempSync(join(tmpdir(), "aws-sdk-"));
+  assert.equal(findAwsSdkDir({ msgCurrentNodeModules: currentNm, msgNodeModules: join(bare, "none"), cliNodeModules: cliNm }), cliNm);
+});
