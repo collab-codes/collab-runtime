@@ -103,3 +103,43 @@ test("recordDirs finds the shared tree, every project tree and the VM queue that
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("rt250: a release de várias filas manda um release.finished por fila, com a fila trocada e sem o campo filas", async () => {
+  await withDir(async (dir) => {
+    leave(dir, "20261119100000", ["release.finished", "release.finished:libs", "release.finished:base"], { fila: "app", filas: ["app", "libs", "base"] });
+    const posted = [];
+    const postJson = async (_url, { body }) => {
+      posted.push(JSON.parse(body));
+      return { statusCode: 200 };
+    };
+    const result = await sendPendingNotices(CONFIG, { postJson, dirs: [dir], log: quiet });
+    assert.deepEqual(result, { sent: 3, failed: 0 });
+    assert.deepEqual(posted.map((p) => p.code), ["release.finished", "release.finished", "release.finished"]);
+    assert.deepEqual(posted.map((p) => p.details.fila), ["app", "libs", "base"]);
+    assert.deepEqual(posted.map((p) => p.message), [
+      "release.finished app 20261119100000 ok",
+      "release.finished libs 20261119100000 ok",
+      "release.finished base 20261119100000 ok",
+    ]);
+    for (const item of posted) {
+      assert.equal("filas" in item.details, false, "the sites refuses a field outside the contract");
+      assert.equal(item.details.releaseId, "20261119100000");
+      assert.equal(item.details.vmId, "srv_1");
+    }
+    assert.equal(existsSync(join(dir, "20261119100000.aviso-pendente")), false);
+  });
+});
+
+test("rt250: se o sites cai no meio, só a fila já confirmada sai do aviso pendente", async () => {
+  await withDir(async (dir) => {
+    leave(dir, "20261119100001", ["release.finished", "release.finished:libs"], { fila: "app", filas: ["app", "libs"] });
+    let calls = 0;
+    const postJson = async () => {
+      calls += 1;
+      return { statusCode: calls === 1 ? 200 : 503 };
+    };
+    const result = await sendPendingNotices(CONFIG, { postJson, dirs: [dir], log: quiet });
+    assert.deepEqual(result, { sent: 1, failed: 1 });
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, "20261119100001.aviso-pendente"), "utf8")).codes, ["release.finished:libs"]);
+  });
+});

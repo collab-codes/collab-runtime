@@ -81,16 +81,21 @@ export async function sendPendingNotices(config, { postJson, dirs = recordDirs(c
   let failed = 0;
   for (const notice of pendingNotices(dirs)) {
     let remaining = [...notice.codes];
-    for (const code of notice.codes) {
+    for (const pending of notice.codes) {
+      // `release.finished:<fila>` is the notice of an extra queue of the release (`filas`): the sites receives one
+      // `release.finished` per queue, the same record with `fila` set to that queue and without the field `filas`.
+      const [code, extraQueue] = pending.split(":");
+      const { filas: _filas, ...record } = notice.record;
+      const fila = extraQueue ?? record.fila;
       const payload = JSON.stringify({
         projectId: config.projectId,
         token: config.token,
-        level: code === "release.finished" && notice.record.resultado === "falhou" ? "warn" : "info",
+        level: code === "release.finished" && record.resultado === "falhou" ? "warn" : "info",
         code,
-        message: `${code} ${notice.record.fila} ${notice.record.releaseId} ${notice.record.resultado}`,
+        message: `${code} ${fila} ${record.releaseId} ${record.resultado}`,
         // The sites matches record.vmId against the server id of the URL. The release scripts run as the data owner and
         // cannot read the agent env, so the record may carry the hostname; the agent, which knows the server id, says it.
-        details: { ...notice.record, vmId: config.serverId },
+        details: { ...record, fila, vmId: config.serverId },
       });
       try {
         const result = await postJson(url, {
@@ -99,16 +104,16 @@ export async function sendPendingNotices(config, { postJson, dirs = recordDirs(c
           timeoutMs: 10_000,
         });
         if (result.statusCode >= 200 && result.statusCode < 300) {
-          remaining = remaining.filter((item) => item !== code);
+          remaining = remaining.filter((item) => item !== pending);
           writeCodes(notice.file, remaining);
           sent += 1;
           continue;
         }
         failed += 1;
-        log.error(`release notice ${code} ${notice.releaseId}: sites answered ${result.statusCode}; kept for the next round`);
+        log.error(`release notice ${pending} ${notice.releaseId}: sites answered ${result.statusCode}; kept for the next round`);
       } catch (error) {
         failed += 1;
-        log.error(`release notice ${code} ${notice.releaseId}: ${error instanceof Error ? error.message : String(error)}; kept for the next round`);
+        log.error(`release notice ${pending} ${notice.releaseId}: ${error instanceof Error ? error.message : String(error)}; kept for the next round`);
       }
       break; // keep the order: do not send `finished` before `started` was confirmed
     }
