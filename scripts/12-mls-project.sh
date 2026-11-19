@@ -116,6 +116,7 @@ chown -R "${DEPLOY_USER}:" "$PROJECT_ROOT"
 # The runtime .env with the installer's database secrets: the same file step 10 wrote at /data/mls-base on the old
 # layout, now in the project's own tree. Left untouched when it is already there.
 source "${REPO_ROOT}/scripts/lib/mls-app-db.sh"
+source "${REPO_ROOT}/scripts/lib/mls-tsrs.sh"
 ensure_mls_env "$PROJECT_ROOT" "$DEPLOY_USER"
 
 # Everything else a project needs in its own tree is ONE script of mls-base (rt187), also called by the collab-sites
@@ -134,5 +135,6 @@ else
   tree_result="$(sudo -u "$DEPLOY_USER" -H bash -lc "cd $(printf '%q' "$PROJECT_ROOT") && node $(printf '%q' "$PROJECT_TREE_INIT") $(printf '%q' "$project_id") --data $(printf '%q' "$data_root") --store $(printf '%q' "$PNPM_STORE_DIR")")"
 fi
 log_info "projectTreeInit: $(printf '%s' "$tree_result" | tail -n 1)"
+note_tsrs "$PROJECT_ROOT"
 
 log_ok "mls-${project_id} is git-ready — clone it with: git clone <vm>:${PROJECT_ROOT}/mls-${project_id}"

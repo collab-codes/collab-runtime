@@ -29,6 +29,8 @@ MLS_PROJECT_TREE="${MLS_PROJECT_TREE:-1}"
 # SUDO_USER is not the deploy user.
 resolve_deploy_user
 
+source "${REPO_ROOT}/scripts/lib/mls-tsrs.sh"
+
 # ── rsync + git ─────────────────────────────────────────────────────────────────
 if ! command_exists rsync || ! command_exists git; then
   apt_update_safe
@@ -82,6 +84,7 @@ else
     else
       log_warn "pnpm install failed in ${MLS_BASE_DIR} — no build will work on this VM until this passes"
     fi
+    note_tsrs "$MLS_BASE_DIR"
   else
     log_warn "no package.json in ${MLS_BASE_DIR} — checkout did not land; no build will work on this VM until this passes"
   fi
