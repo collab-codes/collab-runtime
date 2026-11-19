@@ -335,6 +335,8 @@ export PROJECT_ID AGENT_ENV
 run_step 12 "mls client project"      "12-mls-project.sh"
 # Read-only Postgres role for the draft (rt205): after the app .env and the project exist; it warns and exits 0 when the app database is not there yet.
 run_step 13 "Postgres read-only role" "13-postgres-readonly.sh"
+# VM key for external-system secrets (rt263): after the app .env exists. Idempotent; does not restart pm2.
+run_step 15 "VM secrets key" "15-collab-secrets-key.sh"
 
 # ── Step 8: Install collab CLI ────────────────────────────────────────────────
 log_section "Installing collab CLI"

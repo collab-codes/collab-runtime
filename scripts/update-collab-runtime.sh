@@ -82,6 +82,15 @@ if [[ -f "$UPDATE_SCRIPT" ]] && command -v node >/dev/null 2>&1 && { [[ "$(id -u
   if printf '%s' "$AGENT_OUT" | grep -q '"reinicio":true'; then AGENT_RESTART=1; fi
   FAIL_STEP="pull"
 fi
+# The VM key (rt263): the checkout just pulled. Missing on an older checkout, so it is skipped.
+# It does not restart pm2. A failure here fails the update.
+SECRETS_STEP="${RUNTIME_DIR}/scripts/15-collab-secrets-key.sh"
+if [[ -f "$SECRETS_STEP" ]]; then
+  STEPS="${STEPS},secrets"
+  FAIL_STEP="secrets"
+  bash "$SECRETS_STEP"
+  FAIL_STEP="pull"
+fi
 record ok
 trap - EXIT
 if [[ "$AGENT_RESTART" -eq 1 ]]; then
