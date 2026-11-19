@@ -311,6 +311,7 @@ run_step() {
 run_step 00 "Setup Data Disk"         "00-setup-data-disk.sh"
 run_step 00a "Config on data disk" "00a-etc-on-data.sh"
 run_step 01 "Ubuntu System Update"    "01-ubuntu-update.sh"
+run_step 01b "Swap (2 GB)"            "01b-swap.sh"
 run_step 02 "Install NGINX"           "02-install-nginx.sh"
 run_step 03 "Install PostgreSQL"      "03-install-postgres.sh"
 run_step 04 "Install TimescaleDB"     "04-install-timescaledb.sh"
