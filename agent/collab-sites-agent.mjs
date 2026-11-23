@@ -379,6 +379,32 @@ export async function collectPm2Facts(config, deps = {}) {
   return facts;
 }
 
+/**
+ * Disk usage of `/` and of the data root as numbers (the admin shows the percentage and warns above a limit).
+ * `df` exits with an error when any path is missing, which would drop `/` too, so a data root that does not exist is left out.
+ * Returns `undefined` when `df` fails or no data row can be read: the heartbeat goes on without the field.
+ */
+export function collectDisks(config, command = commandOutput, exists = existsSync) {
+  const paths = ["/"];
+  if (config.dataRoot && config.dataRoot !== "/" && exists(config.dataRoot)) paths.push(config.dataRoot);
+  const out = command("df", ["-Pk", ...paths]);
+  if (!out) return undefined;
+  const rows = out.split(/\r?\n/u).slice(1).map((line) => line.trim().split(/\s+/u)).filter((cols) => cols.length >= 6);
+  const disks = [];
+  rows.forEach((cols, index) => {
+    const [, sizeKb, usedKb, availKb, percent] = cols;
+    const entry = {
+      path: paths[index],
+      sizeKb: Number(sizeKb),
+      usedKb: Number(usedKb),
+      availKb: Number(availKb),
+      usedPercent: Number(String(percent).replace("%", "")),
+    };
+    if (entry.path && [entry.sizeKb, entry.usedKb, entry.availKb, entry.usedPercent].every(Number.isInteger)) disks.push(entry);
+  });
+  return disks.length > 0 ? disks : undefined;
+}
+
 export async function collectFacts(config, deps = {}) {
   const command = deps.commandOutput ?? commandOutput;
   const nginx = command("systemctl", ["is-active", "nginx"]) ?? "unknown";
@@ -412,6 +438,8 @@ export async function collectFacts(config, deps = {}) {
     runtimeVersion:
       command("git", ["-C", config.runtimeDir, "rev-parse", "--short", "HEAD"]) ?? "unknown",
   };
+  const disks = collectDisks(config, command, deps.existsSync ?? existsSync);
+  if (disks) facts.disks = disks;
   const boot = (deps.readBootFacts ?? readBootFacts)();
   if (boot) facts.boot = boot;
   return facts;
@@ -425,6 +453,7 @@ export function buildStatusPayload(config, facts, shutdown) {
     runtimeDir: config.runtimeDir,
     loadavg: facts.loadavg ?? "",
     disk: facts.disk ?? "",
+    ...(facts.disks ? { disks: facts.disks } : {}),
     cpus: facts.cpus ?? null,
     memTotalMb: facts.memTotalMb ?? null,
     memAvailableMb: facts.memAvailableMb ?? null,

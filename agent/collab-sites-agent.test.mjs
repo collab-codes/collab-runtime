@@ -11,6 +11,7 @@ import {
   buildHeartbeatBody,
   buildStatusBody,
   buildStatusPayload,
+  collectDisks,
   configFromValues,
   frozenShutdownReport,
   loadConfig,
@@ -585,4 +586,53 @@ test("importing the agent does not open the status listener", async () => {
   });
   const code = await new Promise((resolve) => child.on("close", resolve));
   assert.equal(code, 0);
+});
+
+const DF_BOTH = [
+  "Filesystem     1024-blocks     Used Available Capacity Mounted on",
+  "/dev/root         30316544 16777216  13539328      57% /",
+  "/dev/nvme1n1      20463616 15728640   4734976      79% /data",
+].join("\n");
+
+test("collectDisks reads / and the data root from df -Pk as integers", async () => {
+  const config = await configFromValues(parseEnvFile(FIXTURE_ENV));
+  const calls = [];
+  const disks = collectDisks(config, (command, args) => {
+    calls.push([command, ...args]);
+    return DF_BOTH;
+  }, () => true);
+  assert.deepEqual(calls, [["df", "-Pk", "/", "/data"]]);
+  assert.deepEqual(disks, [
+    { path: "/", sizeKb: 30316544, usedKb: 16777216, availKb: 13539328, usedPercent: 57 },
+    { path: "/data", sizeKb: 20463616, usedKb: 15728640, availKb: 4734976, usedPercent: 79 },
+  ]);
+});
+
+test("collectDisks asks only for / when the data root does not exist", async () => {
+  const config = await configFromValues(parseEnvFile(FIXTURE_ENV));
+  const calls = [];
+  const disks = collectDisks(config, (command, args) => {
+    calls.push(args);
+    return DF_BOTH.split("\n").slice(0, 2).join("\n");
+  }, () => false);
+  assert.deepEqual(calls, [["-Pk", "/"]]);
+  assert.deepEqual(disks, [{ path: "/", sizeKb: 30316544, usedKb: 16777216, availKb: 13539328, usedPercent: 57 }]);
+});
+
+test("collectDisks leaves the field out when df fails or has no readable row", async () => {
+  const config = await configFromValues(parseEnvFile(FIXTURE_ENV));
+  assert.equal(collectDisks(config, () => null, () => true), undefined);
+  assert.equal(collectDisks(config, () => "Filesystem 1024-blocks Used Available Capacity Mounted on", () => true), undefined);
+  assert.equal(collectDisks(config, () => "header\nbad row only", () => true), undefined);
+});
+
+test("status payload carries disks right after disk and keeps the text disk", async () => {
+  const config = await configFromValues(parseEnvFile(FIXTURE_ENV));
+  const disks = [{ path: "/", sizeKb: 100, usedKb: 50, availKb: 50, usedPercent: 50 }];
+  const withDisks = buildStatusPayload(config, { ...FACTS, disks });
+  const keys = Object.keys(withDisks);
+  assert.equal(keys[keys.indexOf("disk") + 1], "disks");
+  assert.equal(withDisks.disk, FACTS.disk);
+  assert.deepEqual(withDisks.disks, disks);
+  assert.equal("disks" in buildStatusPayload(config, FACTS), false);
 });
