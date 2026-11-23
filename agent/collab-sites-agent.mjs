@@ -405,6 +405,26 @@ export function collectDisks(config, command = commandOutput, exists = existsSyn
   return disks.length > 0 ? disks : undefined;
 }
 
+/**
+ * The last disk cleanup (rt304), read from `<dataRoot>/etc/disk-cleanup/last.json` (written by scripts/disk-cleanup.mjs).
+ * The path mirrors `lastFile` there; the agent does not import that script because the installed agent is a copy of
+ * a fixed list of files. Absent or unreadable file, or a record without a valid `finishedAt`: `undefined`.
+ */
+export function readDiskCleanup(config, read = readFileSync) {
+  try {
+    const record = JSON.parse(read(join(config.dataRoot ?? "/data", "etc", "disk-cleanup", "last.json"), "utf8"));
+    if (!record || typeof record !== "object" || !Number.isFinite(Date.parse(record.finishedAt))) return undefined;
+    return {
+      finishedAt: record.finishedAt,
+      ok: record.ok === true,
+      freedKb: Number.isFinite(record.freedKb) ? record.freedKb : 0,
+      trigger: typeof record.trigger === "string" ? record.trigger : "",
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 export async function collectFacts(config, deps = {}) {
   const command = deps.commandOutput ?? commandOutput;
   const nginx = command("systemctl", ["is-active", "nginx"]) ?? "unknown";
@@ -440,6 +460,8 @@ export async function collectFacts(config, deps = {}) {
   };
   const disks = collectDisks(config, command, deps.existsSync ?? existsSync);
   if (disks) facts.disks = disks;
+  const diskCleanup = readDiskCleanup(config, deps.readFile ?? readFileSync);
+  if (diskCleanup) facts.diskCleanup = diskCleanup;
   const boot = (deps.readBootFacts ?? readBootFacts)();
   if (boot) facts.boot = boot;
   return facts;
@@ -454,6 +476,7 @@ export function buildStatusPayload(config, facts, shutdown) {
     loadavg: facts.loadavg ?? "",
     disk: facts.disk ?? "",
     ...(facts.disks ? { disks: facts.disks } : {}),
+    ...(facts.diskCleanup ? { diskCleanup: facts.diskCleanup } : {}),
     cpus: facts.cpus ?? null,
     memTotalMb: facts.memTotalMb ?? null,
     memAvailableMb: facts.memAvailableMb ?? null,

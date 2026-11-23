@@ -18,6 +18,7 @@ import {
   meminfoMbFrom,
   parseEnvFile,
   parsePm2Processes,
+  readDiskCleanup,
   pm2FactsFrom,
   pm2Jlist,
   pm2UnitFromShow,
@@ -635,4 +636,51 @@ test("status payload carries disks right after disk and keeps the text disk", as
   assert.equal(withDisks.disk, FACTS.disk);
   assert.deepEqual(withDisks.disks, disks);
   assert.equal("disks" in buildStatusPayload(config, FACTS), false);
+});
+
+const LAST_CLEANUP = {
+  startedAt: "2026-11-24T02:00:00.000Z",
+  finishedAt: "2026-11-24T02:03:10.000Z",
+  ok: true,
+  trigger: "timer",
+  trees: [{ root: "/data/app1/mls-base", ok: true, freedKb: 900, removed: 3 }],
+  freedKb: 900,
+};
+
+test("readDiskCleanup lê só os quatro campos do last.json e lê do caminho certo", async () => {
+  const config = await configFromValues(parseEnvFile(FIXTURE_ENV));
+  const paths = [];
+  const got = readDiskCleanup(config, (path) => {
+    paths.push(path);
+    return JSON.stringify(LAST_CLEANUP);
+  });
+  assert.deepEqual(paths, ["/data/etc/disk-cleanup/last.json"]);
+  assert.deepEqual(got, { finishedAt: "2026-11-24T02:03:10.000Z", ok: true, freedKb: 900, trigger: "timer" });
+});
+
+test("readDiskCleanup: sem o arquivo, arquivo quebrado ou sem finishedAt válido, o campo fica ausente", async () => {
+  const config = await configFromValues(parseEnvFile(FIXTURE_ENV));
+  assert.equal(readDiskCleanup(config, () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); }), undefined);
+  assert.equal(readDiskCleanup(config, () => "{ não é json"), undefined);
+  assert.equal(readDiskCleanup(config, () => JSON.stringify({ ok: true })), undefined);
+  assert.equal(readDiskCleanup(config, () => JSON.stringify({ finishedAt: "ontem", ok: true })), undefined);
+  assert.equal(readDiskCleanup(config, () => "null"), undefined);
+});
+
+test("readDiskCleanup: ok só é true quando o arquivo diz true, e freedKb inválido vira 0", async () => {
+  const config = await configFromValues(parseEnvFile(FIXTURE_ENV));
+  const got = readDiskCleanup(config, () => JSON.stringify({ finishedAt: "2026-11-24T02:00:00Z", ok: "sim", freedKb: "muito" }));
+  assert.deepEqual(got, { finishedAt: "2026-11-24T02:00:00Z", ok: false, freedKb: 0, trigger: "" });
+});
+
+test("status payload: diskCleanup entra logo depois de disks, e some quando não há last.json", async () => {
+  const config = await configFromValues(parseEnvFile(FIXTURE_ENV));
+  const disks = [{ path: "/", sizeKb: 100, usedKb: 50, availKb: 50, usedPercent: 50 }];
+  const diskCleanup = { finishedAt: "2026-11-24T02:03:10.000Z", ok: true, freedKb: 900, trigger: "timer" };
+  const keys = Object.keys(buildStatusPayload(config, { ...FACTS, disks, diskCleanup }));
+  assert.deepEqual(keys.slice(keys.indexOf("disk"), keys.indexOf("disk") + 3), ["disk", "disks", "diskCleanup"]);
+  const without = buildStatusPayload(config, { ...FACTS, disks });
+  assert.equal("diskCleanup" in without, false);
+  const body = buildHeartbeatBody(config, { ...FACTS, disks, diskCleanup });
+  assert.deepEqual(body.payload.diskCleanup, diskCleanup);
 });
