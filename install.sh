@@ -337,6 +337,8 @@ run_step 12 "mls client project"      "12-mls-project.sh"
 run_step 13 "Postgres read-only role" "13-postgres-readonly.sh"
 # VM key for external-system secrets (rt263): after the app .env exists. Idempotent; does not restart pm2.
 run_step 15 "VM secrets key" "15-collab-secrets-key.sh"
+# Daily disk cleanup (rt304): two systemd timers run scripts/disk-cleanup.mjs at 02:00 UTC and, after boot, when the last one is older than 30 h. Never starts the cleanup.
+run_step 16 "Disk cleanup timers" "16-disk-cleanup-timers.sh"
 
 # ── Step 8: Install collab CLI ────────────────────────────────────────────────
 log_section "Installing collab CLI"

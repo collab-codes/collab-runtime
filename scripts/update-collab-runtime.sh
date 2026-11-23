@@ -91,6 +91,15 @@ if [[ -f "$SECRETS_STEP" ]]; then
   bash "$SECRETS_STEP"
   FAIL_STEP="pull"
 fi
+# The daily disk cleanup timers (rt304): the checkout just pulled, so the units follow the scripts. It never starts the cleanup
+# (the first run is the automatic one). Missing on an older checkout, so it is skipped; it needs root for systemctl.
+DISK_CLEANUP_STEP="${RUNTIME_DIR}/scripts/16-disk-cleanup-timers.sh"
+if [[ -f "$DISK_CLEANUP_STEP" ]] && { [[ "$(id -u)" -eq 0 ]] || [[ -n "${COLLAB_SYSTEMD_ROOT:-}" ]]; }; then
+  STEPS="${STEPS},limpeza"
+  FAIL_STEP="limpeza"
+  bash "$DISK_CLEANUP_STEP"
+  FAIL_STEP="pull"
+fi
 record ok
 trap - EXIT
 if [[ "$AGENT_RESTART" -eq 1 ]]; then
