@@ -100,6 +100,15 @@ if [[ -f "$DISK_CLEANUP_STEP" ]] && { [[ "$(id -u)" -eq 0 ]] || [[ -n "${COLLAB_
   bash "$DISK_CLEANUP_STEP"
   FAIL_STEP="pull"
 fi
+# NGINX proxy timeouts (rt308): 1900s at http level, from the checkout just pulled. Reload only, and only when the file changes.
+# Missing on an older checkout, so it is skipped. Needs root; COLLAB_NGINX_ROOT redirects the conf path (tests).
+NGINX_TIMEOUT_STEP="${RUNTIME_DIR}/scripts/17-nginx-proxy-timeouts.sh"
+if [[ -f "$NGINX_TIMEOUT_STEP" ]] && { [[ "$(id -u)" -eq 0 ]] || [[ -n "${COLLAB_NGINX_ROOT:-}" ]]; }; then
+  STEPS="${STEPS},timeouts"
+  FAIL_STEP="timeouts"
+  bash "$NGINX_TIMEOUT_STEP"
+  FAIL_STEP="pull"
+fi
 record ok
 trap - EXIT
 if [[ "$AGENT_RESTART" -eq 1 ]]; then

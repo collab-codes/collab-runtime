@@ -339,6 +339,8 @@ run_step 13 "Postgres read-only role" "13-postgres-readonly.sh"
 run_step 15 "VM secrets key" "15-collab-secrets-key.sh"
 # Daily disk cleanup (rt304): two systemd timers run scripts/disk-cleanup.mjs at 02:00 UTC and, after boot, when the last one is older than 30 h. Never starts the cleanup.
 run_step 16 "Disk cleanup timers" "16-disk-cleanup-timers.sh"
+# NGINX http-level proxy timeouts (rt308): 1900s in conf.d, so every app on the VM waits above the collab-messages LLM proxy. A location that sets its own timeout still wins.
+run_step 17 "NGINX proxy timeouts" "17-nginx-proxy-timeouts.sh"
 
 # ── Step 8: Install collab CLI ────────────────────────────────────────────────
 log_section "Installing collab CLI"
